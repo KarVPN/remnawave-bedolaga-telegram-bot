@@ -33,6 +33,7 @@ class SubscriptionStates(StatesGroup):
 
 class BalanceStates(StatesGroup):
     waiting_for_amount = State()
+    waiting_for_yookassa_receipt_contact = State()
     waiting_for_pal24_method = State()
     waiting_for_platega_method = State()
     waiting_for_stars_payment = State()

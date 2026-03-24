@@ -1752,5 +1752,11 @@
   "WEBHOOK_USER_NOT_CONNECTED": "📡 <b>Not connected yet</b>\n\nYour subscription is active but no VPN connection has been made. Connect to start using the service.",
   "WEBHOOK_DEVICE_ADDED": "📱 <b>New device</b>\n\nA new device has been added to your subscription: <code>{device}</code>",
   "WEBHOOK_DEVICE_DELETED": "📱 <b>Device removed</b>\n\nA device has been removed from your subscription: <code>{device}</code>",
-  "WEBHOOK_CLOSE_BUTTON": "✖️ Close"
+  "WEBHOOK_CLOSE_BUTTON": "✖️ Close",
+  "YOOKASSA_RECEIPT_CONTACT_TEXT_REQUIRED": "❌ Enter your email or phone number as text.",
+  "YOOKASSA_RECEIPT_CONTACT_EMPTY": "❌ Enter your email or phone number.",
+  "YOOKASSA_RECEIPT_CONTACT_INVALID": "❌ Invalid format. Enter a valid email or phone number in the format <code>+79991234567</code>.",
+  "YOOKASSA_RECEIPT_CONTACT_AMOUNT_MISSING": "❌ Failed to restore the payment amount. Please try again.",
+  "YOOKASSA_RECEIPT_CONTACT_USER_NOT_FOUND": "❌ User not found. Please try again.",
+  "YOOKASSA_RECEIPT_CONTACT_EMAIL_IN_USE": "❌ This email is already used by another user. Enter a different email or phone number."
 }

@@ -1776,5 +1776,11 @@
   "WEBHOOK_USER_NOT_CONNECTED": "📡 <b>Вы ещё не подключились</b>\n\nВаша подписка активна, но VPN-соединение не было установлено. Подключитесь, чтобы начать пользоваться.",
   "WEBHOOK_DEVICE_ADDED": "📱 <b>Новое устройство</b>\n\nК вашей подписке подключено новое устройство: <code>{device}</code>",
   "WEBHOOK_DEVICE_DELETED": "📱 <b>Устройство удалено</b>\n\nУстройство отключено от подписки: <code>{device}</code>",
-  "WEBHOOK_CLOSE_BUTTON": "✖️ Закрыть"
+  "WEBHOOK_CLOSE_BUTTON": "✖️ Закрыть",
+  "YOOKASSA_RECEIPT_CONTACT_TEXT_REQUIRED": "❌ Введите email или номер телефона текстом.",
+  "YOOKASSA_RECEIPT_CONTACT_EMPTY": "❌ Введите email или номер телефона.",
+  "YOOKASSA_RECEIPT_CONTACT_INVALID": "❌ Неверный формат. Введите корректный email или телефон в формате <code>+79991234567</code>.",
+  "YOOKASSA_RECEIPT_CONTACT_AMOUNT_MISSING": "❌ Не удалось восстановить сумму платежа. Попробуйте заново.",
+  "YOOKASSA_RECEIPT_CONTACT_USER_NOT_FOUND": "❌ Пользователь не найден. Попробуйте заново.",
+  "YOOKASSA_RECEIPT_CONTACT_EMAIL_IN_USE": "❌ Этот email уже используется другим пользователем. Введите другой email или номер телефона."
 }

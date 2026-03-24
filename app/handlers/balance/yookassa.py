@@ -4,19 +4,140 @@ from datetime import UTC, datetime
 import structlog
 from aiogram import types
 from aiogram.fsm.context import FSMContext
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database.crud.user import get_user_by_id, update_user
+from app.database.database import AsyncSessionLocal
 from app.database.models import User
 from app.keyboards.inline import get_back_keyboard
 from app.localization.texts import get_texts
 from app.services.payment_service import PaymentService
 from app.states import BalanceStates
 from app.utils.decorators import error_handler
+from app.utils.validators import validate_email, validate_phone
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _normalise_phone(phone: str) -> str:
+    return ''.join(ch for ch in phone.strip() if ch not in ' -()')
+
+
+async def _get_yookassa_receipt_contact(db_user: User, state: FSMContext) -> tuple[str | None, str | None]:
+    state_data = await state.get_data()
+    receipt_email = state_data.get('yookassa_receipt_email') or getattr(db_user, 'email', None)
+    receipt_phone = state_data.get('yookassa_receipt_phone') or getattr(db_user, 'phone', None)
+    return receipt_email, receipt_phone
+
+
+async def _request_yookassa_receipt_contact(
+    message: types.Message,
+    db_user: User,
+    state: FSMContext,
+    *,
+    payment_method: str,
+    amount_kopeks: int,
+) -> None:
+    await state.update_data(
+        payment_method=payment_method,
+        yookassa_pending_amount_kopeks=amount_kopeks,
+    )
+    await state.set_state(BalanceStates.waiting_for_yookassa_receipt_contact)
+    await message.answer(
+        'Для оформления чека нужен email или номер телефона.\n\n'
+        'Введите email или телефон в международном формате, например:\n'
+        '<code>user@example.com</code>\n'
+        '<code>+79991234567</code>',
+        reply_markup=get_back_keyboard(db_user.language),
+        parse_mode='HTML',
+    )
+
+
+@error_handler
+async def process_yookassa_receipt_contact(message: types.Message, db_user: User, state: FSMContext):
+    texts = get_texts(db_user.language)
+
+    if not message.text:
+        await message.answer(
+            texts.YOOKASSA_RECEIPT_CONTACT_TEXT_REQUIRED,
+            reply_markup=get_back_keyboard(db_user.language),
+        )
+        return
+
+    raw_contact = message.text.strip()
+    if not raw_contact:
+        await message.answer(
+            texts.YOOKASSA_RECEIPT_CONTACT_EMPTY,
+            reply_markup=get_back_keyboard(db_user.language),
+        )
+        return
+
+    receipt_email: str | None = None
+    receipt_phone: str | None = None
+
+    if validate_email(raw_contact):
+        receipt_email = raw_contact.lower()
+    elif validate_phone(raw_contact):
+        receipt_phone = _normalise_phone(raw_contact)
+    else:
+        await message.answer(
+            texts.YOOKASSA_RECEIPT_CONTACT_INVALID,
+            reply_markup=get_back_keyboard(db_user.language),
+            parse_mode='HTML',
+        )
+        return
+
+    data = await state.get_data()
+    amount_kopeks = data.get('yookassa_pending_amount_kopeks')
+    payment_method = data.get('payment_method', 'yookassa')
+
+    if not amount_kopeks:
+        await state.clear()
+        await message.answer(
+            texts.YOOKASSA_RECEIPT_CONTACT_AMOUNT_MISSING,
+            reply_markup=get_back_keyboard(db_user.language),
+        )
+        return
+
+    updated_user = db_user
+
+    if receipt_email and getattr(db_user, 'email', None) != receipt_email:
+        try:
+            async with AsyncSessionLocal() as db:
+                persistent_user = await get_user_by_id(db, db_user.id)
+                if persistent_user is None:
+                    await state.clear()
+                    await message.answer(
+                        texts.YOOKASSA_RECEIPT_CONTACT_USER_NOT_FOUND,
+                        reply_markup=get_back_keyboard(db_user.language),
+                    )
+                    return
+                updated_user = await update_user(db, persistent_user, email=receipt_email)
+        except IntegrityError:
+            await message.answer(
+                texts.YOOKASSA_RECEIPT_CONTACT_EMAIL_IN_USE,
+                reply_markup=get_back_keyboard(db_user.language),
+            )
+            return
+        except Exception as error:
+            logger.warning('Не удалось сохранить email пользователя для YooKassa', error=error)
+
+    await state.update_data(
+        yookassa_receipt_email=receipt_email,
+        yookassa_receipt_phone=receipt_phone,
+    )
+    await state.set_state(BalanceStates.waiting_for_amount)
+
+    from .main import route_payment_by_method
+
+    if not await route_payment_by_method(message, updated_user, int(amount_kopeks), state, payment_method):
+        await message.answer('Неизвестный способ оплаты', reply_markup=get_back_keyboard(updated_user.language))
+        await state.clear()
+        return
 
 
 @error_handler
@@ -158,6 +279,17 @@ async def process_yookassa_payment_amount(
         return
 
     try:
+        receipt_email, receipt_phone = await _get_yookassa_receipt_contact(db_user, state)
+        if not receipt_email and not receipt_phone:
+            await _request_yookassa_receipt_contact(
+                message,
+                db_user,
+                state,
+                payment_method='yookassa',
+                amount_kopeks=amount_kopeks,
+            )
+            return
+
         payment_service = PaymentService(message.bot)
 
         payment_result = await payment_service.create_yookassa_payment(
@@ -165,8 +297,8 @@ async def process_yookassa_payment_amount(
             user_id=db_user.id,
             amount_kopeks=amount_kopeks,
             description=settings.get_balance_payment_description(amount_kopeks, telegram_user_id=db_user.telegram_id),
-            receipt_email=None,
-            receipt_phone=None,
+            receipt_email=receipt_email,
+            receipt_phone=receipt_phone,
             metadata={
                 'user_telegram_id': str(db_user.telegram_id),
                 'user_username': db_user.username or '',
@@ -313,6 +445,17 @@ async def process_yookassa_sbp_payment_amount(
         return
 
     try:
+        receipt_email, receipt_phone = await _get_yookassa_receipt_contact(db_user, state)
+        if not receipt_email and not receipt_phone:
+            await _request_yookassa_receipt_contact(
+                message,
+                db_user,
+                state,
+                payment_method='yookassa_sbp',
+                amount_kopeks=amount_kopeks,
+            )
+            return
+
         payment_service = PaymentService(message.bot)
 
         payment_result = await payment_service.create_yookassa_sbp_payment(
@@ -320,8 +463,8 @@ async def process_yookassa_sbp_payment_amount(
             user_id=db_user.id,
             amount_kopeks=amount_kopeks,
             description=settings.get_balance_payment_description(amount_kopeks, telegram_user_id=db_user.telegram_id),
-            receipt_email=None,
-            receipt_phone=None,
+            receipt_email=receipt_email,
+            receipt_phone=receipt_phone,
             metadata={
                 'user_telegram_id': str(db_user.telegram_id),
                 'user_username': db_user.username or '',

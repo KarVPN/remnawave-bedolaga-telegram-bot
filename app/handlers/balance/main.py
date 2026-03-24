@@ -669,6 +669,9 @@ def register_balance_handlers(dp: Dispatcher):
     from .yookassa import check_yookassa_payment_status
 
     dp.callback_query.register(check_yookassa_payment_status, F.data.startswith('check_yookassa_'))
+    from .yookassa import process_yookassa_receipt_contact
+
+    dp.message.register(process_yookassa_receipt_contact, BalanceStates.waiting_for_yookassa_receipt_contact)
 
     dp.message.register(process_topup_amount, BalanceStates.waiting_for_amount)
 
