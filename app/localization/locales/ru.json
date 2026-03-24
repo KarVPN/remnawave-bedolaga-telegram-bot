@@ -1777,6 +1777,7 @@
   "WEBHOOK_DEVICE_ADDED": "📱 <b>Новое устройство</b>\n\nК вашей подписке подключено новое устройство: <code>{device}</code>",
   "WEBHOOK_DEVICE_DELETED": "📱 <b>Устройство удалено</b>\n\nУстройство отключено от подписки: <code>{device}</code>",
   "WEBHOOK_CLOSE_BUTTON": "✖️ Закрыть",
+  "YOOKASSA_RECEIPT_CONTACT_REQUEST": "Для оформления чека нужен email или номер телефона.\n\nВведите email или телефон в международном формате, например:\n<code>user@example.com</code>\n<code>+79991234567</code>",
   "YOOKASSA_RECEIPT_CONTACT_TEXT_REQUIRED": "❌ Введите email или номер телефона текстом.",
   "YOOKASSA_RECEIPT_CONTACT_EMPTY": "❌ Введите email или номер телефона.",
   "YOOKASSA_RECEIPT_CONTACT_INVALID": "❌ Неверный формат. Введите корректный email или телефон в формате <code>+79991234567</code>.",

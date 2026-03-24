@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.models import PaymentMethod, TransactionType
+from app.services.yookassa_receipt_contact import resolve_receipt_contact
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
 
@@ -110,16 +111,32 @@ class YooKassaPaymentMixin:
             amount_rubles = amount_kopeks / 100
 
             payment_metadata = metadata.copy() if metadata else {}
+            receipt_email_to_use = receipt_email
+            receipt_phone_to_use = receipt_phone
 
             # Всегда добавляем telegram_id в метаданные для возможности возврата платежа
-            if user_id is not None and 'user_telegram_id' not in payment_metadata:
+            if user_id is not None and ('user_telegram_id' not in payment_metadata or not receipt_email_to_use):
                 try:
                     from app.database.crud.user import get_user_by_id
 
                     user = await get_user_by_id(db, user_id)
-                    if user and user.telegram_id:
-                        payment_metadata['user_telegram_id'] = str(user.telegram_id)
-                        payment_metadata['user_username'] = user.username or ''
+                    if user:
+                        receipt_email_to_use, receipt_phone_to_use = resolve_receipt_contact(
+                            user,
+                            receipt_email=receipt_email_to_use,
+                            receipt_phone=receipt_phone_to_use,
+                        )
+                        if user.telegram_id:
+                            payment_metadata['user_telegram_id'] = str(user.telegram_id)
+                            payment_metadata['user_username'] = user.username or ''
+                        logger.info(
+                            'Подготовлен контакт для чека YooKassa',
+                            user_id=user_id,
+                            has_receipt_email=bool(receipt_email_to_use),
+                            has_receipt_phone=bool(receipt_phone_to_use),
+                            has_user_email=bool(getattr(user, 'email', None)),
+                            has_pending_email=bool(getattr(user, 'email_change_new', None)),
+                        )
                 except Exception as e:
                     logger.warning('Не удалось получить telegram_id для user_id', user_id=user_id, error=e)
 
@@ -138,8 +155,8 @@ class YooKassaPaymentMixin:
                 currency='RUB',
                 description=description,
                 metadata=payment_metadata,
-                receipt_email=receipt_email,
-                receipt_phone=receipt_phone,
+                receipt_email=receipt_email_to_use,
+                receipt_phone=receipt_phone_to_use,
                 return_url=return_url,
             )
 
@@ -214,16 +231,32 @@ class YooKassaPaymentMixin:
             amount_rubles = amount_kopeks / 100
 
             payment_metadata = metadata.copy() if metadata else {}
+            receipt_email_to_use = receipt_email
+            receipt_phone_to_use = receipt_phone
 
             # Всегда добавляем telegram_id в метаданные для возможности возврата платежа
-            if user_id is not None and 'user_telegram_id' not in payment_metadata:
+            if user_id is not None and ('user_telegram_id' not in payment_metadata or not receipt_email_to_use):
                 try:
                     from app.database.crud.user import get_user_by_id
 
                     user = await get_user_by_id(db, user_id)
-                    if user and user.telegram_id:
-                        payment_metadata['user_telegram_id'] = str(user.telegram_id)
-                        payment_metadata['user_username'] = user.username or ''
+                    if user:
+                        receipt_email_to_use, receipt_phone_to_use = resolve_receipt_contact(
+                            user,
+                            receipt_email=receipt_email_to_use,
+                            receipt_phone=receipt_phone_to_use,
+                        )
+                        if user.telegram_id:
+                            payment_metadata['user_telegram_id'] = str(user.telegram_id)
+                            payment_metadata['user_username'] = user.username or ''
+                        logger.info(
+                            'Подготовлен контакт для чека YooKassa СБП',
+                            user_id=user_id,
+                            has_receipt_email=bool(receipt_email_to_use),
+                            has_receipt_phone=bool(receipt_phone_to_use),
+                            has_user_email=bool(getattr(user, 'email', None)),
+                            has_pending_email=bool(getattr(user, 'email_change_new', None)),
+                        )
                 except Exception as e:
                     logger.warning('Не удалось получить telegram_id для user_id', user_id=user_id, error=e)
 
@@ -242,8 +275,8 @@ class YooKassaPaymentMixin:
                 currency='RUB',
                 description=description,
                 metadata=payment_metadata,
-                receipt_email=receipt_email,
-                receipt_phone=receipt_phone,
+                receipt_email=receipt_email_to_use,
+                receipt_phone=receipt_phone_to_use,
                 return_url=return_url,
             )
 

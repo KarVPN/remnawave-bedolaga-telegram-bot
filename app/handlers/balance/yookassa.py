@@ -15,6 +15,7 @@ from app.database.models import User
 from app.keyboards.inline import get_back_keyboard
 from app.localization.texts import get_texts
 from app.services.payment_service import PaymentService
+from app.services.yookassa_receipt_contact import normalize_phone, resolve_receipt_contact
 from app.states import BalanceStates
 from app.utils.decorators import error_handler
 from app.utils.validators import validate_email, validate_phone
@@ -22,15 +23,13 @@ from app.utils.validators import validate_email, validate_phone
 
 logger = structlog.get_logger(__name__)
 
-
-def _normalise_phone(phone: str) -> str:
-    return ''.join(ch for ch in phone.strip() if ch not in ' -()')
-
-
 async def _get_yookassa_receipt_contact(db_user: User, state: FSMContext) -> tuple[str | None, str | None]:
     state_data = await state.get_data()
-    receipt_email = state_data.get('yookassa_receipt_email') or getattr(db_user, 'email', None)
-    receipt_phone = state_data.get('yookassa_receipt_phone') or getattr(db_user, 'phone', None)
+    receipt_email, receipt_phone = resolve_receipt_contact(
+        db_user,
+        receipt_email=state_data.get('yookassa_receipt_email'),
+        receipt_phone=state_data.get('yookassa_receipt_phone'),
+    )
     return receipt_email, receipt_phone
 
 
@@ -48,10 +47,7 @@ async def _request_yookassa_receipt_contact(
     )
     await state.set_state(BalanceStates.waiting_for_yookassa_receipt_contact)
     await message.answer(
-        'Для оформления чека нужен email или номер телефона.\n\n'
-        'Введите email или телефон в международном формате, например:\n'
-        '<code>user@example.com</code>\n'
-        '<code>+79991234567</code>',
+        get_texts(db_user.language).YOOKASSA_RECEIPT_CONTACT_REQUEST,
         reply_markup=get_back_keyboard(db_user.language),
         parse_mode='HTML',
     )
@@ -82,7 +78,7 @@ async def process_yookassa_receipt_contact(message: types.Message, db_user: User
     if validate_email(raw_contact):
         receipt_email = raw_contact.lower()
     elif validate_phone(raw_contact):
-        receipt_phone = _normalise_phone(raw_contact)
+        receipt_phone = normalize_phone(raw_contact)
     else:
         await message.answer(
             texts.YOOKASSA_RECEIPT_CONTACT_INVALID,
@@ -281,6 +277,15 @@ async def process_yookassa_payment_amount(
     try:
         receipt_email, receipt_phone = await _get_yookassa_receipt_contact(db_user, state)
         if not receipt_email and not receipt_phone:
+            logger.info(
+                'Для YooKassa требуется контакт для чека, запускаем запрос у пользователя',
+                user_id=db_user.id,
+                telegram_id=db_user.telegram_id,
+                has_user_email=bool(getattr(db_user, 'email', None)),
+                has_pending_email=bool(getattr(db_user, 'email_change_new', None)),
+                has_state_email=bool((await state.get_data()).get('yookassa_receipt_email')),
+                has_state_phone=bool((await state.get_data()).get('yookassa_receipt_phone')),
+            )
             await _request_yookassa_receipt_contact(
                 message,
                 db_user,
@@ -447,6 +452,15 @@ async def process_yookassa_sbp_payment_amount(
     try:
         receipt_email, receipt_phone = await _get_yookassa_receipt_contact(db_user, state)
         if not receipt_email and not receipt_phone:
+            logger.info(
+                'Для YooKassa СБП требуется контакт для чека, запускаем запрос у пользователя',
+                user_id=db_user.id,
+                telegram_id=db_user.telegram_id,
+                has_user_email=bool(getattr(db_user, 'email', None)),
+                has_pending_email=bool(getattr(db_user, 'email_change_new', None)),
+                has_state_email=bool((await state.get_data()).get('yookassa_receipt_email')),
+                has_state_phone=bool((await state.get_data()).get('yookassa_receipt_phone')),
+            )
             await _request_yookassa_receipt_contact(
                 message,
                 db_user,

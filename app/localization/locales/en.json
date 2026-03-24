@@ -1753,6 +1753,7 @@
   "WEBHOOK_DEVICE_ADDED": "📱 <b>New device</b>\n\nA new device has been added to your subscription: <code>{device}</code>",
   "WEBHOOK_DEVICE_DELETED": "📱 <b>Device removed</b>\n\nA device has been removed from your subscription: <code>{device}</code>",
   "WEBHOOK_CLOSE_BUTTON": "✖️ Close",
+  "YOOKASSA_RECEIPT_CONTACT_REQUEST": "An email address or phone number is required for the receipt.\n\nEnter your email or phone number in international format, for example:\n<code>user@example.com</code>\n<code>+79991234567</code>",
   "YOOKASSA_RECEIPT_CONTACT_TEXT_REQUIRED": "❌ Enter your email or phone number as text.",
   "YOOKASSA_RECEIPT_CONTACT_EMPTY": "❌ Enter your email or phone number.",
   "YOOKASSA_RECEIPT_CONTACT_INVALID": "❌ Invalid format. Enter a valid email or phone number in the format <code>+79991234567</code>.",

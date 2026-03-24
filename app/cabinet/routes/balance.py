@@ -27,6 +27,7 @@ from app.services.payment_verification_service import (
     method_display_name,
     run_manual_check,
 )
+from app.services.yookassa_receipt_contact import resolve_receipt_contact
 from app.utils.currency_converter import currency_converter
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
@@ -349,6 +350,7 @@ async def create_topup(
     try:
         if request.payment_method == 'yookassa':
             payment_service = PaymentService()
+            receipt_email, receipt_phone = resolve_receipt_contact(user)
             yookassa_metadata = {
                 'user_telegram_id': str(user.telegram_id) if user.telegram_id else '',
                 'user_username': user.username or '',
@@ -368,6 +370,8 @@ async def create_topup(
                     user_id=user.id,
                     amount_kopeks=request.amount_kopeks,
                     description=description,
+                    receipt_email=receipt_email,
+                    receipt_phone=receipt_phone,
                     metadata=yookassa_metadata,
                     return_url=cabinet_return_url,
                 )
@@ -377,6 +381,8 @@ async def create_topup(
                     user_id=user.id,
                     amount_kopeks=request.amount_kopeks,
                     description=description,
+                    receipt_email=receipt_email,
+                    receipt_phone=receipt_phone,
                     metadata=yookassa_metadata,
                     return_url=cabinet_return_url,
                 )
