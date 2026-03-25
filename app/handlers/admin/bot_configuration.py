@@ -1901,8 +1901,8 @@ async def test_payment_provider(
                 pass
 
     if method == 'yookassa':
-        if not settings.is_yookassa_enabled():
-            await callback.answer('❌ YooKassa отключена', show_alert=True)
+        if not settings.is_yookassa_card_enabled():
+            await callback.answer('❌ Оплата картой через YooKassa отключена', show_alert=True)
             return
 
         amount_kopeks = 10 * 100

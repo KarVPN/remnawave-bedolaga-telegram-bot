@@ -693,7 +693,7 @@ async def get_payment_methods(
         )
 
     if settings.is_yookassa_enabled():
-        if getattr(settings, 'YOOKASSA_SBP_ENABLED', False):
+        if settings.is_yookassa_sbp_enabled():
             methods.append(
                 MiniAppPaymentMethod(
                     id='yookassa_sbp',
@@ -706,17 +706,18 @@ async def get_payment_methods(
                 )
             )
 
-        methods.append(
-            MiniAppPaymentMethod(
-                id='yookassa',
-                icon='💳',
-                requires_amount=True,
-                currency='RUB',
-                min_amount_kopeks=settings.YOOKASSA_MIN_AMOUNT_KOPEKS,
-                max_amount_kopeks=settings.YOOKASSA_MAX_AMOUNT_KOPEKS,
-                integration_type=MiniAppPaymentIntegrationType.REDIRECT,
+        if settings.is_yookassa_card_enabled():
+            methods.append(
+                MiniAppPaymentMethod(
+                    id='yookassa',
+                    icon='💳',
+                    requires_amount=True,
+                    currency='RUB',
+                    min_amount_kopeks=settings.YOOKASSA_MIN_AMOUNT_KOPEKS,
+                    max_amount_kopeks=settings.YOOKASSA_MAX_AMOUNT_KOPEKS,
+                    integration_type=MiniAppPaymentIntegrationType.REDIRECT,
+                )
             )
-        )
 
     if settings.is_mulenpay_enabled():
         mulenpay_iframe_config = _build_mulenpay_iframe_config()
@@ -973,7 +974,7 @@ async def create_payment_link(
         )
 
     if method == 'yookassa_sbp':
-        if not settings.is_yookassa_enabled() or not getattr(settings, 'YOOKASSA_SBP_ENABLED', False):
+        if not settings.is_yookassa_sbp_enabled():
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Payment method is unavailable')
         if amount_kopeks is None or amount_kopeks <= 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Amount must be positive')
@@ -1013,7 +1014,7 @@ async def create_payment_link(
         )
 
     if method == 'yookassa':
-        if not settings.is_yookassa_enabled():
+        if not settings.is_yookassa_card_enabled():
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Payment method is unavailable')
         if amount_kopeks is None or amount_kopeks <= 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Amount must be positive')

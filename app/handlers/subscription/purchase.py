@@ -714,15 +714,16 @@ def _get_trial_payment_keyboard(language: str, can_pay_from_balance: bool = Fals
     if settings.TELEGRAM_STARS_ENABLED:
         keyboard.append([types.InlineKeyboardButton(text='⭐ Telegram Stars', callback_data='trial_payment_stars')])
 
-    if settings.is_yookassa_enabled():
+    if settings.is_yookassa_card_enabled() or settings.is_yookassa_sbp_enabled():
         yookassa_methods = []
-        if settings.YOOKASSA_SBP_ENABLED:
+        if settings.is_yookassa_sbp_enabled():
             yookassa_methods.append(
                 types.InlineKeyboardButton(text='🏦 YooKassa (СБП)', callback_data='trial_payment_yookassa_sbp')
             )
-        yookassa_methods.append(
-            types.InlineKeyboardButton(text='💳 YooKassa (Карта)', callback_data='trial_payment_yookassa')
-        )
+        if settings.is_yookassa_card_enabled():
+            yookassa_methods.append(
+                types.InlineKeyboardButton(text='💳 YooKassa (Карта)', callback_data='trial_payment_yookassa')
+            )
         if yookassa_methods:
             keyboard.append(yookassa_methods)
 
@@ -3570,6 +3571,10 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
             )
 
         elif payment_method == 'yookassa_sbp':
+            if not settings.is_yookassa_sbp_enabled():
+                await callback.answer('❌ Оплата через СБП временно недоступна', show_alert=True)
+                return
+
             # Оплата через YooKassa СБП
             payment_result = await payment_service.create_yookassa_sbp_payment(
                 db=db,
@@ -3608,6 +3613,10 @@ async def handle_trial_payment_method(callback: types.CallbackQuery, db_user: Us
             )
 
         elif payment_method == 'yookassa':
+            if not settings.is_yookassa_card_enabled():
+                await callback.answer('❌ Оплата картой через YooKassa временно недоступна', show_alert=True)
+                return
+
             # Оплата через YooKassa карта
             payment_result = await payment_service.create_yookassa_payment(
                 db=db,

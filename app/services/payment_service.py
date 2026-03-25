@@ -468,6 +468,14 @@ class PaymentService(
 
             option = 'sbp' if payment_method == 'yookassa_sbp' else 'card'
 
+            if option == 'sbp' and not settings.is_yookassa_sbp_enabled():
+                logger.warning('YooKassa SBP is disabled, cannot create guest payment')
+                return None
+
+            if option == 'card' and not settings.is_yookassa_card_enabled():
+                logger.warning('YooKassa card is disabled, cannot create guest payment')
+                return None
+
             if option == 'sbp':
                 result = await self.create_yookassa_sbp_payment(
                     db=db,

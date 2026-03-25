@@ -29,7 +29,7 @@ def get_available_payment_methods() -> list[dict[str, str]]:
         )
 
     if settings.is_yookassa_enabled():
-        if getattr(settings, 'YOOKASSA_SBP_ENABLED', False):
+        if settings.is_yookassa_sbp_enabled():
             methods.append(
                 {
                     'id': 'yookassa_sbp',
@@ -40,15 +40,16 @@ def get_available_payment_methods() -> list[dict[str, str]]:
                 }
             )
 
-        methods.append(
-            {
-                'id': 'yookassa',
-                'name': 'Банковская карта',
-                'icon': '💳',
-                'description': 'через YooKassa',
-                'callback': 'topup_yookassa',
-            }
-        )
+        if settings.is_yookassa_card_enabled():
+            methods.append(
+                {
+                    'id': 'yookassa',
+                    'name': 'Банковская карта',
+                    'icon': '💳',
+                    'description': 'через YooKassa',
+                    'callback': 'topup_yookassa',
+                }
+            )
 
     if settings.TRIBUTE_ENABLED:
         methods.append(
@@ -280,7 +281,9 @@ def is_payment_method_available(method_id: str) -> bool:
     if method_id == 'stars':
         return settings.TELEGRAM_STARS_ENABLED
     if method_id == 'yookassa':
-        return settings.is_yookassa_enabled()
+        return settings.is_yookassa_card_enabled()
+    if method_id == 'yookassa_sbp':
+        return settings.is_yookassa_sbp_enabled()
     if method_id == 'tribute':
         return settings.TRIBUTE_ENABLED
     if method_id == 'mulenpay':
@@ -322,7 +325,8 @@ def get_payment_method_status() -> dict[str, bool]:
     """
     return {
         'stars': settings.TELEGRAM_STARS_ENABLED,
-        'yookassa': settings.is_yookassa_enabled(),
+        'yookassa': settings.is_yookassa_card_enabled(),
+        'yookassa_sbp': settings.is_yookassa_sbp_enabled(),
         'tribute': settings.TRIBUTE_ENABLED,
         'mulenpay': settings.is_mulenpay_enabled(),
         'wata': settings.is_wata_enabled(),
@@ -344,7 +348,7 @@ def get_enabled_payment_methods_count() -> int:
     count = 0
     if settings.TELEGRAM_STARS_ENABLED:
         count += 1
-    if settings.is_yookassa_enabled():
+    if settings.is_yookassa_card_enabled() or settings.is_yookassa_sbp_enabled():
         count += 1
     if settings.TRIBUTE_ENABLED:
         count += 1

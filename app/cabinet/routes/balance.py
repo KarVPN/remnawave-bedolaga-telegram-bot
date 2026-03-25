@@ -362,6 +362,12 @@ async def create_topup(
 
             # Use payment_option to select card or sbp (default: card)
             option = (request.payment_option or '').strip().lower()
+            if option == 'sbp':
+                if not settings.is_yookassa_sbp_enabled():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='SBP payment is unavailable')
+            elif not settings.is_yookassa_card_enabled():
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Card payment is unavailable')
+
             # Use description with telegram_id for tax receipts
             description = settings.get_balance_payment_description(
                 request.amount_kopeks, telegram_user_id=user.telegram_id, user_db_id=user.id

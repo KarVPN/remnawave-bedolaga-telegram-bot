@@ -12,6 +12,15 @@ from app.database.models import PaymentMethodConfig, PromoGroup
 logger = structlog.get_logger(__name__)
 
 
+def _get_yookassa_sub_options() -> list[dict] | None:
+    options = []
+    if settings.is_yookassa_card_enabled():
+        options.append({'id': 'card', 'name': 'Карта'})
+    if settings.is_yookassa_sbp_enabled():
+        options.append({'id': 'sbp', 'name': 'СБП'})
+    return options or None
+
+
 # ============ Default method definitions ============
 
 
@@ -52,10 +61,7 @@ def _get_method_defaults() -> dict:
             'is_configured': settings.is_yookassa_enabled(),
             'default_min': settings.YOOKASSA_MIN_AMOUNT_KOPEKS,
             'default_max': settings.YOOKASSA_MAX_AMOUNT_KOPEKS,
-            'available_sub_options': [
-                {'id': 'card', 'name': 'Карта'},
-                {'id': 'sbp', 'name': 'СБП'},
-            ],
+            'available_sub_options': _get_yookassa_sub_options(),
         },
         'mulenpay': {
             'default_display_name': settings.get_mulenpay_display_name(),

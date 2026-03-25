@@ -269,15 +269,16 @@ def _get_simple_subscription_payment_keyboard(language: str) -> types.InlineKeyb
             [types.InlineKeyboardButton(text='⭐ Telegram Stars', callback_data='simple_subscription_stars')]
         )
 
-    if settings.is_yookassa_enabled():
+    if settings.is_yookassa_card_enabled() or settings.is_yookassa_sbp_enabled():
         yookassa_methods = []
-        if settings.YOOKASSA_SBP_ENABLED:
+        if settings.is_yookassa_sbp_enabled():
             yookassa_methods.append(
                 types.InlineKeyboardButton(text='🏦 YooKassa (СБП)', callback_data='simple_subscription_yookassa_sbp')
             )
-        yookassa_methods.append(
-            types.InlineKeyboardButton(text='💳 YooKassa (Карта)', callback_data='simple_subscription_yookassa')
-        )
+        if settings.is_yookassa_card_enabled():
+            yookassa_methods.append(
+                types.InlineKeyboardButton(text='💳 YooKassa (Карта)', callback_data='simple_subscription_yookassa')
+            )
         if yookassa_methods:
             keyboard.append(yookassa_methods)
 
@@ -912,8 +913,12 @@ async def handle_simple_subscription_payment_method(
                 await callback.answer('❌ Оплата через YooKassa временно недоступна', show_alert=True)
                 return
 
-            if payment_method == 'yookassa_sbp' and not settings.YOOKASSA_SBP_ENABLED:
+            if payment_method == 'yookassa_sbp' and not settings.is_yookassa_sbp_enabled():
                 await callback.answer('❌ Оплата через СБП временно недоступна', show_alert=True)
+                return
+
+            if payment_method == 'yookassa' and not settings.is_yookassa_card_enabled():
+                await callback.answer('❌ Оплата картой через YooKassa временно недоступна', show_alert=True)
                 return
 
             # Создаем заказ на подписку

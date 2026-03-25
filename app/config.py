@@ -357,6 +357,7 @@ class Settings(BaseSettings):
     YOOKASSA_RETURN_URL: str | None = None
     YOOKASSA_DEFAULT_RECEIPT_EMAIL: str | None = None
     YOOKASSA_VAT_CODE: int = 1
+    YOOKASSA_CARD_ENABLED: bool = True
     YOOKASSA_SBP_ENABLED: bool = False
     YOOKASSA_PAYMENT_MODE: str = 'full_payment'
     YOOKASSA_PAYMENT_SUBJECT: str = 'service'
@@ -1489,13 +1490,8 @@ class Settings(BaseSettings):
         if not username:
             return None
 
-        short_name = (self.MINIAPP_SHORT_NAME or '').strip().strip('/')
         safe_startapp = _url_quote(startapp, safe='') if startapp else ''
-
-        if short_name:
-            base_url = f'https://t.me/{username}/{short_name}'
-        else:
-            base_url = f'https://t.me/{username}'
+        base_url = f'https://t.me/{username}'
 
         if safe_startapp:
             return f'{base_url}?startapp={safe_startapp}'
@@ -1735,6 +1731,12 @@ class Settings(BaseSettings):
 
     def is_yookassa_enabled(self) -> bool:
         return self.YOOKASSA_ENABLED and self.YOOKASSA_SHOP_ID is not None and self.YOOKASSA_SECRET_KEY is not None
+
+    def is_yookassa_card_enabled(self) -> bool:
+        return self.is_yookassa_enabled() and bool(self.YOOKASSA_CARD_ENABLED)
+
+    def is_yookassa_sbp_enabled(self) -> bool:
+        return self.is_yookassa_enabled() and bool(self.YOOKASSA_SBP_ENABLED)
 
     def get_yookassa_display_name(self) -> str:
         name = (self.YOOKASSA_DISPLAY_NAME or '').strip()

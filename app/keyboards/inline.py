@@ -1542,7 +1542,7 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
         has_direct_payment_methods = True
 
     if settings.is_yookassa_enabled():
-        if settings.YOOKASSA_SBP_ENABLED:
+        if settings.is_yookassa_sbp_enabled():
             keyboard.append(
                 [
                     InlineKeyboardButton(
@@ -1553,15 +1553,16 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
             )
             has_direct_payment_methods = True
 
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    text=texts.t('PAYMENT_CARD_YOOKASSA', '💳 Банковская карта (YooKassa)'),
-                    callback_data=_build_callback('yookassa'),
-                )
-            ]
-        )
-        has_direct_payment_methods = True
+        if settings.is_yookassa_card_enabled():
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('PAYMENT_CARD_YOOKASSA', '💳 Банковская карта (YooKassa)'),
+                        callback_data=_build_callback('yookassa'),
+                    )
+                ]
+            )
+            has_direct_payment_methods = True
 
     if settings.TRIBUTE_ENABLED:
         keyboard.append(
