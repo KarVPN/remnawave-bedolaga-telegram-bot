@@ -42,6 +42,7 @@ async def send_referral_notification(
     user: User | None = None,
     bonus_kopeks: int = 0,
     referral_name: str = '',
+    notification_kind: str = 'bonus',
 ):
     """
     Отправляет реферальное уведомление в Telegram или по email.
@@ -57,12 +58,28 @@ async def send_referral_notification(
     # Handle email-only users via notification delivery service
     if telegram_id is None:
         if user is not None:
-            success = await notification_delivery_service.notify_referral_bonus(
-                user=user,
-                bonus_kopeks=bonus_kopeks,
-                referral_name=referral_name,
-                telegram_message=message,
-            )
+            success = False
+            if notification_kind == 'registered':
+                success = await notification_delivery_service.notify_referral_registered(
+                    user=user,
+                    referral_name=referral_name,
+                    telegram_message=message,
+                )
+            elif notification_kind == 'bonus' and bonus_kopeks > 0:
+                success = await notification_delivery_service.notify_referral_bonus(
+                    user=user,
+                    bonus_kopeks=bonus_kopeks,
+                    referral_name=referral_name,
+                    telegram_message=message,
+                )
+            else:
+                logger.debug(
+                    'Пропуск email-уведомления о реферале без начисления бонуса',
+                    user_id=user.id,
+                    notification_kind=notification_kind,
+                )
+                return
+
             if success:
                 logger.info('✅ Email уведомление о реферале отправлено пользователю', user_id=user.id)
             else:
@@ -125,7 +142,13 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
                     f'\n\n💰 При первом пополнении от {settings.format_price(settings.REFERRAL_MINIMUM_TOPUP_KOPEKS)} '
                     f'вы получите бонус {settings.format_price(settings.REFERRAL_FIRST_TOPUP_BONUS_KOPEKS)}!'
                 )
-            await send_referral_notification(bot, new_user.telegram_id, referral_notification, user=new_user)
+            await send_referral_notification(
+                bot,
+                new_user.telegram_id,
+                referral_notification,
+                user=new_user,
+                notification_kind='message_only',
+            )
 
             inviter_notification = (
                 f'👥 <b>Новый реферал!</b>\n\n'
@@ -143,7 +166,12 @@ async def process_referral_registration(db: AsyncSession, new_user_id: int, refe
                 f'📈 С каждого последующего пополнения вы будете получать {commission_percent}% комиссии.'
             )
             await send_referral_notification(
-                bot, referrer.telegram_id, inviter_notification, user=referrer, referral_name=new_user.full_name
+                bot,
+                referrer.telegram_id,
+                inviter_notification,
+                user=referrer,
+                referral_name=new_user.full_name,
+                notification_kind='registered',
             )
 
         logger.info(

@@ -519,6 +519,28 @@ class NotificationDeliveryService:
             telegram_markup=telegram_markup,
         )
 
+    async def notify_referral_registered(
+        self,
+        user: User,
+        referral_name: str,
+        bot: Bot | None = None,
+        telegram_message: str | None = None,
+        telegram_markup: Any | None = None,
+    ) -> bool:
+        """Notify user about a newly registered referral."""
+        context = {
+            'referral_name': referral_name,
+        }
+
+        return await self.send_notification(
+            user=user,
+            notification_type=NotificationType.REFERRAL_REGISTERED,
+            context=context,
+            bot=bot,
+            telegram_message=telegram_message,
+            telegram_markup=telegram_markup,
+        )
+
     async def notify_partner_approved(
         self,
         user: User,

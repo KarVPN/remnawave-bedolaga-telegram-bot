@@ -117,3 +117,53 @@ async def test_first_topup_inviter_gets_fixed_plus_commission(monkeypatch):
 
     # With old max() logic, this would have been max(5000, 7500) = 7500 — wrong!
     assert expected_inviter_bonus == 12500
+
+
+async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypatch):
+    new_user = SimpleNamespace(
+        id=1,
+        telegram_id=None,
+        email='new@example.com',
+        full_name='New User',
+        referred_by_id=2,
+    )
+    referrer = SimpleNamespace(
+        id=2,
+        telegram_id=None,
+        email='ref@example.com',
+        full_name='Referrer',
+    )
+
+    db = SimpleNamespace()
+
+    get_user_mock = AsyncMock(side_effect=[new_user, referrer])
+    monkeypatch.setattr(referral_service, 'get_user_by_id', get_user_mock)
+    monkeypatch.setattr(referral_service, 'create_referral_earning', AsyncMock())
+    monkeypatch.setattr(referral_service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_service, 'get_effective_referral_commission_percent', lambda u: 25)
+
+    notify_bonus_mock = AsyncMock(return_value=True)
+    notify_registered_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        referral_service.notification_delivery_service,
+        'notify_referral_bonus',
+        notify_bonus_mock,
+    )
+    monkeypatch.setattr(
+        referral_service.notification_delivery_service,
+        'notify_referral_registered',
+        notify_registered_mock,
+    )
+
+    result = await referral_service.process_referral_registration(
+        db,
+        new_user_id=new_user.id,
+        referrer_id=referrer.id,
+        bot=None,
+    )
+
+    assert result is True
+    notify_bonus_mock.assert_not_awaited()
+    notify_registered_mock.assert_awaited_once()
+    assert notify_registered_mock.await_args.kwargs['user'] is referrer
+    assert notify_registered_mock.await_args.kwargs['referral_name'] == new_user.full_name
