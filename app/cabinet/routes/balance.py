@@ -344,8 +344,10 @@ async def create_topup(
     payment_url = None
     payment_id = None
     cabinet_return_url = f'{settings.CABINET_URL.rstrip("/")}/balance/top-up/result?method={request.payment_method}'
-    cabinet_success_url = f'{cabinet_return_url}&status=success'
-    cabinet_failed_url = f'{cabinet_return_url}&status=failed'
+    miniapp_return_url = None
+    if request.return_to_miniapp:
+        miniapp_return_url = settings.get_miniapp_launch_url(f'topup_result_{request.payment_method}')
+    payment_return_url = miniapp_return_url or cabinet_return_url
 
     try:
         if request.payment_method == 'yookassa':
@@ -373,7 +375,7 @@ async def create_topup(
                     receipt_email=receipt_email,
                     receipt_phone=receipt_phone,
                     metadata=yookassa_metadata,
-                    return_url=cabinet_return_url,
+                    return_url=payment_return_url,
                 )
             else:
                 result = await payment_service.create_yookassa_payment(
@@ -384,7 +386,7 @@ async def create_topup(
                     receipt_email=receipt_email,
                     receipt_phone=receipt_phone,
                     metadata=yookassa_metadata,
-                    return_url=cabinet_return_url,
+                    return_url=payment_return_url,
                 )
 
             if result:

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     MINIAPP_TICKETS_ENABLED: bool = True  # Enable/disable tickets section in miniapp
     MINIAPP_SUPPORT_TYPE: str = 'tickets'  # one of: tickets, profile, url
     MINIAPP_SUPPORT_URL: str = ''  # Custom URL to redirect when tickets disabled (only for url type)
+    MINIAPP_SHORT_NAME: str = ''  # Optional BotFather mini app short name for direct startapp links
 
     ADMIN_NOTIFICATIONS_ENABLED: bool = False
     ADMIN_NOTIFICATIONS_CHAT_ID: str | None = None
@@ -1482,6 +1483,24 @@ class Settings(BaseSettings):
             if value:
                 return value
         return None
+
+    def get_miniapp_launch_url(self, startapp: str | None = None) -> str | None:
+        username = self.get_bot_username()
+        if not username:
+            return None
+
+        short_name = (self.MINIAPP_SHORT_NAME or '').strip().strip('/')
+        safe_startapp = _url_quote(startapp, safe='') if startapp else ''
+
+        if short_name:
+            base_url = f'https://t.me/{username}/{short_name}'
+        else:
+            base_url = f'https://t.me/{username}'
+
+        if safe_startapp:
+            return f'{base_url}?startapp={safe_startapp}'
+
+        return base_url
 
     _CABINET_URL_DEFAULT = 'https://example.com/cabinet'
 

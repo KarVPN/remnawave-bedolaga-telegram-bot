@@ -65,6 +65,7 @@ class TopUpRequest(BaseModel):
     amount_kopeks: int = Field(..., ge=1000, le=2_000_000_000, description='Amount in kopeks (min 10 rubles)')
     payment_method: str = Field(..., description='Payment method ID')
     payment_option: str | None = Field(None, description='Payment option (e.g. Platega method code)')
+    return_to_miniapp: bool = Field(False, description='Return to Telegram Mini App after payment')
 
 
 class TopUpResponse(BaseModel):
