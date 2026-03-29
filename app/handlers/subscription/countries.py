@@ -33,6 +33,20 @@ from .common import _get_period_hint_from_subscription, logger
 from .summary import present_subscription_summary
 
 
+async def _get_tariff_included_countries(db: AsyncSession, user: User) -> list[str]:
+    subscription = getattr(user, 'subscription', None)
+    if not subscription or not subscription.tariff_id:
+        return []
+
+    from app.database.crud.tariff import get_tariff_by_id
+
+    tariff = getattr(subscription, 'tariff', None)
+    if tariff is None:
+        tariff = await get_tariff_by_id(db, subscription.tariff_id)
+
+    return list(getattr(tariff, 'allowed_squads', None) or [])
+
+
 async def handle_add_countries(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     if not await _should_show_countries_management(db_user):
         texts = get_texts(db_user.language)
@@ -56,7 +70,8 @@ async def handle_add_countries(callback: types.CallbackQuery, db_user: User, db:
         return
 
     countries = await _get_available_countries(db_user.promo_group_id)
-    current_countries = subscription.connected_squads
+    immutable_countries = await _get_tariff_included_countries(db, db_user)
+    current_countries = list(dict.fromkeys((subscription.connected_squads or []) + immutable_countries))
 
     period_hint_days = _get_period_hint_from_subscription(subscription)
     servers_discount_percent = PricingEngine.get_addon_discount_percent(
@@ -83,6 +98,7 @@ async def handle_add_countries(callback: types.CallbackQuery, db_user: User, db:
             '📋 <b>Текущие страны ({current_count}):</b>\n'
             '{current_list}\n\n'
             '💡 <b>Инструкция:</b>\n'
+            '🔒 - сервер включен в тариф\n'
             '✅ - страна подключена\n'
             '➕ - будет добавлена (платно)\n'
             '➖ - будет отключена (бесплатно)\n'
@@ -94,7 +110,7 @@ async def handle_add_countries(callback: types.CallbackQuery, db_user: User, db:
         current_list=current_list,
     )
 
-    await state.update_data(countries=current_countries.copy())
+    await state.update_data(countries=current_countries.copy(), immutable_countries=immutable_countries)
 
     await callback.message.edit_text(
         text,
@@ -105,6 +121,7 @@ async def handle_add_countries(callback: types.CallbackQuery, db_user: User, db:
             db_user.language,
             subscription.end_date,
             servers_discount_percent,
+            immutable_countries,
         ),
         parse_mode='HTML',
     )
@@ -168,6 +185,11 @@ async def handle_manage_country(callback: types.CallbackQuery, db_user: User, db
 
     data = await state.get_data()
     current_selected = data.get('countries', subscription.connected_squads.copy())
+    immutable_countries = set(data.get('immutable_countries', []))
+
+    if country_uuid in immutable_countries:
+        await callback.answer('ℹ️ Этот сервер включен в текущий тариф и не может быть отключен', show_alert=True)
+        return
 
     countries = await _get_available_countries(db_user.promo_group_id)
     allowed_country_ids = {country['uuid'] for country in countries}
@@ -210,6 +232,7 @@ async def handle_manage_country(callback: types.CallbackQuery, db_user: User, db
                 db_user.language,
                 subscription.end_date,
                 servers_discount_percent,
+                list(immutable_countries),
             )
         )
         logger.info('✅ Клавиатура обновлена')
@@ -230,16 +253,21 @@ async def apply_countries_changes(callback: types.CallbackQuery, db_user: User, 
     resume_callback = 'subscription_resume_checkout' if should_offer_checkout_resume(db_user, True) else None
     subscription = db_user.subscription
 
-    selected_countries = data.get('countries', [])
-    current_countries = subscription.connected_squads
+    immutable_countries = await _get_tariff_included_countries(db, db_user)
+    selected_countries = list(dict.fromkeys([*immutable_countries, *(data.get('countries', []))]))
+    current_countries = list(dict.fromkeys((subscription.connected_squads or []) + immutable_countries))
 
     countries = await _get_available_countries(db_user.promo_group_id)
     allowed_country_ids = {country['uuid'] for country in countries}
 
-    selected_countries = [country_uuid for country_uuid in selected_countries if country_uuid in allowed_country_ids]
+    selected_countries = [
+        country_uuid
+        for country_uuid in selected_countries
+        if country_uuid in allowed_country_ids or country_uuid in immutable_countries
+    ]
 
     added = [c for c in selected_countries if c not in current_countries]
-    removed = [c for c in current_countries if c not in selected_countries]
+    removed = [c for c in current_countries if c not in selected_countries and c not in immutable_countries]
 
     if not added and not removed:
         await callback.answer(
@@ -672,6 +700,11 @@ async def handle_add_country_to_subscription(
     logger.info('🔍 Данные состояния', data=data)
 
     selected_countries = data.get('countries', [])
+    immutable_countries = set(data.get('immutable_countries', []))
+    if country_uuid in immutable_countries:
+        await callback.answer('ℹ️ Этот сервер включен в текущий тариф и не может быть отключен', show_alert=True)
+        return
+
     countries = await _get_available_countries(db_user.promo_group_id)
     allowed_country_ids = {country['uuid'] for country in countries}
 
@@ -728,6 +761,7 @@ async def handle_add_country_to_subscription(
                 db_user.language,
                 subscription.end_date,
                 servers_discount_percent,
+                list(immutable_countries),
             )
         )
         logger.info('✅ Клавиатура обновлена')
@@ -778,16 +812,21 @@ async def confirm_add_countries_to_subscription(
     texts = get_texts(db_user.language)
     subscription = db_user.subscription
 
-    selected_countries = data.get('countries', [])
-    current_countries = subscription.connected_squads
+    immutable_countries = await _get_tariff_included_countries(db, db_user)
+    selected_countries = list(dict.fromkeys([*immutable_countries, *(data.get('countries', []))]))
+    current_countries = list(dict.fromkeys((subscription.connected_squads or []) + immutable_countries))
 
     countries = await _get_available_countries(db_user.promo_group_id)
     allowed_country_ids = {country['uuid'] for country in countries}
 
-    selected_countries = [country_uuid for country_uuid in selected_countries if country_uuid in allowed_country_ids]
+    selected_countries = [
+        country_uuid
+        for country_uuid in selected_countries
+        if country_uuid in allowed_country_ids or country_uuid in immutable_countries
+    ]
 
     new_countries = [c for c in selected_countries if c not in current_countries]
-    removed_countries = [c for c in current_countries if c not in selected_countries]
+    removed_countries = [c for c in current_countries if c not in selected_countries and c not in immutable_countries]
 
     if not new_countries and not removed_countries:
         await callback.answer('⚠️ Изменения не обнаружены', show_alert=True)

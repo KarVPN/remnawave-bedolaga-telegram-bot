@@ -6487,6 +6487,7 @@ async def purchase_tariff_endpoint(
         device_limit = subscription.device_limit
 
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         payload.period_days,
         device_limit=device_limit,

@@ -4918,6 +4918,7 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
 
     try:
         result = await pricing_engine.calculate_tariff_purchase_price(
+            db,
             tariff,
             period,
             device_limit=device_limit,

@@ -361,6 +361,7 @@ class SubscriptionRenewalService:
         charge_balance_amount: int | None = None,
         description: str | None = None,
         payment_method: PaymentMethod | None = None,
+        connected_squads_override: list[str] | None = None,
     ) -> SubscriptionRenewalResult:
         final_total = int(pricing.final_total)
         final_total = max(final_total, 0)
@@ -418,7 +419,12 @@ class SubscriptionRenewalService:
         )
 
         try:
-            subscription_after = await extend_subscription(db, subscription_before, period_days)
+            subscription_after = await extend_subscription(
+                db,
+                subscription_before,
+                period_days,
+                connected_squads=connected_squads_override,
+            )
         except Exception:
             # Session may be in a failed state after a broken commit — rollback first
             await db.rollback()

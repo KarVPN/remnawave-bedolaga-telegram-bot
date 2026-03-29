@@ -8,6 +8,7 @@ import structlog
 
 from app.config import CLASSIC_PERIOD_PRICES, PERIOD_PRICES, settings
 from app.database.crud.server_squad import get_server_squads_by_uuids
+from app.services.tariff_extra_squads import get_subscription_extra_squad_uuids
 from app.utils.pricing_utils import calculate_months_from_days
 from app.utils.promo_offer import get_user_active_promo_discount_percent
 
@@ -27,6 +28,10 @@ class TariffBreakdown:
 
     tariff_id: int
     extra_devices: int
+    extra_server_uuids: list[str] = field(default_factory=list)
+    servers: list[dict[str, Any]] = field(default_factory=list)
+    servers_individual_prices: list[int] = field(default_factory=list)
+    server_ids: list[int] = field(default_factory=list)
     group_discount_pct: dict[str, int]
     offer_discount_pct: int
     months_in_period: int = 1
@@ -423,7 +428,7 @@ class PricingEngine:
             servers = await get_server_squads_by_uuids(db, country_uuids)
         except Exception as e:  # intentional broad catch: pricing must not crash on DB errors, servers_price=0 is safe (user pays less)
             logger.error('Ошибка пакетной загрузки серверов', error=str(e), squad_uuids=country_uuids)
-            return 0, [{'uuid': uuid, 'id': None, 'price': 0, 'status': 'error'} for uuid in country_uuids]
+            return 0, [{'uuid': uuid, 'id': None, 'name': uuid, 'price': 0, 'status': 'error'} for uuid in country_uuids]
 
         server_map = {s.squad_uuid: s for s in servers}
 
@@ -434,7 +439,7 @@ class PricingEngine:
             server = server_map.get(uuid)
             if server is None:
                 logger.error('Сервер не найден в БД', squad_uuid=uuid)
-                details.append({'uuid': uuid, 'id': None, 'price': 0, 'status': 'not_found'})
+                details.append({'uuid': uuid, 'id': None, 'name': uuid, 'price': 0, 'status': 'not_found'})
                 continue
 
             price = server.price_kopeks or 0
@@ -466,7 +471,15 @@ class PricingEngine:
                     )
 
             total_price += price
-            details.append({'uuid': uuid, 'id': server.id, 'price': price, 'status': status})
+            details.append(
+                {
+                    'uuid': uuid,
+                    'id': server.id,
+                    'name': getattr(server, 'display_name', uuid),
+                    'price': price,
+                    'status': status,
+                }
+            )
 
         return total_price, details
 
@@ -502,6 +515,7 @@ class PricingEngine:
         period_days: int,
         *,
         user: User | None = None,
+        selected_extra_squad_uuids: list[str] | None = None,
     ) -> RenewalPricing:
         """Calculate renewal price for a subscription.
 
@@ -520,7 +534,13 @@ class PricingEngine:
                     tariff_id=subscription.tariff_id,
                 )
             else:
-                return await self._calculate_tariff_mode(db, subscription, period_days, user=user)
+                return await self._calculate_tariff_mode(
+                    db,
+                    subscription,
+                    period_days,
+                    user=user,
+                    selected_extra_squad_uuids=selected_extra_squad_uuids,
+                )
         return await self._calculate_classic_mode(db, subscription, period_days, user=user)
 
     # ------------------------------------------------------------------
@@ -534,33 +554,44 @@ class PricingEngine:
         period_days: int,
         *,
         user: User | None = None,
+        selected_extra_squad_uuids: list[str] | None = None,
     ) -> RenewalPricing:
         """Price calculation when subscription is linked to a Tariff."""
         tariff = subscription.tariff
         device_limit = subscription.device_limit or 0
+        extra_squad_uuids = (
+            list(dict.fromkeys(selected_extra_squad_uuids))
+            if selected_extra_squad_uuids is not None
+            else await get_subscription_extra_squad_uuids(db, subscription)
+        )
         return await self._calculate_tariff_core(
+            db,
             tariff,
             period_days,
             device_limit,
             user=user,
+            extra_squad_uuids=extra_squad_uuids,
         )
 
     async def _calculate_tariff_core(
         self,
+        db: AsyncSession,
         tariff: Tariff,
         period_days: int,
         device_limit: int,
         *,
         custom_traffic_gb: int | None = None,
         user: User | None = None,
+        extra_squad_uuids: list[str] | None = None,
     ) -> RenewalPricing:
         """Core tariff pricing logic (raw params, no Subscription needed).
 
         Per-category discounts:
         - 'period' → base tariff price
         - 'devices' → extra device cost
+        - 'servers' → extra server squads on top of the tariff
         Promo-offer discount applied on the discounted subtotal.
-        Device cost is monthly × months_in_period.
+        Add-on costs are monthly × months_in_period.
         """
         months = calculate_months_from_days(period_days)
 
@@ -588,6 +619,17 @@ class PricingEngine:
         else:
             devices_price = extra_devices * device_price_per_unit * months
 
+        extra_squad_uuids = list(dict.fromkeys(extra_squad_uuids or []))
+        promo_group_id = getattr(user, 'promo_group_id', None) if user else None
+        servers_price_per_month = 0
+        server_details: list[dict[str, Any]] = []
+        if extra_squad_uuids:
+            servers_price_per_month, server_details = await self._calculate_servers_price(
+                extra_squad_uuids,
+                db,
+                promo_group_id=promo_group_id,
+            )
+
         # --- Custom traffic (tariff add-on, uses addon discount path) ---
         traffic_price = 0
         if custom_traffic_gb is not None and hasattr(tariff, 'get_price_for_custom_traffic'):
@@ -598,15 +640,22 @@ class PricingEngine:
         # --- Per-category group discounts ---
         period_pct = 0
         devices_pct = 0
+        servers_pct = 0
         promo_group = self.resolve_promo_group(user)
         if promo_group is not None:
             period_pct = promo_group.get_discount_percent('period', period_days)
             devices_pct = promo_group.get_discount_percent('devices', period_days)
+            servers_pct = promo_group.get_discount_percent('servers', period_days)
 
         offer_pct = get_user_active_promo_discount_percent(user) if user else 0
 
         discounted_base = self.apply_discount(base_price, period_pct)
         discounted_devices = self.apply_discount(devices_price, devices_pct)
+        discounted_servers_per_month = self.apply_discount(servers_price_per_month, servers_pct)
+        if is_daily and period_days <= 1:
+            servers_price = discounted_servers_per_month
+        else:
+            servers_price = discounted_servers_per_month * months
 
         # Traffic uses addon discount (checks apply_discounts_to_addons flag)
         discounted_traffic = traffic_price
@@ -615,19 +664,30 @@ class PricingEngine:
 
         base_group_disc = base_price - discounted_base
         devices_group_disc = devices_price - discounted_devices
+        servers_group_disc = (
+            servers_price_per_month - discounted_servers_per_month
+        ) * (1 if is_daily and period_days <= 1 else months)
         traffic_group_disc = traffic_price - discounted_traffic
-        total_group_discount = base_group_disc + devices_group_disc + traffic_group_disc
+        total_group_discount = base_group_disc + devices_group_disc + servers_group_disc + traffic_group_disc
 
-        subtotal = discounted_base + discounted_devices + discounted_traffic
+        subtotal = discounted_base + discounted_devices + servers_price + discounted_traffic
         after_offer = self.apply_discount(subtotal, offer_pct)
         offer_discount = subtotal - after_offer
         final_total = after_offer
 
+        valid_servers = [detail for detail in server_details if detail.get('id') is not None]
+        server_multiplier = 1 if is_daily and period_days <= 1 else months
         breakdown = dataclasses.asdict(
             TariffBreakdown(
                 tariff_id=tariff.id,
                 extra_devices=extra_devices,
-                group_discount_pct={'period': period_pct, 'devices': devices_pct},
+                extra_server_uuids=extra_squad_uuids,
+                servers=server_details,
+                servers_individual_prices=[
+                    self.apply_discount(int(detail['price']), servers_pct) * server_multiplier for detail in valid_servers
+                ],
+                server_ids=[int(detail['id']) for detail in valid_servers],
+                group_discount_pct={'period': period_pct, 'devices': devices_pct, 'servers': servers_pct},
                 offer_discount_pct=offer_pct,
                 months_in_period=months,
             )
@@ -645,7 +705,7 @@ class PricingEngine:
 
         return RenewalPricing(
             base_price=discounted_base,
-            servers_price=0,
+            servers_price=servers_price,
             traffic_price=discounted_traffic,
             devices_price=discounted_devices,
             promo_group_discount=total_group_discount,
@@ -658,12 +718,14 @@ class PricingEngine:
 
     async def calculate_tariff_purchase_price(
         self,
+        db: AsyncSession,
         tariff: Tariff,
         period_days: int,
         *,
         device_limit: int | None = None,
         custom_traffic_gb: int | None = None,
         user: User | None = None,
+        extra_squad_uuids: list[str] | None = None,
     ) -> RenewalPricing:
         """Calculate price for a tariff purchase (new or renewal).
 
@@ -672,11 +734,13 @@ class PricingEngine:
         """
         effective_device_limit = device_limit if device_limit is not None else (tariff.device_limit or 0)
         return await self._calculate_tariff_core(
+            db,
             tariff,
             period_days,
             effective_device_limit,
             custom_traffic_gb=custom_traffic_gb,
             user=user,
+            extra_squad_uuids=extra_squad_uuids,
         )
 
     # ------------------------------------------------------------------

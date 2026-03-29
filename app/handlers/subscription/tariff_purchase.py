@@ -18,6 +18,10 @@ from app.database.models import Tariff, TransactionType, User
 from app.localization.texts import get_texts
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.subscription_service import SubscriptionService
+from app.services.tariff_extra_squads import (
+    build_connected_squads_for_tariff_renewal,
+    get_subscription_extra_squad_records,
+)
 from app.services.user_cart_service import user_cart_service
 from app.utils.decorators import error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
@@ -420,6 +424,7 @@ async def format_custom_tariff_preview(
         from app.services.pricing_engine import pricing_engine
 
         result = await pricing_engine.calculate_tariff_purchase_price(
+            db,
             tariff,
             days,
             device_limit=tariff.device_limit,
@@ -821,6 +826,7 @@ async def handle_custom_confirm(
     from app.services.pricing_engine import pricing_engine
 
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         custom_days,
         device_limit=tariff.device_limit,
@@ -1201,6 +1207,7 @@ async def confirm_tariff_purchase(
         device_limit = existing_sub.device_limit
 
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period,
         device_limit=device_limit,
@@ -1420,6 +1427,7 @@ async def confirm_daily_tariff_purchase(
     from app.services.pricing_engine import pricing_engine
 
     pricing_result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period_days=1,
         device_limit=tariff.device_limit,
@@ -1701,6 +1709,248 @@ def get_tariff_extend_confirm_keyboard(
     )
 
 
+async def _get_tariff_renewal_extra_squad_items(
+    db: AsyncSession,
+    db_user: User,
+    subscription: User | object,
+    period: int,
+    selected_extra_squads: list[str] | None = None,
+) -> tuple[list[dict[str, object]], int]:
+    from app.services.pricing_engine import PricingEngine
+
+    extra_records = await get_subscription_extra_squad_records(db, subscription)
+    if not extra_records:
+        return [], 0
+
+    selected = (
+        set(selected_extra_squads)
+        if selected_extra_squads is not None
+        else {record.squad_uuid for record in extra_records}
+    )
+    promo_group = PricingEngine.resolve_promo_group(db_user)
+    servers_pct = promo_group.get_discount_percent('servers', period) if promo_group else 0
+    months = max(1, round(period / 30))
+
+    items: list[dict[str, object]] = []
+    total = 0
+    for record in extra_records:
+        price = PricingEngine.apply_discount(int(record.price_kopeks or 0), servers_pct) * months
+        enabled = record.squad_uuid in selected
+        if enabled:
+            total += price
+        items.append(
+            {
+                'uuid': record.squad_uuid,
+                'name': record.display_name,
+                'price_kopeks': price,
+                'enabled': enabled,
+            }
+        )
+
+    return items, total
+
+
+def get_tariff_extend_extra_squads_keyboard(
+    tariff_id: int,
+    period: int,
+    items: list[dict[str, object]],
+    language: str,
+) -> InlineKeyboardMarkup:
+    texts = get_texts(language)
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    all_enabled = bool(items) and all(bool(item['enabled']) for item in items)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text=texts.t(
+                    'TARIFF_RENEWAL_EXTRA_SQUADS_TOGGLE_ALL_ON',
+                    '✅ Оставить все дополнительные серверы',
+                )
+                if all_enabled
+                else texts.t(
+                    'TARIFF_RENEWAL_EXTRA_SQUADS_TOGGLE_ALL_OFF',
+                    '⬜️ Отключить все дополнительные серверы',
+                ),
+                callback_data=f'tariff_ext_extra_all:{tariff_id}:{period}',
+            )
+        ]
+    )
+
+    for item in items:
+        enabled = bool(item['enabled'])
+        marker = '✅' if enabled else '⬜️'
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{marker} {item['name']} (+{format_price_kopeks(int(item['price_kopeks']))})",
+                    callback_data=f"tariff_ext_extra:{tariff_id}:{period}:{item['uuid']}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text=texts.t('TARIFF_RENEWAL_EXTRA_SQUADS_CONFIRM', '✅ Продолжить'),
+                callback_data=f'tariff_ext_extra_confirm:{tariff_id}:{period}',
+            )
+        ]
+    )
+    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'tariff_extend:{tariff_id}')])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _show_tariff_extend_extra_squads(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+    tariff: Tariff,
+    subscription,
+    period: int,
+):
+    texts = get_texts(db_user.language)
+    data = await state.get_data()
+    selected_extra_squads = data.get('tariff_extend_selected_extra_squads')
+    items, total = await _get_tariff_renewal_extra_squad_items(
+        db,
+        db_user,
+        subscription,
+        period,
+        selected_extra_squads,
+    )
+    await state.update_data(
+        tariff_extend_tariff_id=tariff.id,
+        tariff_extend_period=period,
+        tariff_extend_selected_extra_squads=[item['uuid'] for item in items if item['enabled']],
+    )
+
+    lines = [
+        texts.t('TARIFF_RENEWAL_EXTRA_SQUADS_TITLE', '🌐 Дополнительные серверы'),
+        '',
+        texts.t(
+            'TARIFF_RENEWAL_EXTRA_SQUADS_TOTAL',
+            'Оставить дополнительные серверы +{amount}',
+        ).format(amount=format_price_kopeks(total)),
+        texts.t(
+            'TARIFF_RENEWAL_EXTRA_SQUADS_HINT',
+            'Сумма меняется в зависимости от переключателей ниже.',
+        ),
+        '',
+    ]
+
+    for item in items:
+        marker = '•'
+        state_label = texts.t('COMMON_ENABLED', 'Вкл') if item['enabled'] else texts.t('COMMON_DISABLED', 'Выкл')
+        lines.append(
+            f"{marker} {html.escape(str(item['name']))} +{format_price_kopeks(int(item['price_kopeks']))} {state_label}"
+        )
+
+    await callback.message.edit_text(
+        '\n'.join(lines),
+        reply_markup=get_tariff_extend_extra_squads_keyboard(tariff.id, period, items, db_user.language),
+    )
+
+
+async def _show_tariff_extend_confirmation(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+    tariff: Tariff,
+    subscription,
+    period: int,
+    selected_extra_squads: list[str] | None = None,
+):
+    texts = get_texts(db_user.language)
+    actual_device_limit = (subscription.device_limit if subscription else None) or tariff.device_limit
+
+    from app.services.pricing_engine import pricing_engine
+
+    result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
+        tariff,
+        period,
+        device_limit=actual_device_limit,
+        user=db_user,
+        extra_squad_uuids=selected_extra_squads,
+    )
+    final_price = result.final_total
+    original_price = result.original_total
+    total_discount = result.promo_group_discount + result.promo_offer_discount
+    discount_percent = (
+        round((1 - final_price / original_price) * 100) if original_price > 0 and total_discount > 0 else 0
+    )
+
+    user_balance = db_user.balance_kopeks or 0
+    traffic = format_traffic(tariff.traffic_limit_gb)
+
+    if user_balance >= final_price:
+        discount_text = ''
+        if discount_percent > 0:
+            discount_text = f'\n🎁 Скидка: {discount_percent}% (-{format_price_kopeks(total_discount)})'
+
+        await callback.message.edit_text(
+            f'✅ <b>Подтверждение продления</b>\n\n'
+            f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
+            f'📊 Трафик: {traffic}\n'
+            f'📱 Устройств: {actual_device_limit}\n'
+            f'📅 Период: {format_period(period)}\n'
+            f'{discount_text}\n'
+            f'💰 <b>К оплате: {format_price_kopeks(final_price)}</b>\n\n'
+            f'💳 Ваш баланс: {format_price_kopeks(user_balance)}\n'
+            f'После оплаты: {format_price_kopeks(user_balance - final_price)}',
+            reply_markup=get_tariff_extend_confirm_keyboard(tariff.id, period, db_user.language),
+            parse_mode='HTML',
+        )
+    else:
+        missing = final_price - user_balance
+        cart_data = {
+            'cart_mode': 'extend',
+            'tariff_id': tariff.id,
+            'subscription_id': subscription.id if subscription else None,
+            'period_days': period,
+            'total_price': final_price,
+            'user_id': db_user.id,
+            'saved_cart': True,
+            'missing_amount': missing,
+            'return_to_cart': True,
+            'description': f'Продление тарифа {tariff.name} на {period} дней',
+            'traffic_limit_gb': tariff.traffic_limit_gb,
+            'device_limit': actual_device_limit,
+            'allowed_squads': tariff.allowed_squads or [],
+            'selected_extra_squads': list(selected_extra_squads or []),
+            'discount_percent': discount_percent,
+        }
+        await user_cart_service.save_user_cart(db_user.id, cart_data)
+
+        await callback.message.edit_text(
+            f'❌ <b>Недостаточно средств</b>\n\n'
+            f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
+            f'📅 Период: {format_period(period)}\n'
+            f'💰 К оплате: {format_price_kopeks(final_price)}\n\n'
+            f'💳 Ваш баланс: {format_price_kopeks(user_balance)}\n'
+            f'⚠️ Не хватает: <b>{format_price_kopeks(missing)}</b>\n\n'
+            f'🛒 <i>Корзина сохранена! После пополнения баланса подписка будет продлена автоматически.</i>',
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text='💳 Пополнить баланс', callback_data='balance_topup')],
+                    [InlineKeyboardButton(text=texts.BACK, callback_data='subscription_extend')],
+                ]
+            ),
+            parse_mode='HTML',
+        )
+
+    await state.update_data(
+        extend_tariff_id=tariff.id,
+        extend_period=period,
+        extend_discount_percent=discount_percent,
+        tariff_extend_selected_extra_squads=list(selected_extra_squads or []),
+    )
+
+
 async def show_tariff_extend(
     callback: types.CallbackQuery,
     db_user: User,
@@ -1778,88 +2028,110 @@ async def select_tariff_extend_period(
     subscription = await get_subscription_by_user_id(db, db_user.id)
     actual_device_limit = (subscription.device_limit if subscription else None) or tariff.device_limit
 
-    # Calculate price via PricingEngine (per-category discounts: period + devices)
-    from app.services.pricing_engine import pricing_engine
+    if subscription and subscription.tariff_id == tariff.id:
+        extra_records = await get_subscription_extra_squad_records(db, subscription)
+        if extra_records:
+            await state.update_data(
+                tariff_extend_selected_extra_squads=[record.squad_uuid for record in extra_records]
+            )
+            await _show_tariff_extend_extra_squads(callback, db_user, db, state, tariff, subscription, period)
+            await callback.answer()
+            return
 
-    result = await pricing_engine.calculate_tariff_purchase_price(
-        tariff,
-        period,
-        device_limit=actual_device_limit,
-        user=db_user,
-    )
-    final_price = result.final_total
-    original_price = result.original_total
-    total_discount = result.promo_group_discount + result.promo_offer_discount
-    discount_percent = (
-        round((1 - final_price / original_price) * 100) if original_price > 0 and total_discount > 0 else 0
-    )
+    await _show_tariff_extend_confirmation(callback, db_user, db, state, tariff, subscription, period)
+    await callback.answer()
 
-    # Проверяем баланс
-    user_balance = db_user.balance_kopeks or 0
 
-    traffic = format_traffic(tariff.traffic_limit_gb)
+@error_handler
+async def toggle_tariff_extend_extra_squad(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    parts = callback.data.split(':')
+    tariff_id = int(parts[1])
+    period = int(parts[2])
+    squad_uuid = parts[3]
 
-    if user_balance >= final_price:
-        discount_text = ''
-        if discount_percent > 0:
-            discount_text = f'\n🎁 Скидка: {discount_percent}% (-{format_price_kopeks(total_discount)})'
+    subscription = await get_subscription_by_user_id(db, db_user.id)
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if not subscription or not tariff:
+        await callback.answer('Подписка не найдена', show_alert=True)
+        return
 
-        await callback.message.edit_text(
-            f'✅ <b>Подтверждение продления</b>\n\n'
-            f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
-            f'📊 Трафик: {traffic}\n'
-            f'📱 Устройств: {actual_device_limit}\n'
-            f'📅 Период: {format_period(period)}\n'
-            f'{discount_text}\n'
-            f'💰 <b>К оплате: {format_price_kopeks(final_price)}</b>\n\n'
-            f'💳 Ваш баланс: {format_price_kopeks(user_balance)}\n'
-            f'После оплаты: {format_price_kopeks(user_balance - final_price)}',
-            reply_markup=get_tariff_extend_confirm_keyboard(tariff_id, period, db_user.language),
-            parse_mode='HTML',
-        )
+    extra_records = await get_subscription_extra_squad_records(db, subscription)
+    valid_extra = {record.squad_uuid for record in extra_records}
+    if squad_uuid not in valid_extra:
+        await callback.answer('Сервер недоступен', show_alert=True)
+        return
+
+    data = await state.get_data()
+    selected = set(data.get('tariff_extend_selected_extra_squads', list(valid_extra)))
+    if squad_uuid in selected:
+        selected.remove(squad_uuid)
     else:
-        missing = final_price - user_balance
+        selected.add(squad_uuid)
 
-        # Сохраняем данные корзины для автопокупки после пополнения
-        cart_data = {
-            'cart_mode': 'extend',
-            'tariff_id': tariff_id,
-            'subscription_id': subscription.id if subscription else None,
-            'period_days': period,
-            'total_price': final_price,
-            'user_id': db_user.id,
-            'saved_cart': True,
-            'missing_amount': missing,
-            'return_to_cart': True,
-            'description': f'Продление тарифа {tariff.name} на {period} дней',
-            'traffic_limit_gb': tariff.traffic_limit_gb,
-            'device_limit': actual_device_limit,
-            'allowed_squads': tariff.allowed_squads or [],
-            'discount_percent': discount_percent,
-        }
-        await user_cart_service.save_user_cart(db_user.id, cart_data)
+    await state.update_data(tariff_extend_selected_extra_squads=list(selected))
+    await _show_tariff_extend_extra_squads(callback, db_user, db, state, tariff, subscription, period)
+    await callback.answer()
 
-        await callback.message.edit_text(
-            f'❌ <b>Недостаточно средств</b>\n\n'
-            f'📦 Тариф: <b>{html.escape(tariff.name)}</b>\n'
-            f'📅 Период: {format_period(period)}\n'
-            f'💰 К оплате: {format_price_kopeks(final_price)}\n\n'
-            f'💳 Ваш баланс: {format_price_kopeks(user_balance)}\n'
-            f'⚠️ Не хватает: <b>{format_price_kopeks(missing)}</b>\n\n'
-            f'🛒 <i>Корзина сохранена! После пополнения баланса подписка будет продлена автоматически.</i>',
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text='💳 Пополнить баланс', callback_data='balance_topup')],
-                    [InlineKeyboardButton(text=texts.BACK, callback_data='subscription_extend')],
-                ]
-            ),
-            parse_mode='HTML',
-        )
 
-    await state.update_data(
-        extend_tariff_id=tariff_id,
-        extend_period=period,
-        extend_discount_percent=discount_percent,
+@error_handler
+async def toggle_all_tariff_extend_extra_squads(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    parts = callback.data.split(':')
+    tariff_id = int(parts[1])
+    period = int(parts[2])
+
+    subscription = await get_subscription_by_user_id(db, db_user.id)
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if not subscription or not tariff:
+        await callback.answer('Подписка не найдена', show_alert=True)
+        return
+
+    extra_records = await get_subscription_extra_squad_records(db, subscription)
+    all_extra = [record.squad_uuid for record in extra_records]
+    data = await state.get_data()
+    selected = set(data.get('tariff_extend_selected_extra_squads', all_extra))
+    new_selected = [] if len(selected) == len(all_extra) else all_extra
+
+    await state.update_data(tariff_extend_selected_extra_squads=new_selected)
+    await _show_tariff_extend_extra_squads(callback, db_user, db, state, tariff, subscription, period)
+    await callback.answer()
+
+
+@error_handler
+async def confirm_tariff_extend_extra_squads(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+    state: FSMContext,
+):
+    parts = callback.data.split(':')
+    tariff_id = int(parts[1])
+    period = int(parts[2])
+    subscription = await get_subscription_by_user_id(db, db_user.id)
+    tariff = await get_tariff_by_id(db, tariff_id)
+    if not subscription or not tariff:
+        await callback.answer('Подписка не найдена', show_alert=True)
+        return
+
+    data = await state.get_data()
+    await _show_tariff_extend_confirmation(
+        callback,
+        db_user,
+        db,
+        state,
+        tariff,
+        subscription,
+        period,
+        data.get('tariff_extend_selected_extra_squads'),
     )
     await callback.answer()
 
@@ -1887,6 +2159,10 @@ async def confirm_tariff_extend(
         return
 
     actual_device_limit = subscription.device_limit or tariff.device_limit
+    state_data = await state.get_data()
+    selected_extra_squads = (
+        state_data.get('tariff_extend_selected_extra_squads') if subscription.tariff_id == tariff.id else None
+    )
 
     from app.database.crud.user import lock_user_for_pricing
 
@@ -1896,10 +2172,12 @@ async def confirm_tariff_extend(
     from app.services.pricing_engine import pricing_engine
 
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period,
         device_limit=actual_device_limit,
         user=db_user,
+        extra_squad_uuids=selected_extra_squads,
     )
     final_price = result.final_total
     consume_promo = result.promo_offer_discount > 0
@@ -1931,6 +2209,7 @@ async def confirm_tariff_extend(
             db,
             subscription,
             days=period,
+            connected_squads=await build_connected_squads_for_tariff_renewal(db, subscription, selected_extra_squads),
         )
 
         # Обновляем пользователя в Remnawave
@@ -2360,6 +2639,7 @@ async def select_tariff_switch_period(
     from app.services.pricing_engine import pricing_engine
 
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period,
         device_limit=tariff.device_limit or 0,
@@ -2466,6 +2746,7 @@ async def confirm_tariff_switch(
         subscription.device_limit if subscription.tariff_id == tariff.id else (tariff.device_limit or 0)
     )
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period,
         device_limit=effective_device_limit,
@@ -2651,6 +2932,7 @@ async def confirm_daily_tariff_switch(
     from app.services.pricing_engine import pricing_engine
 
     pricing_result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period_days=1,
         device_limit=tariff.device_limit,
@@ -3319,6 +3601,7 @@ async def confirm_instant_switch(
             # Для суточного тарифа - сбрасываем на 1 день и настраиваем суточные параметры
             # Apply group + promo-offer discounts via PricingEngine (single source of truth)
             daily_pricing = await pricing_engine.calculate_tariff_purchase_price(
+                db,
                 new_tariff,
                 period_days=1,
                 device_limit=new_tariff.device_limit,

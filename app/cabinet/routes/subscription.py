@@ -26,7 +26,7 @@ from app.services.notification_delivery_service import (
     NotificationType,
     notification_delivery_service,
 )
-from app.services.pricing_engine import pricing_engine
+from app.services.pricing_engine import PricingEngine, pricing_engine
 from app.services.remnawave_service import RemnaWaveService
 from app.services.subscription_purchase_service import (
     MiniAppSubscriptionPurchaseService,
@@ -39,14 +39,19 @@ from app.services.subscription_renewal_service import (
 )
 from app.services.subscription_service import SubscriptionService
 from app.services.system_settings_service import bot_configuration_service
+from app.services.tariff_extra_squads import (
+    build_connected_squads_for_tariff_renewal,
+    get_subscription_extra_squad_records,
+)
 from app.services.user_cart_service import user_cart_service
 from app.utils.cache import RateLimitCache, cache, cache_key
-from app.utils.pricing_utils import format_period_description
+from app.utils.pricing_utils import calculate_months_from_days, format_period_description
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.subscription import (
     AutopayUpdateRequest,
     DevicePurchaseRequest,
+    ExtraSquadPreviewItem,
     PurchasePreviewRequest,
     RenewalOptionResponse,
     RenewalRequest,
@@ -54,6 +59,8 @@ from ..schemas.subscription import (
     SubscriptionData,
     SubscriptionResponse,
     SubscriptionStatusResponse,
+    TariffRenewalPreviewRequest,
+    TariffRenewalPreviewResponse,
     TariffPurchaseRequest,
     TrafficPackageResponse,
     TrafficPurchaseRequest,
@@ -99,6 +106,65 @@ def _apply_addon_discount(
         'discount': discount_value,
         'percent': percent,
     }
+
+
+async def _get_tariff_included_squads(
+    db: AsyncSession,
+    subscription: Subscription | None,
+) -> list[str]:
+    """Return immutable server squads included in the current tariff."""
+    if not subscription or not subscription.tariff_id:
+        return []
+
+    tariff = getattr(subscription, 'tariff', None)
+    if tariff is None:
+        tariff = await get_tariff_by_id(db, subscription.tariff_id)
+
+    return list(getattr(tariff, 'allowed_squads', None) or [])
+
+
+async def _build_tariff_extra_squad_preview(
+    db: AsyncSession,
+    user: User,
+    subscription: Subscription | None,
+    period_days: int,
+    selected_extra_squads: list[str] | None = None,
+) -> tuple[list[ExtraSquadPreviewItem], int]:
+    if not subscription or not subscription.tariff_id:
+        return [], 0
+
+    extra_records = await get_subscription_extra_squad_records(db, subscription)
+    if not extra_records:
+        return [], 0
+
+    selected_set = (
+        set(selected_extra_squads)
+        if selected_extra_squads is not None
+        else {record.squad_uuid for record in extra_records}
+    )
+    discount = _apply_addon_discount(user, 'servers', 0, period_days)
+    servers_discount_pct = discount.get('percent', 0)
+    months = calculate_months_from_days(period_days)
+    multiplier = 1 if getattr(subscription.tariff, 'is_daily', False) and period_days <= 1 else months
+
+    items: list[ExtraSquadPreviewItem] = []
+    total_kopeks = 0
+    for record in extra_records:
+        per_period = PricingEngine.apply_discount(int(record.price_kopeks or 0), servers_discount_pct) * multiplier
+        enabled = record.squad_uuid in selected_set
+        if enabled:
+            total_kopeks += per_period
+        items.append(
+            ExtraSquadPreviewItem(
+                uuid=record.squad_uuid,
+                name=record.display_name,
+                price_kopeks=per_period,
+                price_label=settings.format_price(per_period),
+                enabled=enabled,
+            )
+        )
+
+    return items, total_kopeks
 
 
 def _subscription_to_response(
@@ -395,6 +461,7 @@ async def renew_subscription(
         subscription,
         request.period_days,
         user=user,
+        selected_extra_squad_uuids=request.selected_extra_squads,
     )
     price_kopeks = pricing.final_total
     promo_offer_discount_value = pricing.promo_offer_discount
@@ -454,6 +521,7 @@ async def renew_subscription(
             # Сохраняем актуальный device_limit подписки (включая докупленные устройства)
             cart_data['device_limit'] = user.subscription.device_limit
             cart_data['allowed_squads'] = tariff_allowed_squads
+            cart_data['selected_extra_squads'] = list(request.selected_extra_squads or [])
         else:
             # Classic mode: сохраняем текущие параметры подписки для корректной автопокупки
             cart_data['device_limit'] = user.subscription.device_limit
@@ -480,6 +548,11 @@ async def renew_subscription(
     # server price recording, and compensating refund on failure.
     renewal_description = f'Продление подписки на {request.period_days} дней' + (f' ({tariff.name})' if tariff else '')
     renewal_service = SubscriptionRenewalService()
+    connected_squads_override = (
+        await build_connected_squads_for_tariff_renewal(db, subscription, request.selected_extra_squads)
+        if subscription.tariff_id
+        else None
+    )
 
     try:
         result = await renewal_service.finalize(
@@ -489,6 +562,7 @@ async def renew_subscription(
             pricing,
             description=renewal_description,
             payment_method=PaymentMethod.BALANCE,
+            connected_squads_override=connected_squads_override,
         )
     except SubscriptionRenewalChargeError:
         raise HTTPException(
@@ -1923,14 +1997,17 @@ async def purchase_tariff(
             device_limit = existing_subscription.device_limit
             if (existing_subscription.device_limit or 0) > (tariff.device_limit or 0):
                 effective_device_limit = existing_subscription.device_limit
+        selected_extra_squads = request.selected_extra_squads if existing_subscription and existing_subscription.tariff_id == tariff.id else None
 
         # Calculate price via PricingEngine (single source of truth)
         result = await pricing_engine.calculate_tariff_purchase_price(
+            db,
             tariff,
             period_days,
             device_limit=device_limit,
             custom_traffic_gb=custom_traffic_gb,
             user=user,
+            extra_squad_uuids=selected_extra_squads,
         )
         price_kopeks = result.final_total
         original_price = result.original_total
@@ -1968,6 +2045,7 @@ async def purchase_tariff(
                     'traffic_limit_gb': tariff.traffic_limit_gb,
                     'device_limit': effective_device_limit,
                     'allowed_squads': tariff.allowed_squads or [],
+                    'selected_extra_squads': list(selected_extra_squads or []),
                     'consume_promo_offer': promo_offer_discount_value > 0,
                     'source': 'cabinet',
                 }
@@ -1985,6 +2063,7 @@ async def purchase_tariff(
                     'traffic_limit_gb': traffic_limit_gb,
                     'device_limit': effective_device_limit,
                     'allowed_squads': tariff.allowed_squads or [],
+                    'selected_extra_squads': list(selected_extra_squads or []),
                     'discount_percent': discount_percent,
                     'consume_promo_offer': promo_offer_discount_value > 0,
                     'source': 'cabinet',
@@ -2018,6 +2097,14 @@ async def purchase_tariff(
 
             all_servers, _ = await get_all_server_squads(db, available_only=True)
             squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+
+        effective_connected_squads = list(squads)
+        if existing_subscription and existing_subscription.tariff_id == tariff.id:
+            effective_connected_squads = await build_connected_squads_for_tariff_renewal(
+                db,
+                existing_subscription,
+                selected_extra_squads,
+            )
 
         # Charge balance
         if is_daily_tariff:
@@ -2061,7 +2148,7 @@ async def purchase_tariff(
                 tariff_id=tariff.id,
                 traffic_limit_gb=traffic_limit_gb,
                 device_limit=effective_device_limit,
-                connected_squads=squads,
+                connected_squads=effective_connected_squads,
             )
         else:
             # Create new subscription
@@ -2071,7 +2158,7 @@ async def purchase_tariff(
                 duration_days=period_days,
                 traffic_limit_gb=traffic_limit_gb,
                 device_limit=tariff.device_limit,
-                connected_squads=squads,
+                connected_squads=effective_connected_squads,
                 tariff_id=tariff.id,
             )
 
@@ -2114,6 +2201,7 @@ async def purchase_tariff(
                     'total_price': price_kopeks,
                     'tariff_id': tariff.id,
                     'description': f'Продление тарифа {tariff.name} на {period_days} дней',
+                    'selected_extra_squads': list(selected_extra_squads or []),
                 }
                 await user_cart_service.save_user_cart(user.id, cart_data)
                 logger.info('Tariff cart saved for auto-renewal (cabinet) user', user_id=user.id)
@@ -2218,6 +2306,57 @@ async def purchase_tariff(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to process tariff purchase',
         )
+
+
+@router.post('/tariff-renewal-preview', response_model=TariffRenewalPreviewResponse)
+async def tariff_renewal_preview(
+    request: TariffRenewalPreviewRequest,
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    subscription = await get_subscription_by_user_id(db, user.id)
+    if not subscription or not subscription.tariff_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='No tariff subscription found')
+
+    tariff = await get_tariff_by_id(db, request.tariff_id)
+    if not tariff or not tariff.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Tariff not found or inactive')
+
+    existing_subscription = subscription if subscription.tariff_id == tariff.id else None
+    device_limit = existing_subscription.device_limit if existing_subscription else None
+
+    result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
+        tariff,
+        request.period_days,
+        device_limit=device_limit,
+        custom_traffic_gb=request.traffic_gb if request.traffic_gb is not None and tariff.can_purchase_custom_traffic() else None,
+        user=user,
+        extra_squad_uuids=request.selected_extra_squads if existing_subscription else None,
+    )
+    extra_items, extra_total = await _build_tariff_extra_squad_preview(
+        db,
+        user,
+        existing_subscription,
+        request.period_days,
+        request.selected_extra_squads,
+    )
+
+    original_total = result.original_total if result.original_total > result.final_total else None
+    return TariffRenewalPreviewResponse(
+        final_total_kopeks=result.final_total,
+        final_total_label=settings.format_price(result.final_total),
+        original_total_kopeks=original_total,
+        original_total_label=settings.format_price(original_total) if original_total is not None else None,
+        base_price_kopeks=result.base_price,
+        devices_price_kopeks=result.devices_price,
+        traffic_price_kopeks=result.traffic_price,
+        servers_price_kopeks=result.servers_price,
+        offer_discount_percent=int(result.breakdown.get('offer_discount_pct', 0) or 0),
+        extra_squads_total_kopeks=extra_total,
+        extra_squads_total_label=settings.format_price(extra_total),
+        extra_squads=extra_items,
+    )
 
 
 # ============ Device Purchase ============
@@ -2969,8 +3108,11 @@ async def get_available_countries(
 
     connected_squads = []
     days_left = 0
+    tariff_included_squads: set[str] = set()
     if user.subscription:
         connected_squads = user.subscription.connected_squads or []
+        tariff_included_squads = set(await _get_tariff_included_squads(db, user.subscription))
+        connected_squads = list(dict.fromkeys(connected_squads + list(tariff_included_squads)))
         # Calculate days left for prorated pricing
         if user.subscription.end_date:
             delta = user.subscription.end_date - datetime.now(UTC)
@@ -3010,6 +3152,7 @@ async def get_available_countries(
                 'price_rubles': prorated_price / 100,
                 'is_available': server.is_available and not server.is_full,
                 'is_connected': server.squad_uuid in connected_squads,
+                'is_included_in_tariff': server.squad_uuid in tariff_included_squads,
                 'has_discount': servers_discount_percent > 0,
                 'discount_percent': servers_discount_percent,
             }
@@ -3059,22 +3202,25 @@ async def update_countries(
             detail='At least one country must be selected',
         )
 
-    current_countries = user.subscription.connected_squads or []
+    tariff_included_squads = await _get_tariff_included_squads(db, user.subscription)
+    current_countries = list(dict.fromkeys((user.subscription.connected_squads or []) + tariff_included_squads))
     promo_group_id = user.promo_group_id
 
     available_servers = await get_available_server_squads(db, promo_group_id=promo_group_id)
     allowed_country_ids = {server.squad_uuid for server in available_servers}
 
+    selected_countries = list(dict.fromkeys([*tariff_included_squads, *selected_countries]))
+
     # Validate selected countries
     for country_uuid in selected_countries:
-        if country_uuid not in allowed_country_ids:
+        if country_uuid not in allowed_country_ids and country_uuid not in tariff_included_squads:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f'Country {country_uuid} is not available',
             )
 
     added = [c for c in selected_countries if c not in current_countries]
-    removed = [c for c in current_countries if c not in selected_countries]
+    removed = [c for c in current_countries if c not in selected_countries and c not in tariff_included_squads]
 
     if not added and not removed:
         return {

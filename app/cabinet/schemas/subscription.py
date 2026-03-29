@@ -88,6 +88,10 @@ class RenewalRequest(BaseModel):
     """Request to renew subscription."""
 
     period_days: int = Field(..., ge=1, le=3650, description='Renewal period in days')
+    selected_extra_squads: list[str] | None = Field(
+        default=None,
+        description='Subset of current paid extra squads to keep on renewal for tariff subscriptions',
+    )
 
 
 class TrafficPackageResponse(BaseModel):
@@ -161,3 +165,42 @@ class TariffPurchaseRequest(BaseModel):
     traffic_gb: int | None = Field(
         None, ge=0, le=100_000, description='Custom traffic in GB (for custom_traffic_enabled tariffs)'
     )
+    selected_extra_squads: list[str] | None = Field(
+        default=None,
+        description='Subset of current paid extra squads to keep when renewing the same tariff',
+    )
+
+
+class ExtraSquadPreviewItem(BaseModel):
+    uuid: str
+    name: str
+    price_kopeks: int
+    price_label: str
+    enabled: bool = True
+
+
+class TariffRenewalPreviewRequest(BaseModel):
+    tariff_id: int = Field(..., description='Tariff ID to renew')
+    period_days: int = Field(..., ge=1, le=3650, description='Renewal period in days')
+    traffic_gb: int | None = Field(
+        None, ge=0, le=100_000, description='Custom traffic in GB (for custom_traffic_enabled tariffs)'
+    )
+    selected_extra_squads: list[str] | None = Field(
+        default=None,
+        description='Subset of current paid extra squads to keep when renewing the same tariff',
+    )
+
+
+class TariffRenewalPreviewResponse(BaseModel):
+    final_total_kopeks: int
+    final_total_label: str
+    original_total_kopeks: int | None = None
+    original_total_label: str | None = None
+    base_price_kopeks: int
+    devices_price_kopeks: int
+    traffic_price_kopeks: int
+    servers_price_kopeks: int
+    offer_discount_percent: int = 0
+    extra_squads_total_kopeks: int = 0
+    extra_squads_total_label: str
+    extra_squads: list[ExtraSquadPreviewItem] = []

@@ -265,6 +265,7 @@ async def create_gift_purchase(
     from app.services.pricing_engine import pricing_engine
 
     pricing_result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         body.period_days,
         device_limit=tariff.device_limit,
