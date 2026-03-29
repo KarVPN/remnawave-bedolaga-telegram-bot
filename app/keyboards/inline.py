@@ -2396,8 +2396,10 @@ def get_manage_countries_keyboard(
     language: str = DEFAULT_LANGUAGE,
     subscription_end_date: datetime = None,
     discount_percent: int = 0,
+    immutable_country_uuids: list[str] | None = None,
 ) -> InlineKeyboardMarkup:
     texts = get_texts(language)
+    immutable_country_ids = set(immutable_country_uuids or [])
 
     # Считаем по дням (как в кабинете и подтверждении)
     if subscription_end_date:
@@ -2423,6 +2425,17 @@ def get_manage_countries_keyboard(
         uuid = country['uuid']
         name = country['name']
         price_per_month = country['price_kopeks']
+
+        if uuid in immutable_country_ids:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f'🔒 {name} ({texts.t("COUNTRY_INCLUDED_IN_TARIFF", "в тарифе")})',
+                        callback_data=f'country_manage_{uuid}',
+                    )
+                ]
+            )
+            continue
 
         discounted_per_month, discount_per_month = apply_percentage_discount(
             price_per_month,
@@ -2827,7 +2840,7 @@ def get_updated_subscription_settings_keyboard(
 
     # Для суточных тарифов кнопка паузы теперь в главном меню подписки
 
-    if show_countries_management and not has_tariff:
+    if show_countries_management:
         keyboard.append(
             [
                 InlineKeyboardButton(

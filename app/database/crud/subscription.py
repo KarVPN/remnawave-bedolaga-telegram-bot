@@ -576,6 +576,11 @@ async def extend_subscription(
         logger.info('📱 Обновлен лимит устройств: →', old_devices=old_devices, device_limit=device_limit)
 
     if connected_squads is not None:
+        if tariff_id is not None and not is_tariff_change and subscription.connected_squads:
+            # Renewing the same tariff: preserve previously added extra servers on top
+            # of the tariff's current base squads.
+            connected_squads = list(dict.fromkeys((subscription.connected_squads or []) + list(connected_squads)))
+
         # Не перезаписываем существующие сквады пустым списком
         if connected_squads or not subscription.connected_squads:
             old_squads = subscription.connected_squads

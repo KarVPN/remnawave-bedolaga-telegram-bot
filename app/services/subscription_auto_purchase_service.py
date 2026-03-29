@@ -30,6 +30,7 @@ from app.services.subscription_purchase_service import (
     PurchaseValidationError,
 )
 from app.services.subscription_service import SubscriptionService
+from app.services.tariff_extra_squads import build_connected_squads_for_tariff_renewal
 from app.services.user_cart_service import user_cart_service
 from app.utils.pricing_utils import format_period_description
 from app.utils.timezone import format_local_datetime
@@ -66,7 +67,7 @@ class AutoExtendContext:
     squad_uuid: str | None = None
     consume_promo_offer: bool = False
     tariff_id: int | None = None
-    allowed_squads: list | None = None
+    connected_squads_override: list[str] | None = None
 
 
 async def _prepare_auto_purchase(
@@ -217,11 +218,13 @@ async def _prepare_auto_extend_context(
     user = await lock_user_for_pricing(db, user.id)
 
     try:
+        selected_extra_squads = cart_data.get('selected_extra_squads')
         pricing = await _pricing_engine.calculate_renewal_price(
             db,
             subscription,
             period_days,
             user=user,
+            selected_extra_squad_uuids=selected_extra_squads,
         )
         price_kopeks = pricing.final_total
     except Exception as e:
@@ -260,7 +263,13 @@ async def _prepare_auto_extend_context(
 
     squad_uuid = cart_data.get('squad_uuid')
     consume_promo_offer = get_user_active_promo_discount_percent(user) > 0
-    allowed_squads = cart_data.get('allowed_squads')
+    connected_squads_override = None
+    if tariff_id and subscription.tariff_id == tariff_id:
+        connected_squads_override = await build_connected_squads_for_tariff_renewal(
+            db,
+            subscription,
+            cart_data.get('selected_extra_squads'),
+        )
 
     return AutoExtendContext(
         subscription=subscription,
@@ -272,7 +281,7 @@ async def _prepare_auto_extend_context(
         squad_uuid=squad_uuid,
         consume_promo_offer=consume_promo_offer,
         tariff_id=tariff_id,
-        allowed_squads=allowed_squads,
+        connected_squads_override=connected_squads_override,
     )
 
 
@@ -286,9 +295,8 @@ def _apply_extension_updates(context: AutoExtendContext) -> None:
     # НЕ обновляем tariff_id здесь — это делает extend_subscription(),
     # чтобы корректно определить is_tariff_change внутри CRUD
 
-    # Обновляем allowed_squads если указаны (заменяем полностью)
-    if context.allowed_squads is not None:
-        subscription.connected_squads = context.allowed_squads
+    if context.connected_squads_override is not None:
+        subscription.connected_squads = context.connected_squads_override
 
     # Обновляем лимиты для триальной подписки
     if subscription.is_trial:
@@ -401,6 +409,7 @@ async def _auto_extend_subscription(
             tariff_id=prepared.tariff_id if is_tariff_change else None,
             traffic_limit_gb=prepared.traffic_limit_gb if is_tariff_change else None,
             device_limit=prepared.device_limit if is_tariff_change else None,
+            connected_squads=prepared.connected_squads_override,
         )
 
         # Конвертируем триал в платную подписку ТОЛЬКО после успешного продления
@@ -683,14 +692,18 @@ async def _auto_purchase_tariff(
 
     # Calculate price via PricingEngine (single source of truth)
     device_limit = None
+    selected_extra_squads = None
     if existing_subscription and existing_subscription.tariff_id == tariff_id:
         device_limit = existing_subscription.device_limit
+        selected_extra_squads = cart_data.get('selected_extra_squads')
 
     result = await pricing_engine.calculate_tariff_purchase_price(
+        db,
         tariff,
         period_days,
         device_limit=device_limit,
         user=user,
+        extra_squad_uuids=selected_extra_squads,
     )
     final_price = result.final_total
     consume_promo = result.promo_offer_discount > 0
@@ -748,6 +761,13 @@ async def _auto_purchase_tariff(
                 effective_device_limit = max(tariff.device_limit or 0, existing_subscription.device_limit or 0)
             else:
                 effective_device_limit = tariff.device_limit
+            effective_squads = squads
+            if existing_subscription.tariff_id == tariff.id:
+                effective_squads = await build_connected_squads_for_tariff_renewal(
+                    db,
+                    existing_subscription,
+                    selected_extra_squads,
+                )
             subscription = await extend_subscription(
                 db,
                 existing_subscription,
@@ -755,7 +775,7 @@ async def _auto_purchase_tariff(
                 tariff_id=tariff.id,
                 traffic_limit_gb=tariff.traffic_limit_gb,
                 device_limit=effective_device_limit,
-                connected_squads=squads,
+                connected_squads=effective_squads,
             )
             was_trial_conversion = existing_subscription.is_trial
             if was_trial_conversion:
