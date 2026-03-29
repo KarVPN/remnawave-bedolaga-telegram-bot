@@ -66,6 +66,8 @@ class TopUpRequest(BaseModel):
     payment_method: str = Field(..., description='Payment method ID')
     payment_option: str | None = Field(None, description='Payment option (e.g. Platega method code)')
     return_to_miniapp: bool = Field(False, description='Return to Telegram Mini App after payment')
+    receipt_email: str | None = Field(None, description='Receipt contact email for YooKassa')
+    receipt_phone: str | None = Field(None, description='Receipt contact phone for YooKassa')
 
 
 class TopUpResponse(BaseModel):

@@ -15,7 +15,7 @@ from app.database.crud.saved_payment_method import (
     deactivate_payment_method,
     get_active_payment_methods_by_user,
 )
-from app.database.crud.user import get_user_by_id
+from app.database.crud.user import get_user_by_email, get_user_by_id, update_user
 from app.database.models import PaymentMethod, Transaction, User
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.services.payment_service import PaymentService
@@ -27,7 +27,8 @@ from app.services.payment_verification_service import (
     method_display_name,
     run_manual_check,
 )
-from app.services.yookassa_receipt_contact import resolve_receipt_contact
+from app.services.yookassa_receipt_contact import normalize_phone, resolve_receipt_contact
+from app.utils.validators import validate_email, validate_phone
 from app.utils.currency_converter import currency_converter
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
@@ -352,7 +353,55 @@ async def create_topup(
     try:
         if request.payment_method == 'yookassa':
             payment_service = PaymentService()
-            receipt_email, receipt_phone = resolve_receipt_contact(user)
+            raw_receipt_email = (request.receipt_email or '').strip().lower() or None
+            raw_receipt_phone = (request.receipt_phone or '').strip() or None
+
+            if raw_receipt_email and not validate_email(raw_receipt_email):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        'code': 'yookassa_receipt_contact_invalid',
+                        'message': 'Invalid email format',
+                    },
+                )
+
+            if raw_receipt_phone:
+                normalized_phone = normalize_phone(raw_receipt_phone)
+                if not validate_phone(normalized_phone):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            'code': 'yookassa_receipt_contact_invalid',
+                            'message': 'Invalid phone format',
+                        },
+                    )
+                raw_receipt_phone = normalized_phone
+
+            if raw_receipt_email and raw_receipt_email != (getattr(user, 'email', None) or '').strip().lower():
+                existing_user = await get_user_by_email(db, raw_receipt_email)
+                if existing_user and existing_user.id != user.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            'code': 'yookassa_receipt_contact_email_in_use',
+                            'message': 'This email is already used by another user',
+                        },
+                    )
+                user = await update_user(db, user, email=raw_receipt_email)
+
+            receipt_email, receipt_phone = resolve_receipt_contact(
+                user,
+                receipt_email=raw_receipt_email,
+                receipt_phone=raw_receipt_phone,
+            )
+            if not receipt_email and not receipt_phone:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        'code': 'yookassa_receipt_contact_required',
+                        'message': 'Отсутствуют контактные данные для чека YooKassa и не настроен email по умолчанию.',
+                    },
+                )
             yookassa_metadata = {
                 'user_telegram_id': str(user.telegram_id) if user.telegram_id else '',
                 'user_username': user.username or '',
@@ -393,6 +442,21 @@ async def create_topup(
                     receipt_phone=receipt_phone,
                     metadata=yookassa_metadata,
                     return_url=payment_return_url,
+                )
+
+            if result and result.get('error'):
+                internal_message = result.get('internal_message') or 'Failed to create YooKassa payment'
+                if 'контактные данные' in internal_message.lower():
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            'code': 'yookassa_receipt_contact_required',
+                            'message': internal_message,
+                        },
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=internal_message,
                 )
 
             if result:
