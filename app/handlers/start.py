@@ -59,7 +59,7 @@ from app.utils.promo_offer import (
     build_test_access_hint,
 )
 from app.utils.timezone import format_local_datetime
-from app.utils.user_utils import generate_unique_referral_code
+from app.utils.user_utils import ensure_user_referral_code, generate_unique_referral_code
 
 
 logger = structlog.get_logger(__name__)
@@ -1365,6 +1365,7 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
 
         existing_user.updated_at = datetime.now(UTC)
         existing_user.last_activity = datetime.now(UTC)
+        await ensure_user_referral_code(db, existing_user)
 
         await db.commit()
         await db.refresh(existing_user, ['subscription'])
@@ -1441,6 +1442,7 @@ async def complete_registration_from_callback(callback: types.CallbackQuery, sta
 
         existing_user.updated_at = datetime.now(UTC)
         existing_user.last_activity = datetime.now(UTC)
+        await ensure_user_referral_code(db, existing_user)
 
         await db.commit()
         await db.refresh(existing_user, ['subscription'])
@@ -1682,6 +1684,7 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
 
         existing_user.updated_at = datetime.now(UTC)
         existing_user.last_activity = datetime.now(UTC)
+        await ensure_user_referral_code(db, existing_user)
 
         await db.commit()
         await db.refresh(existing_user, ['subscription'])
@@ -1756,6 +1759,7 @@ async def complete_registration(message: types.Message, state: FSMContext, db: A
 
         existing_user.updated_at = datetime.now(UTC)
         existing_user.last_activity = datetime.now(UTC)
+        await ensure_user_referral_code(db, existing_user)
 
         await db.commit()
         await db.refresh(existing_user, ['subscription'])

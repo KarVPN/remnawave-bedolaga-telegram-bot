@@ -18,6 +18,7 @@ from app.database.models import (
     WithdrawalRequest,
     WithdrawalRequestStatus,
 )
+from app.utils.user_utils import ensure_user_referral_code
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.referral import (
@@ -41,6 +42,10 @@ async def get_referral_info(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get referral program info for current user."""
+    if not user.referral_code:
+        await ensure_user_referral_code(db, user)
+        await db.commit()
+
     # Get total referrals count
     total_query = select(func.count()).select_from(User).where(User.referred_by_id == user.id)
     total_result = await db.execute(total_query)

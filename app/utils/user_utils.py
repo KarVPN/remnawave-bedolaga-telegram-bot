@@ -1,6 +1,7 @@
 import secrets
 import string
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import and_, func, select, update
@@ -59,6 +60,21 @@ async def generate_unique_referral_code(db: AsyncSession, telegram_id: int) -> s
 
     timestamp = str(int(datetime.now(UTC).timestamp()))[-6:]
     return f'ref{timestamp}'
+
+
+async def ensure_user_referral_code(db: AsyncSession, user: User) -> str:
+    """Ensure the user has a referral code and persist it in the current session."""
+
+    referral_code = getattr(user, 'referral_code', None)
+    if referral_code:
+        return referral_code
+
+    user_identity: Any = getattr(user, 'telegram_id', None) or getattr(user, 'id', 0) or 0
+    referral_code = await generate_unique_referral_code(db, int(user_identity))
+    user.referral_code = referral_code
+    user.updated_at = datetime.now(UTC)
+    await db.flush()
+    return referral_code
 
 
 def get_effective_referral_commission_percent(user: User) -> int:

@@ -105,6 +105,7 @@ from app.utils.telegram_webapp import (
 )
 from app.utils.timezone import format_local_datetime
 from app.utils.user_utils import (
+    ensure_user_referral_code,
     get_detailed_referral_list,
     get_effective_referral_commission_percent,
     get_user_referral_summary,
@@ -2905,6 +2906,10 @@ async def _build_referral_info(
     user: User,
 ) -> MiniAppReferralInfo | None:
     referral_code = getattr(user, 'referral_code', None)
+    if not referral_code:
+        referral_code = await ensure_user_referral_code(db, user)
+        await db.commit()
+
     referral_settings = settings.get_referral_settings() or {}
 
     referral_link = None
