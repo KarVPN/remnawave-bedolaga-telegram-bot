@@ -5,6 +5,14 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 
+class SubscriptionTariffResponse(BaseModel):
+    """Tariff attached to a subscription (None when the subscription has no tariff)."""
+
+    id: int
+    name: str
+    available_periods: list[int] = Field(default_factory=list)
+
+
 class SubscriptionResponse(BaseModel):
     id: int
     user_id: int
@@ -23,6 +31,7 @@ class SubscriptionResponse(BaseModel):
     connected_squads: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    tariff: SubscriptionTariffResponse | None = None
 
 
 class SubscriptionCreateRequest(BaseModel):

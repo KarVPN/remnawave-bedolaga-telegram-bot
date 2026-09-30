@@ -34,6 +34,7 @@ from ..schemas.subscriptions import (
     SubscriptionExtendRequest,
     SubscriptionResponse,
     SubscriptionSquadRequest,
+    SubscriptionTariffResponse,
     SubscriptionTrafficRequest,
 )
 
@@ -41,6 +42,22 @@ from ..schemas.subscriptions import (
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+
+def _serialize_tariff(subscription: Subscription) -> SubscriptionTariffResponse | None:
+    """Builds the tariff payload; returns None when the subscription has no tariff."""
+    if not subscription.tariff_id:
+        return None
+
+    tariff = subscription.tariff
+    if tariff is None:
+        return None
+
+    return SubscriptionTariffResponse(
+        id=tariff.id,
+        name=tariff.name,
+        available_periods=tariff.get_available_periods(),
+    )
 
 
 def _serialize_subscription(subscription: Subscription) -> SubscriptionResponse:
@@ -62,6 +79,7 @@ def _serialize_subscription(subscription: Subscription) -> SubscriptionResponse:
         connected_squads=list(subscription.connected_squads or []),
         created_at=subscription.created_at,
         updated_at=subscription.updated_at,
+        tariff=_serialize_tariff(subscription),
     )
 
 
@@ -89,7 +107,9 @@ async def _choose_trial_squads(
 
 async def _get_subscription(db: AsyncSession, subscription_id: int) -> Subscription:
     result = await db.execute(
-        select(Subscription).options(selectinload(Subscription.user)).where(Subscription.id == subscription_id)
+        select(Subscription)
+        .options(selectinload(Subscription.user), selectinload(Subscription.tariff))
+        .where(Subscription.id == subscription_id)
     )
     subscription = result.scalar_one_or_none()
     if not subscription:
@@ -107,7 +127,7 @@ async def list_subscriptions(
     user_id: int | None = Query(default=None),
     is_trial: bool | None = Query(default=None),
 ) -> list[SubscriptionResponse]:
-    query = select(Subscription).options(selectinload(Subscription.user))
+    query = select(Subscription).options(selectinload(Subscription.user), selectinload(Subscription.tariff))
 
     if status_filter:
         query = query.where(Subscription.status == status_filter.value)
