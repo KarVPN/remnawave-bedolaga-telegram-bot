@@ -345,6 +345,10 @@ async def create_topup(
     payment_url = None
     payment_id = None
     cabinet_return_url = f'{settings.CABINET_URL.rstrip("/")}/balance/top-up/result?method={request.payment_method}'
+    # Возвраты для провайдеров, которые различают успех и неуспех отдельными
+    # адресами (platega, heleket, wata, cloudpayments, riopay).
+    cabinet_success_url = f'{cabinet_return_url}&status=success'
+    cabinet_failed_url = f'{cabinet_return_url}&status=failed'
     miniapp_return_url = None
     if request.return_to_miniapp:
         miniapp_return_url = settings.get_miniapp_launch_url(f'topup_result_{request.payment_method}')
