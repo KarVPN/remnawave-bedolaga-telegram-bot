@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     ADMIN_IDS: str = ''
     ADMIN_EMAILS: str = ''  # Comma-separated admin emails for email-only users
 
+    # KarVPN app login (deep link `t.me/<bot>?start=login_<nonce>`): the bot
+    # confirms the login to the KarVPN BFF. Empty values keep the flow off, so a
+    # deployment without this integration behaves exactly as it did before.
+    KARVPN_BFF_URL: str = ''  # e.g. https://api.example.com/api/v1
+    KARVPN_BOT_SECRET: str = ''  # the same secret the BFF expects from the bot
+
     # Test email account for development/testing (bypasses email verification and SMTP)
     TEST_EMAIL: str = ''  # e.g., test@example.com
     TEST_EMAIL_PASSWORD: str = ''  # Password for test account
