@@ -40,6 +40,12 @@ from app.middlewares.channel_checker import (
     get_pending_payload_from_redis,
 )
 from app.services.admin_notification_service import AdminNotificationService
+from app.services.app_login_service import (
+    AppLoginResult,
+    app_login_nonce,
+    confirm_app_login,
+    is_app_login_payload,
+)
 from app.services.campaign_service import AdvertisingCampaignService
 from app.services.channel_subscription_service import channel_subscription_service
 from app.services.main_menu_button_service import MainMenuButtonService
@@ -467,6 +473,36 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
             # _activate_pending_gift_after_registration() before state.clear().
             await state.update_data(pending_gift_token=gift_token)
             start_parameter = None  # Don't treat as campaign or referral
+
+    # Handle KarVPN app login deep links: /start login_{nonce}
+    # The app asked the BFF to start a login; tapping this link in Telegram is
+    # the confirmation, so the bot reports it to the BFF and answers honestly.
+    if is_app_login_payload(start_parameter):
+        nonce = app_login_nonce(start_parameter)
+        logger.info(
+            'App login deep link detected',
+            telegram_id=message.from_user.id,
+            nonce_length=len(nonce),
+        )
+        app_login_result = await confirm_app_login(message.from_user.id, nonce)
+        texts = get_texts(db_user.language if db_user else DEFAULT_LANGUAGE)
+        app_login_key, app_login_default = {
+            AppLoginResult.OK: ('APP_LOGIN_OK', '✅ Вход подтверждён. Вернитесь в приложение KarVPN.'),
+            AppLoginResult.EXPIRED: (
+                'APP_LOGIN_EXPIRED',
+                '⌛ Ссылка входа устарела. Начните вход в приложении заново.',
+            ),
+            AppLoginResult.UNAVAILABLE: (
+                'APP_LOGIN_UNAVAILABLE',
+                '⚠️ Сервис входа недоступен. Попробуйте позже.',
+            ),
+            AppLoginResult.DISABLED: (
+                'APP_LOGIN_DISABLED',
+                '⚠️ Вход из приложения не настроен на этом боте.',
+            ),
+        }[app_login_result]
+        await message.answer(texts.t(app_login_key, app_login_default))
+        start_parameter = None
 
     # Handle web auth deep links: /start webauth_{token}
     if start_parameter and start_parameter.startswith('webauth_'):
