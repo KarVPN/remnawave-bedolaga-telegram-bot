@@ -61,9 +61,25 @@ if 'redis.asyncio' not in sys.modules:
     def _from_url(url):
         return _FakeRedisClient()
 
+    # app/utils/cache.py импортирует NoScriptError из redis.exceptions: без этой
+    # заглушки подмена sys.modules['redis'] ломает сбор тестов всего пакета
+    # кабинета и веб-API (ModuleNotFoundError: No module named 'redis.exceptions').
+    redis_exceptions_module = types.ModuleType('redis.exceptions')
+
+    class _FakeRedisError(Exception):
+        """Заглушка базовой ошибки клиента Redis."""
+
+    class _FakeNoScriptError(_FakeRedisError):
+        """Заглушка ошибки отсутствующего скрипта в Redis."""
+
+    redis_exceptions_module.RedisError = _FakeRedisError
+    redis_exceptions_module.NoScriptError = _FakeNoScriptError
+
     redis_async_module.from_url = _from_url
     redis_async_module.Redis = _FakeRedisClient
+    redis_module.exceptions = redis_exceptions_module
     sys.modules['redis'] = redis_module
+    sys.modules['redis.exceptions'] = redis_exceptions_module
     sys.modules['redis.asyncio'] = redis_async_module
 
 # Минимальная реализация SDK YooKassa, чтобы импорт сервисов не падал.
