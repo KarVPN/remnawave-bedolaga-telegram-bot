@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from app.utils.validators import validate_email, validate_phone
 
+
 if TYPE_CHECKING:
     from app.database.models import User
 

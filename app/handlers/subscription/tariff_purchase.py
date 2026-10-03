@@ -1783,8 +1783,8 @@ def get_tariff_extend_extra_squads_keyboard(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f"{marker} {item['name']} (+{format_price_kopeks(int(item['price_kopeks']))})",
-                    callback_data=f"tariff_ext_extra:{tariff_id}:{period}:{item['uuid']}",
+                    text=f'{marker} {item["name"]} (+{format_price_kopeks(int(item["price_kopeks"]))})',
+                    callback_data=f'tariff_ext_extra:{tariff_id}:{period}:{item["uuid"]}',
                 )
             ]
         )
@@ -1845,7 +1845,7 @@ async def _show_tariff_extend_extra_squads(
         marker = '•'
         state_label = texts.t('COMMON_ENABLED', 'Вкл') if item['enabled'] else texts.t('COMMON_DISABLED', 'Выкл')
         lines.append(
-            f"{marker} {html.escape(str(item['name']))} +{format_price_kopeks(int(item['price_kopeks']))} {state_label}"
+            f'{marker} {html.escape(str(item["name"]))} +{format_price_kopeks(int(item["price_kopeks"]))} {state_label}'
         )
 
     await callback.message.edit_text(
@@ -2009,7 +2009,7 @@ async def select_tariff_extend_period(
     state: FSMContext,
 ):
     """Обрабатывает выбор периода для продления."""
-    texts = get_texts(db_user.language)
+    get_texts(db_user.language)
     parts = callback.data.split(':')
     tariff_id = int(parts[1])
 
@@ -2026,14 +2026,11 @@ async def select_tariff_extend_period(
         return
 
     subscription = await get_subscription_by_user_id(db, db_user.id)
-    actual_device_limit = (subscription.device_limit if subscription else None) or tariff.device_limit
 
     if subscription and subscription.tariff_id == tariff.id:
         extra_records = await get_subscription_extra_squad_records(db, subscription)
         if extra_records:
-            await state.update_data(
-                tariff_extend_selected_extra_squads=[record.squad_uuid for record in extra_records]
-            )
+            await state.update_data(tariff_extend_selected_extra_squads=[record.squad_uuid for record in extra_records])
             await _show_tariff_extend_extra_squads(callback, db_user, db, state, tariff, subscription, period)
             await callback.answer()
             return

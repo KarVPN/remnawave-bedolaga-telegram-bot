@@ -59,9 +59,9 @@ from ..schemas.subscription import (
     SubscriptionData,
     SubscriptionResponse,
     SubscriptionStatusResponse,
+    TariffPurchaseRequest,
     TariffRenewalPreviewRequest,
     TariffRenewalPreviewResponse,
-    TariffPurchaseRequest,
     TrafficPackageResponse,
     TrafficPurchaseRequest,
     TrialInfoResponse,
@@ -1997,7 +1997,11 @@ async def purchase_tariff(
             device_limit = existing_subscription.device_limit
             if (existing_subscription.device_limit or 0) > (tariff.device_limit or 0):
                 effective_device_limit = existing_subscription.device_limit
-        selected_extra_squads = request.selected_extra_squads if existing_subscription and existing_subscription.tariff_id == tariff.id else None
+        selected_extra_squads = (
+            request.selected_extra_squads
+            if existing_subscription and existing_subscription.tariff_id == tariff.id
+            else None
+        )
 
         # Calculate price via PricingEngine (single source of truth)
         result = await pricing_engine.calculate_tariff_purchase_price(
@@ -2330,7 +2334,9 @@ async def tariff_renewal_preview(
         tariff,
         request.period_days,
         device_limit=device_limit,
-        custom_traffic_gb=request.traffic_gb if request.traffic_gb is not None and tariff.can_purchase_custom_traffic() else None,
+        custom_traffic_gb=request.traffic_gb
+        if request.traffic_gb is not None and tariff.can_purchase_custom_traffic()
+        else None,
         user=user,
         extra_squad_uuids=request.selected_extra_squads if existing_subscription else None,
     )
