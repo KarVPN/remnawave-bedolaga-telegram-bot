@@ -11,11 +11,12 @@ Answers stay honest: `ok` only when the BFF accepted the confirmation,
 reached or answered unexpectedly, `disabled` when this deployment has no BFF
 configured at all.
 
-The confirmation also carries the way back (`APP_LOGIN_RETURN_URL`): the person
-came from the app and the chat has nothing else to offer them (#78).
+The confirmation also carries the way back (`KARVPN_APP_LOGIN_RETURN_URL`): the
+person came from the app and the chat has nothing else to offer them (#78).
 """
 
 from enum import StrEnum
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -30,12 +31,19 @@ APP_LOGIN_PREFIX = 'login_'
 APP_LOGIN_MIN_NONCE = 16
 APP_LOGIN_TIMEOUT = 10.0
 
-# Where the confirmation message sends a person back (#78): the scheme the app
-# registers for itself, so a tap on the button opens the app instead of leaving
-# someone in the chat. The host is what the app's intent-filter matches
-# (`app/android/app/src/main/AndroidManifest.xml`, `karvpn://login`) — the two
-# halves of one contract, one in each repository: change them together.
-APP_LOGIN_RETURN_URL = 'karvpn://login'
+# What Telegram accepts inside an inline button (#163). It is stricter than a
+# URL in general: any other scheme makes the server reject the message together
+# with its keyboard, and the person gets nothing —
+#
+#   Bad Request: inline keyboard button URL 'karvpn://login' is invalid:
+#   Unsupported URL protocol
+#
+# — which is why the app's own scheme (`karvpn://login`, registered by the app's
+# intent-filter in `app/android/app/src/main/AndroidManifest.xml`) is not used
+# here any more. The bot hands over the http(s) address of a page that opens the
+# app itself and stays ignorant of the scheme: the contract about `karvpn://`
+# now lives entirely in the app and on that page.
+APP_LOGIN_RETURN_URL_SCHEMES = ('http', 'https')
 
 
 class AppLoginResult(StrEnum):
@@ -58,6 +66,32 @@ def app_login_nonce(start_parameter: str) -> str:
 
 def is_app_login_configured() -> bool:
     return bool(settings.KARVPN_BFF_URL.strip() and settings.KARVPN_BOT_SECRET.strip())
+
+
+def is_supported_return_url(url: str) -> bool:
+    """Whether Telegram will accept this address in an inline button (#163)."""
+    return urlsplit(url).scheme.lower() in APP_LOGIN_RETURN_URL_SCHEMES
+
+
+def app_login_return_url() -> str | None:
+    """The address of the return button, or `None` when the button must be skipped.
+
+    `None` covers both an unconfigured deployment — the shipped default is empty,
+    because the domain appears later than the code — and a value that Telegram
+    would refuse. In both cases the answer is sent without the keyboard: the
+    confirmation itself is what the tap is for, and a rejected URL would take the
+    whole message down with it (that is the #163 failure).
+    """
+    url = settings.KARVPN_APP_LOGIN_RETURN_URL.strip()
+    if not url:
+        return None
+    if not is_supported_return_url(url):
+        logger.warning(
+            'app_login: KARVPN_APP_LOGIN_RETURN_URL is not an http(s) address — the return button is skipped',
+            url=url,
+        )
+        return None
+    return url
 
 
 async def confirm_app_login(telegram_id: int, nonce: str) -> AppLoginResult:
