@@ -10,6 +10,9 @@ Answers stay honest: `ok` only when the BFF accepted the confirmation,
 `expired` when the nonce is gone, `unavailable` when the BFF could not be
 reached or answered unexpectedly, `disabled` when this deployment has no BFF
 configured at all.
+
+The confirmation also carries the way back (`APP_LOGIN_RETURN_URL`): the person
+came from the app and the chat has nothing else to offer them (#78).
 """
 
 from enum import StrEnum
@@ -26,6 +29,13 @@ APP_LOGIN_PREFIX = 'login_'
 # The BFF refuses anything shorter, so neither do we: it cannot be a real nonce.
 APP_LOGIN_MIN_NONCE = 16
 APP_LOGIN_TIMEOUT = 10.0
+
+# Where the confirmation message sends a person back (#78): the scheme the app
+# registers for itself, so a tap on the button opens the app instead of leaving
+# someone in the chat. The host is what the app's intent-filter matches
+# (`app/android/app/src/main/AndroidManifest.xml`, `karvpn://login`) — the two
+# halves of one contract, one in each repository: change them together.
+APP_LOGIN_RETURN_URL = 'karvpn://login'
 
 
 class AppLoginResult(StrEnum):

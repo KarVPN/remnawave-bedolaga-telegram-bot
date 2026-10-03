@@ -34,13 +34,14 @@ from app.keyboards.inline import (
     get_rules_keyboard,
 )
 from app.localization.loader import DEFAULT_LANGUAGE
-from app.localization.texts import get_privacy_policy, get_rules, get_texts
+from app.localization.texts import Texts, get_privacy_policy, get_rules, get_texts
 from app.middlewares.channel_checker import (
     delete_pending_payload_from_redis,
     get_pending_payload_from_redis,
 )
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.app_login_service import (
+    APP_LOGIN_RETURN_URL,
     AppLoginResult,
     app_login_nonce,
     confirm_app_login,
@@ -69,6 +70,76 @@ from app.utils.user_utils import ensure_user_referral_code, generate_unique_refe
 
 
 logger = structlog.get_logger(__name__)
+
+
+# What a person reads in the chat after tapping a login link in the app (#78):
+# the locale key first, the wording as a fallback for a build whose locales are
+# older than the code. Every key here must exist in the locales — otherwise the
+# text silently falls back and each sign-in writes "Missing localization key"
+# to the log; tests/test_app_login_reply.py holds that line.
+APP_LOGIN_MESSAGES: dict[AppLoginResult, tuple[str, str]] = {
+    AppLoginResult.OK: (
+        'APP_LOGIN_OK',
+        '✅ Вы вошли в приложение KarVPN. Кнопка ниже вернёт вас обратно.',
+    ),
+    AppLoginResult.EXPIRED: (
+        'APP_LOGIN_EXPIRED',
+        '⌛ Ссылка входа устарела. Начните вход в приложении заново.',
+    ),
+    AppLoginResult.UNAVAILABLE: (
+        'APP_LOGIN_UNAVAILABLE',
+        '⚠️ Сервис входа недоступен. Попробуйте позже.',
+    ),
+    AppLoginResult.DISABLED: (
+        'APP_LOGIN_DISABLED',
+        '⚠️ Вход из приложения не настроен на этом боте.',
+    ),
+}
+
+# The outcomes that leave the app as the next step: the person came from it, and
+# the way back must cost one tap — what the owner asked for in #78. The other
+# outcomes are reported as they are, without a promise the app cannot keep.
+APP_LOGIN_RETURN_RESULTS = (AppLoginResult.OK, AppLoginResult.EXPIRED)
+
+
+def app_login_reply(
+    result: AppLoginResult,
+    texts: Texts,
+) -> tuple[str, types.InlineKeyboardMarkup | None]:
+    """The answer to an app login deep link: the text and, where it helps, the button back."""
+    key, default = APP_LOGIN_MESSAGES[result]
+    text = texts.t(key, default)
+    if result not in APP_LOGIN_RETURN_RESULTS:
+        return text, None
+
+    button = types.InlineKeyboardButton(
+        text=texts.t('APP_LOGIN_RETURN_BUTTON', '↩️ Вернуться в приложение'),
+        url=APP_LOGIN_RETURN_URL,
+    )
+    return text, types.InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+async def send_app_login_answer(
+    message: types.Message,
+    text: str,
+    keyboard: types.InlineKeyboardMarkup | None,
+) -> None:
+    """Send the login answer so that the confirmation never rides on the button.
+
+    Telegram validates a message together with its keyboard and refuses the whole
+    request if it dislikes either — and a non-http scheme in an inline button is
+    exactly the kind of thing a server or a client may refuse. The point of the
+    tap is the confirmation itself (#78), so the text is sent again without the
+    keyboard rather than lost: the person sees "you are signed in" even on a
+    client that cannot open `karvpn://login`.
+    """
+    try:
+        await message.answer(text, reply_markup=keyboard)
+    except TelegramBadRequest as error:
+        if keyboard is None:
+            raise
+        logger.warning('App login answer refused with the keyboard, sending it as text', error=str(error))
+        await message.answer(text)
 
 
 async def _activate_pending_gift_after_registration(
@@ -486,22 +557,16 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         )
         app_login_result = await confirm_app_login(message.from_user.id, nonce)
         texts = get_texts(db_user.language if db_user else DEFAULT_LANGUAGE)
-        app_login_key, app_login_default = {
-            AppLoginResult.OK: ('APP_LOGIN_OK', '✅ Вход подтверждён. Вернитесь в приложение KarVPN.'),
-            AppLoginResult.EXPIRED: (
-                'APP_LOGIN_EXPIRED',
-                '⌛ Ссылка входа устарела. Начните вход в приложении заново.',
-            ),
-            AppLoginResult.UNAVAILABLE: (
-                'APP_LOGIN_UNAVAILABLE',
-                '⚠️ Сервис входа недоступен. Попробуйте позже.',
-            ),
-            AppLoginResult.DISABLED: (
-                'APP_LOGIN_DISABLED',
-                '⚠️ Вход из приложения не настроен на этом боте.',
-            ),
-        }[app_login_result]
-        await message.answer(texts.t(app_login_key, app_login_default))
+        # The answer is sent here, before anything else in this handler can move
+        # the person on: the confirmation is the point of the tap, and the
+        # button in it is the way back into the app (#78).
+        app_login_text, app_login_keyboard = app_login_reply(app_login_result, texts)
+        await send_app_login_answer(message, app_login_text, app_login_keyboard)
+        logger.info(
+            'App login answered in the chat',
+            telegram_id=message.from_user.id,
+            result=app_login_result.value,
+        )
         start_parameter = None
 
     # Handle web auth deep links: /start webauth_{token}
