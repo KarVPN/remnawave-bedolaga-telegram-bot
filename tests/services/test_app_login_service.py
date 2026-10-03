@@ -9,6 +9,7 @@ import pytest
 
 from app.config import settings
 from app.services.app_login_service import (
+    APP_LOGIN_RETURN_URL,
     AppLoginResult,
     app_login_nonce,
     confirm_app_login,
@@ -112,3 +113,25 @@ class TestConfirm:
         _configure(monkeypatch)
         fake_client.error = httpx.ConnectError('no route to host')
         assert await confirm_app_login(895225, NONCE) == AppLoginResult.UNAVAILABLE
+
+
+class TestReturnLink:
+    """Ссылка возврата — половина контракта, вторая половина в приложении.
+
+    Тот же `karvpn://login` зарегистрирован в манифесте приложения
+    (`app/android/app/src/main/AndroidManifest.xml`), и его сторожит
+    `app/test/android/app_link_manifest_test.dart`: строку меняют в обоих
+    репозиториях сразу, иначе кнопка ведёт в никуда.
+    """
+
+    def test_the_link_is_the_app_scheme_and_host_the_manifest_registers(self):
+        assert APP_LOGIN_RETURN_URL == 'karvpn://login'
+
+    def test_the_link_names_one_scheme_and_one_host(self):
+        parsed = httpx.URL(APP_LOGIN_RETURN_URL)
+        assert parsed.scheme == 'karvpn'
+        assert parsed.host == 'login'
+        # Ни пути, ни запроса: intent-filter приложения совпадает по схеме и хосту,
+        # а лишние части сделали бы ссылку хрупкой и неотличимой в тесте.
+        assert parsed.path in ('', '/')
+        assert not parsed.query
