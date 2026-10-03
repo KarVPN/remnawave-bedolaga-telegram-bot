@@ -115,7 +115,8 @@ APP_LOGIN_CODE_MESSAGES: dict[AppLoginResult, tuple[str, str]] = {
     AppLoginResult.OK: APP_LOGIN_MESSAGES[AppLoginResult.OK],
     AppLoginResult.EXPIRED: (
         'APP_LOGIN_CODE_EXPIRED',
-        '❌ Код не подошёл: он не найден или уже истёк. Покажите в приложении новый код и отправьте его сюда.',
+        '❌ Код не найден или истёк. Проверьте цифры и отправьте код ещё раз; '
+        'если он показывался давно — начните вход в приложении заново.',
     ),
     AppLoginResult.UNAVAILABLE: APP_LOGIN_MESSAGES[AppLoginResult.UNAVAILABLE],
     AppLoginResult.DISABLED: APP_LOGIN_MESSAGES[AppLoginResult.DISABLED],

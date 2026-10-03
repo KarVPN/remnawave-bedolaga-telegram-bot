@@ -2,7 +2,7 @@
   "ACCESS_DENIED": "❌ Access denied",
   "APP_LOGIN_OK": "✅ You are signed in to the KarVPN app. The button below takes you back in one tap.",
   "APP_LOGIN_EXPIRED": "⌛ This sign-in link has expired. Start the sign-in in the app again.",
-  "APP_LOGIN_CODE_EXPIRED": "❌ That code did not work: it was not found or has already expired. Show a new code in the app and send it here.",
+  "APP_LOGIN_CODE_EXPIRED": "❌ The code was not found or has expired. Check the digits and send it again; if it was shown a while ago, start the sign-in in the app again.",
   "APP_LOGIN_UNAVAILABLE": "⚠️ The sign-in service is unavailable. Please try again later.",
   "APP_LOGIN_DISABLED": "⚠️ App sign-in is not configured for this bot.",
   "APP_LOGIN_RETURN_BUTTON": "↩️ Back to the app",
