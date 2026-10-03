@@ -38,6 +38,7 @@ from .routes import (
     tokens,
     transactions,
     user_messages,
+    user_tickets,
     users,
     webhooks,
     websocket,
@@ -221,6 +222,8 @@ def create_web_api_app() -> FastAPI:
     app.include_router(users.router, prefix='/users', tags=['users'])
     app.include_router(subscriptions.router, prefix='/subscriptions', tags=['subscriptions'])
     app.include_router(tickets.router, prefix='/tickets', tags=['support'])
+    # Person-scoped support routes for the app (machine key + telegram_id), #192
+    app.include_router(user_tickets.router, prefix='/tickets', tags=['support'])
     app.include_router(transactions.router, prefix='/transactions', tags=['transactions'])
     app.include_router(promo_groups.router, prefix='/promo-groups', tags=['promo-groups'])
     app.include_router(promo_offers.router, prefix='/promo-offers', tags=['promo-offers'])
