@@ -38,6 +38,24 @@ class Settings(BaseSettings):
     KARVPN_BFF_URL: str = ''  # e.g. https://api.example.com/api/v1
     KARVPN_BOT_SECRET: str = ''  # the same secret the BFF expects from the bot
 
+    # The "back to the app" button under the sign-in confirmation (#78, #163):
+    # a full http(s) address of a page that opens the app for the person, e.g.
+    # https://app.example.com/app/open.
+    #
+    # It must be http(s) and nothing else. The app's own scheme cannot be used
+    # here — Telegram validates an inline button URL and refuses the whole
+    # message otherwise, which is exactly what happened on the contour:
+    #
+    #   Bad Request: inline keyboard button URL 'karvpn://login' is invalid:
+    #   Unsupported URL protocol
+    #
+    # So the bot knows nothing about `karvpn://` and only passes this address on;
+    # the page it points at opens the app itself. Empty (the default) means the
+    # button is not sent at all — a link Telegram rejects would take the whole
+    # message with it — and the confirmation text is sent without it, exactly as
+    # before this setting existed.
+    KARVPN_APP_LOGIN_RETURN_URL: str = ''
+
     # Test email account for development/testing (bypasses email verification and SMTP)
     TEST_EMAIL: str = ''  # e.g., test@example.com
     TEST_EMAIL_PASSWORD: str = ''  # Password for test account

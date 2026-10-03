@@ -41,9 +41,9 @@ from app.middlewares.channel_checker import (
 )
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.app_login_service import (
-    APP_LOGIN_RETURN_URL,
     AppLoginResult,
     app_login_nonce,
+    app_login_return_url,
     confirm_app_login,
     is_app_login_payload,
 )
@@ -106,15 +106,26 @@ def app_login_reply(
     result: AppLoginResult,
     texts: Texts,
 ) -> tuple[str, types.InlineKeyboardMarkup | None]:
-    """The answer to an app login deep link: the text and, where it helps, the button back."""
+    """The answer to an app login deep link: the text and, where it helps, the button back.
+
+    The button needs an http(s) address (`KARVPN_APP_LOGIN_RETURN_URL`, #163):
+    Telegram refuses a keyboard whose URL uses any other protocol, and the
+    refusal costs the whole message. When there is no such address the answer is
+    the same text without the button — what the person reads must not depend on a
+    link the server would reject anyway.
+    """
     key, default = APP_LOGIN_MESSAGES[result]
     text = texts.t(key, default)
     if result not in APP_LOGIN_RETURN_RESULTS:
         return text, None
 
+    return_url = app_login_return_url()
+    if return_url is None:
+        return text, None
+
     button = types.InlineKeyboardButton(
         text=texts.t('APP_LOGIN_RETURN_BUTTON', '↩️ Вернуться в приложение'),
-        url=APP_LOGIN_RETURN_URL,
+        url=return_url,
     )
     return text, types.InlineKeyboardMarkup(inline_keyboard=[[button]])
 
@@ -127,11 +138,12 @@ async def send_app_login_answer(
     """Send the login answer so that the confirmation never rides on the button.
 
     Telegram validates a message together with its keyboard and refuses the whole
-    request if it dislikes either — and a non-http scheme in an inline button is
-    exactly the kind of thing a server or a client may refuse. The point of the
-    tap is the confirmation itself (#78), so the text is sent again without the
-    keyboard rather than lost: the person sees "you are signed in" even on a
-    client that cannot open `karvpn://login`.
+    request if it dislikes either — an inline button URL it does not accept is
+    one such case (#163). The point of the tap is the confirmation itself (#78),
+    so the text is sent again without the keyboard rather than lost: the person
+    sees "you are signed in" even when the button is refused. The address of the
+    button is checked before it is built (`app_login_return_url`), so this is the
+    second line of defence, not the first.
     """
     try:
         await message.answer(text, reply_markup=keyboard)
