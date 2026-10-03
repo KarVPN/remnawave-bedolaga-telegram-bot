@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 import structlog
 from aiogram import types
 from aiogram.fsm.context import FSMContext
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -22,6 +22,7 @@ from app.utils.validators import validate_email, validate_phone
 
 
 logger = structlog.get_logger(__name__)
+
 
 async def _get_yookassa_receipt_contact(db_user: User, state: FSMContext) -> tuple[str | None, str | None]:
     state_data = await state.get_data()

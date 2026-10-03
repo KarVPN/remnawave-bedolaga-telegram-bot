@@ -5,6 +5,13 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  # Перезапуск линта без нового коммита (в том числе по ветке).
+  # 03.10.2026 CI в форке молчал, потому что GitHub отключает workflow-файлы
+  # у форков — разбор и проверки в docs/ci.md.
+  workflow_dispatch:
+  # Этот же файл вызывает release.yml (jobs.lint.uses), поэтому нужен workflow_call:
+  # без него вызов переиспользуемого workflow невалиден.
+  workflow_call:
 
 jobs:
   lint:

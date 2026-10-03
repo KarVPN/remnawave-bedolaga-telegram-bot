@@ -28,8 +28,8 @@ from app.services.payment_verification_service import (
     run_manual_check,
 )
 from app.services.yookassa_receipt_contact import normalize_phone, resolve_receipt_contact
-from app.utils.validators import validate_email, validate_phone
 from app.utils.currency_converter import currency_converter
+from app.utils.validators import validate_email, validate_phone
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.balance import (

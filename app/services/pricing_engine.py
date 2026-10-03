@@ -428,7 +428,9 @@ class PricingEngine:
             servers = await get_server_squads_by_uuids(db, country_uuids)
         except Exception as e:  # intentional broad catch: pricing must not crash on DB errors, servers_price=0 is safe (user pays less)
             logger.error('Ошибка пакетной загрузки серверов', error=str(e), squad_uuids=country_uuids)
-            return 0, [{'uuid': uuid, 'id': None, 'name': uuid, 'price': 0, 'status': 'error'} for uuid in country_uuids]
+            return 0, [
+                {'uuid': uuid, 'id': None, 'name': uuid, 'price': 0, 'status': 'error'} for uuid in country_uuids
+            ]
 
         server_map = {s.squad_uuid: s for s in servers}
 
@@ -664,9 +666,9 @@ class PricingEngine:
 
         base_group_disc = base_price - discounted_base
         devices_group_disc = devices_price - discounted_devices
-        servers_group_disc = (
-            servers_price_per_month - discounted_servers_per_month
-        ) * (1 if is_daily and period_days <= 1 else months)
+        servers_group_disc = (servers_price_per_month - discounted_servers_per_month) * (
+            1 if is_daily and period_days <= 1 else months
+        )
         traffic_group_disc = traffic_price - discounted_traffic
         total_group_discount = base_group_disc + devices_group_disc + servers_group_disc + traffic_group_disc
 
@@ -684,7 +686,8 @@ class PricingEngine:
                 extra_server_uuids=extra_squad_uuids,
                 servers=server_details,
                 servers_individual_prices=[
-                    self.apply_discount(int(detail['price']), servers_pct) * server_multiplier for detail in valid_servers
+                    self.apply_discount(int(detail['price']), servers_pct) * server_multiplier
+                    for detail in valid_servers
                 ],
                 server_ids=[int(detail['id']) for detail in valid_servers],
                 group_discount_pct={'period': period_pct, 'devices': devices_pct, 'servers': servers_pct},

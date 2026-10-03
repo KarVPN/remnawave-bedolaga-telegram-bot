@@ -178,6 +178,25 @@ docker compose up -d
 
 ---
 
+## 🔧 Проверки в форке KarVPN
+
+CI в форке работает: `push` и `pull_request` запускают `Lint`, `docker-registry`,
+`docker-hub` и `release-please`. С момента форка (24.03.2026) и до начала октября 2026
+GitHub держал workflow-файлы форка выключенными, поэтому проверки шли только локально.
+Если прогоны снова пропали — смотреть вкладку Actions и **[docs/ci.md](docs/ci.md)**;
+там же ручной запуск линта и разбор локальных падений.
+
+```bash
+gh workflow run lint.yml --ref <ветка>                                  # линт вручную
+.venv/bin/python -m pytest tests/ -q --continue-on-collection-errors    # тесты локально
+.venv/bin/ruff check . && .venv/bin/ruff format --check .               # линт локально
+```
+
+Полный набор тестов на чистом `main` даёт **372 passed / 78 failed** и ошибки окружения —
+это baseline, а не регрессия.
+
+---
+
 ## 🖥 Bedolaga Cabinet
 
 <div align="center">
