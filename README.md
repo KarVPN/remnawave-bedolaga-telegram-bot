@@ -178,6 +178,23 @@ docker compose up -d
 
 ---
 
+## 🔧 Проверки в форке KarVPN
+
+В форке KarVPN автоматические прогоны GitHub Actions не запускаются: GitHub отключает
+workflow-файлы, которые были в репозитории на момент форка. Поэтому линт гоняется руками
+или локально, а образ публикуется через `workflow_dispatch`.
+
+```bash
+gh workflow run lint.yml --ref <ветка>                                  # линт в CI, вручную
+.venv/bin/python -m pytest tests/ -q --continue-on-collection-errors    # тесты локально
+.venv/bin/ruff check . && .venv/bin/ruff format --check .               # линт локально
+```
+
+Полный набор тестов на чистом `main` даёт **372 passed / 78 failed** и ошибки окружения —
+это baseline, а не регрессия. Команды, разбор падений и шаги для владельца: **[docs/ci.md](docs/ci.md)**.
+
+---
+
 ## 🖥 Bedolaga Cabinet
 
 <div align="center">

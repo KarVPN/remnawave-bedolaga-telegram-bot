@@ -1,10 +1,16 @@
 name: Lint
 
+# В форке KarVPN автоматические прогоны Actions не запускаются: GitHub отключает
+# workflow-файлы, которые были в репозитории на момент форка (см. docs/ci.md).
+# Поэтому у линта есть ручной запуск — им и пользуемся, пока владелец не включит
+# Actions в настройках форка.
 on:
   push:
-    branches: ['**']
   pull_request:
-    branches: ['**']
+  workflow_dispatch:
+  # Этот же файл вызывает release.yml (jobs.lint.uses), поэтому нужен workflow_call:
+  # без него вызов переиспользуемого workflow невалиден.
+  workflow_call:
 
 jobs:
   lint:
