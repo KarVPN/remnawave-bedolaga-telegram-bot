@@ -1,8 +1,12 @@
-"""Ответ на вход из приложения: локализованный текст и кнопка возврата (#78).
+"""Ответ на вход из приложения: локализованный текст и кнопка возврата (#78, #163).
 
 Живого Telegram в тестах нет, поэтому проверяется то, что до него: ключи в
 локалях (без них текст молча берётся из fallback, а каждый вход пишет
 «Missing localization key» в лог), сам текст и клавиатура, которую получит чат.
+
+Кнопка существует только вместе с адресом возврата: Telegram принимает в
+inline-кнопке лишь http(s) и отвергает сообщение целиком на любой другой схеме
+(#163), поэтому без адреса ответ уходит текстом, а не без ответа.
 """
 
 import json
@@ -23,13 +27,27 @@ from app.handlers.start import (
 )
 from app.localization.loader import clear_locale_cache
 from app.localization.texts import get_texts
-from app.services.app_login_service import APP_LOGIN_RETURN_URL, AppLoginResult
+from app.services.app_login_service import AppLoginResult
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCALES_DIR = PROJECT_ROOT / 'app' / 'localization' / 'locales'
 HANDLER = PROJECT_ROOT / 'app' / 'handlers' / 'start.py'
 LANGUAGES = ('ru', 'en')
+RETURN_URL = 'https://app.test.yolgins.ru/app/open'
+
+
+@pytest.fixture(autouse=True)
+def _no_return_url(monkeypatch):
+    """По умолчанию адреса возврата нет: так выглядит контур без настройки."""
+    monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', '', raising=False)
+
+
+@pytest.fixture
+def return_url(monkeypatch, _no_return_url):
+    """Адрес возврата задан — и только тогда кнопка вообще собирается."""
+    monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', RETURN_URL, raising=False)
+    return RETURN_URL
 
 
 def _locale(language: str) -> dict:
@@ -68,7 +86,8 @@ def test_the_localized_text_is_used_and_nothing_warns(language):
             assert text == locale[key], f'{language}: {key}'
 
         _, keyboard = app_login_reply(AppLoginResult.OK, texts)
-        assert keyboard.inline_keyboard[0][0].text == locale['APP_LOGIN_RETURN_BUTTON']
+        # Без адреса возврата кнопки нет — и это не повод писать в лог.
+        assert keyboard is None
 
     warnings = [entry for entry in captured if entry.get('log_level') == 'warning']
     assert warnings == [], warnings
@@ -80,7 +99,7 @@ def test_the_confirmation_itself_carries_the_way_back():
 
 
 @pytest.mark.parametrize('language', LANGUAGES)
-def test_the_button_is_a_single_tap_to_the_app(language):
+def test_the_button_is_a_single_tap_to_the_app(language, return_url):
     texts = get_texts(language)
     text, keyboard = app_login_reply(AppLoginResult.OK, texts)
 
@@ -88,9 +107,62 @@ def test_the_button_is_a_single_tap_to_the_app(language):
     rows = keyboard.inline_keyboard
     assert len(rows) == 1 and len(rows[0]) == 1, 'кнопка возврата — одна и в своём ряду'
     button = rows[0][0]
-    assert button.url == APP_LOGIN_RETURN_URL
+    assert button.url == return_url
     assert button.text == texts.t('APP_LOGIN_RETURN_BUTTON')
     assert button.callback_data is None, 'возврат открывает приложение, а не ещё один шаг в чате'
+
+
+@pytest.mark.parametrize('language', LANGUAGES)
+@pytest.mark.parametrize('result', APP_LOGIN_RETURN_RESULTS)
+def test_no_return_url_means_no_button_and_a_text_without_it(language, result):
+    """Пустая настройка — не негодная ссылка, а её отсутствие (#163).
+
+    Telegram отвергает сообщение вместе с клавиатурой, поэтому негодная ссылка
+    стоит всего ответа: без адреса возврата текст уходит один.
+    """
+    texts = get_texts(language)
+
+    with capture_logs() as captured:
+        text, keyboard = app_login_reply(result, texts)
+
+    assert keyboard is None
+    assert text == texts.t(APP_LOGIN_MESSAGES[result][0])
+    assert captured == [], 'отсутствие настройки — не предупреждение'
+
+
+@pytest.mark.parametrize(
+    'scheme_url',
+    ['karvpn://login', 'tg://resolve?domain=karvpn', 'ftp://app.test.yolgins.ru/app/open'],
+)
+def test_a_scheme_telegram_refuses_is_not_put_into_the_button(scheme_url, monkeypatch):
+    """Схему приложения в переменной прописали — кнопки всё равно не будет.
+
+    Ровно на `karvpn://login` Telegram ответил `Bad Request: inline keyboard
+    button URL 'karvpn://login' is invalid: Unsupported URL protocol`; отдать
+    такую ссылку снова значило бы потерять весь ответ.
+    """
+    monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', scheme_url, raising=False)
+
+    with capture_logs() as captured:
+        text, keyboard = app_login_reply(AppLoginResult.OK, get_texts('ru'))
+
+    assert keyboard is None
+    assert text == get_texts('ru').t('APP_LOGIN_OK')
+    assert [entry['log_level'] for entry in captured] == ['warning'], 'о причине должно быть видно в логе'
+
+
+@pytest.mark.asyncio
+async def test_the_text_arrives_even_when_there_is_no_button_to_send():
+    """Текст не едет на кнопке: без неё ответ всё равно уходит, и один раз."""
+    texts = get_texts('ru')
+    text, keyboard = app_login_reply(AppLoginResult.OK, texts)
+    message = _FakeMessage()
+
+    await send_app_login_answer(message, text, keyboard)
+
+    assert [call['text'] for call in message.calls] == [text]
+    assert message.calls[0]['reply_markup'] is None
+    assert text == texts.t('APP_LOGIN_OK')
 
 
 @pytest.mark.parametrize('result', set(AppLoginResult) - set(APP_LOGIN_RETURN_RESULTS))
@@ -146,8 +218,12 @@ class _FakeMessage:
 
 
 @pytest.mark.asyncio
-async def test_the_confirmation_arrives_even_if_the_button_is_refused():
-    """Подтверждение не должно ехать на кнопке: тап ценен текстом, а не кнопкой."""
+async def test_the_confirmation_arrives_even_if_the_button_is_refused(return_url):
+    """Подтверждение не должно ехать на кнопке: тап ценен текстом, а не кнопкой.
+
+    Адрес из настройки может оказаться негодным для Telegram и после нашей
+    проверки — страховка остаётся на месте (#163).
+    """
     texts = get_texts('ru')
     text, keyboard = app_login_reply(AppLoginResult.OK, texts)
     message = _FakeMessage(refuses='keyboard')

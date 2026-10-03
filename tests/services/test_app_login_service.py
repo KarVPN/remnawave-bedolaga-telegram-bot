@@ -6,15 +6,17 @@
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
-from app.config import settings
+from app.config import Settings, settings
 from app.services.app_login_service import (
-    APP_LOGIN_RETURN_URL,
     AppLoginResult,
     app_login_nonce,
+    app_login_return_url,
     confirm_app_login,
     is_app_login_configured,
     is_app_login_payload,
+    is_supported_return_url,
 )
 
 
@@ -116,22 +118,76 @@ class TestConfirm:
 
 
 class TestReturnLink:
-    """Ссылка возврата — половина контракта, вторая половина в приложении.
+    """Адрес кнопки возврата: настройка, а не константа (#163).
 
-    Тот же `karvpn://login` зарегистрирован в манифесте приложения
-    (`app/android/app/src/main/AndroidManifest.xml`), и его сторожит
-    `app/test/android/app_link_manifest_test.dart`: строку меняют в обоих
-    репозиториях сразу, иначе кнопка ведёт в никуда.
+    Telegram принимает в inline-кнопке только http(s) и на схеме приложения
+    отвечает `Bad Request: inline keyboard button URL 'karvpn://login' is
+    invalid: Unsupported URL protocol`, отвергая всё сообщение вместе с
+    клавиатурой. Поэтому здесь больше нет `karvpn://login`: бот отдаёт
+    https-адрес страницы, которая открывает приложение сама, а про схему не
+    знает вовсе. Пусто = кнопки нет (значение по умолчанию), потому что
+    заведомо негодная ссылка стоит целого сообщения.
     """
 
-    def test_the_link_is_the_app_scheme_and_host_the_manifest_registers(self):
-        assert APP_LOGIN_RETURN_URL == 'karvpn://login'
+    SAMPLE = 'https://app.test.yolgins.ru/app/open'
 
-    def test_the_link_names_one_scheme_and_one_host(self):
-        parsed = httpx.URL(APP_LOGIN_RETURN_URL)
-        assert parsed.scheme == 'karvpn'
-        assert parsed.host == 'login'
-        # Ни пути, ни запроса: intent-filter приложения совпадает по схеме и хосту,
-        # а лишние части сделали бы ссылку хрупкой и неотличимой в тесте.
-        assert parsed.path in ('', '/')
-        assert not parsed.query
+    @pytest.fixture(autouse=True)
+    def _empty_return_url(self, monkeypatch):
+        monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', '', raising=False)
+
+    def test_the_shipped_default_is_empty(self):
+        """Домен появляется позже кода: без настройки поведение прежнее — кнопки нет."""
+        assert Settings.model_fields['KARVPN_APP_LOGIN_RETURN_URL'].default == ''
+
+    def test_empty_setting_means_no_button_and_no_noise(self):
+        """Пустая настройка — не ошибка развёртывания, а её обычное начало."""
+        with capture_logs() as captured:
+            assert app_login_return_url() is None
+
+        assert captured == []
+
+    def test_the_configured_address_is_handed_over_as_it_is(self, monkeypatch):
+        monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', self.SAMPLE, raising=False)
+
+        assert app_login_return_url() == self.SAMPLE
+
+    def test_surrounding_whitespace_does_not_leak_into_the_button(self, monkeypatch):
+        """Значение приходит из .env, и лишний перевод строки — обычное дело."""
+        monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', f'  {self.SAMPLE}\n', raising=False)
+
+        assert app_login_return_url() == self.SAMPLE
+
+    def test_the_value_comes_from_the_environment(self, monkeypatch):
+        """Читается то же имя, что записано в .env.example, — иначе настройку не найти."""
+        monkeypatch.setenv('KARVPN_APP_LOGIN_RETURN_URL', self.SAMPLE)
+
+        assert Settings(_env_file=None).KARVPN_APP_LOGIN_RETURN_URL == self.SAMPLE
+
+    @pytest.mark.parametrize('url', ['http://app.test.yolgins.ru/app/open', 'https://app.test.yolgins.ru/app/open'])
+    def test_http_addresses_are_accepted(self, url):
+        assert is_supported_return_url(url) is True
+        # Простая проверка из тикета: всё, что попадает в кнопку, начинается с http.
+        assert url.startswith('http')
+
+    @pytest.mark.parametrize(
+        'url',
+        [
+            'karvpn://login',  # именно то, на чём Telegram сказал Unsupported URL protocol
+            'KARVPN://login',
+            'tg://resolve?domain=karvpn',
+            'ftp://app.test.yolgins.ru/app/open',
+            'app.test.yolgins.ru/app/open',  # без схемы Telegram тоже не примет
+        ],
+    )
+    def test_anything_but_http_is_refused(self, url):
+        assert is_supported_return_url(url) is False
+
+    @pytest.mark.parametrize('url', ['karvpn://login', 'ftp://app.test/open'])
+    def test_a_refused_scheme_in_the_setting_never_reaches_the_button(self, monkeypatch, url):
+        """Прописали схему приложения в переменной — кнопки всё равно не будет."""
+        monkeypatch.setattr(settings, 'KARVPN_APP_LOGIN_RETURN_URL', url, raising=False)
+
+        with capture_logs() as captured:
+            assert app_login_return_url() is None
+
+        assert [entry['log_level'] for entry in captured] == ['warning']
