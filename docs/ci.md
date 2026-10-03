@@ -156,7 +156,7 @@ ruff format --check .   → 4 файла
 |:---|:---|:---|
 | `Build and Publish Docker Image` | success | образ публикуется в `ghcr.io`, секреты не нужны |
 | `Lint` | success | после PR #7 |
-| `BedolagaBot` (`docker-hub.yml`) | failure | падает на шаге «Login to Docker Hub»: в форке нет секретов `DOCKER_USERNAME` и `DOCKER_PASSWORD` |
+| `BedolagaBot` (`docker-hub.yml`) | failure на push в `main` и на тегах, success на `pull_request` | падает на шаге «Login to Docker Hub»: в форке нет секретов `DOCKER_USERNAME` и `DOCKER_PASSWORD`. На `pull_request` шаг логина пропускается (`if: github.event_name != 'pull_request'`), поэтому на PR-проверках workflow зелёный |
 | `Release Please` | failure | `release-please failed: GitHub Actions is not permitted to create or approve pull requests` |
 
 Что с этим делать (решает владелец):
@@ -165,7 +165,8 @@ ruff format --check .   → 4 файла
    «Allow GitHub Actions to create and approve pull requests»** — без этого релизный
    workflow не сможет открыть PR.
 2. `BedolagaBot`: либо добавить секреты Docker Hub в форк, либо пропускать публикацию,
-   когда секретов нет, либо отключить workflow в форке — сейчас он красный всегда.
-   Форк публикует образ в `ghcr.io`, поэтому Docker Hub ему, скорее всего, не нужен.
+   когда секретов нет, либо отключить workflow в форке — сейчас каждый push в `main`
+   заканчивается красным на этом workflow. Форк публикует образ в `ghcr.io`, поэтому
+   Docker Hub ему, скорее всего, не нужен.
 3. Если прогоны снова пропадут — проверить, что на вкладке Actions не вернулся баннер
    форка, а `state` у workflow не стал `disabled_fork`.
