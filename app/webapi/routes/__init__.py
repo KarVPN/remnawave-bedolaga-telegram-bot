@@ -21,6 +21,7 @@ from . import (
     tokens,
     transactions,
     user_messages,
+    user_tickets,
     users,
     welcome_texts,
 )
@@ -49,6 +50,7 @@ __all__ = [
     'tokens',
     'transactions',
     'user_messages',
+    'user_tickets',
     'users',
     'welcome_texts',
 ]

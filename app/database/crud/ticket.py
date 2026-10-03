@@ -86,10 +86,20 @@ class TicketCRUD:
 
     @staticmethod
     async def get_user_tickets(
-        db: AsyncSession, user_id: int, status: str | None = None, limit: int = 20, offset: int = 0
+        db: AsyncSession,
+        user_id: int,
+        status: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        load_messages: bool = False,
     ) -> list[Ticket]:
         """Получить тикеты пользователя"""
         query = select(Ticket).where(Ticket.user_id == user_id)
+
+        if load_messages:
+            # Без этого обращение к ticket.messages в async-сессии требует ленивой подгрузки
+            query = query.options(selectinload(Ticket.messages))
 
         if status:
             query = query.where(Ticket.status == status)
