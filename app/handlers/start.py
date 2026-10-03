@@ -119,6 +119,29 @@ def app_login_reply(
     return text, types.InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
+async def send_app_login_answer(
+    message: types.Message,
+    text: str,
+    keyboard: types.InlineKeyboardMarkup | None,
+) -> None:
+    """Send the login answer so that the confirmation never rides on the button.
+
+    Telegram validates a message together with its keyboard and refuses the whole
+    request if it dislikes either — and a non-http scheme in an inline button is
+    exactly the kind of thing a server or a client may refuse. The point of the
+    tap is the confirmation itself (#78), so the text is sent again without the
+    keyboard rather than lost: the person sees "you are signed in" even on a
+    client that cannot open `karvpn://login`.
+    """
+    try:
+        await message.answer(text, reply_markup=keyboard)
+    except TelegramBadRequest as error:
+        if keyboard is None:
+            raise
+        logger.warning('App login answer refused with the keyboard, sending it as text', error=str(error))
+        await message.answer(text)
+
+
 async def _activate_pending_gift_after_registration(
     db: AsyncSession,
     state: FSMContext,
@@ -538,7 +561,7 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         # the person on: the confirmation is the point of the tap, and the
         # button in it is the way back into the app (#78).
         app_login_text, app_login_keyboard = app_login_reply(app_login_result, texts)
-        await message.answer(app_login_text, reply_markup=app_login_keyboard)
+        await send_app_login_answer(message, app_login_text, app_login_keyboard)
         logger.info(
             'App login answered in the chat',
             telegram_id=message.from_user.id,

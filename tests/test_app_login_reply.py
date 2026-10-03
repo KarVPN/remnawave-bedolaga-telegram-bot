@@ -10,10 +10,17 @@ import re
 from pathlib import Path
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
 from structlog.testing import capture_logs
 
 from app.config import settings
-from app.handlers.start import APP_LOGIN_MESSAGES, APP_LOGIN_RETURN_RESULTS, app_login_reply
+from app.handlers.start import (
+    APP_LOGIN_MESSAGES,
+    APP_LOGIN_RETURN_RESULTS,
+    app_login_reply,
+    send_app_login_answer,
+)
 from app.localization.loader import clear_locale_cache
 from app.localization.texts import get_texts
 from app.services.app_login_service import APP_LOGIN_RETURN_URL, AppLoginResult
@@ -114,3 +121,55 @@ def test_a_stale_working_copy_of_the_locales_does_not_hide_the_keys(tmp_path, mo
         assert texts.t('ACCESS_DENIED') == 'из старой копии'
     finally:
         clear_locale_cache()
+
+
+class _FakeMessage:
+    """От `Message` нужен только `answer`: больше бот в этой ветке не делает.
+
+    `refuses='keyboard'` повторяет разом и сервер, и клиент: Telegram принимает
+    сообщение вместе с клавиатурой и на непонравившемся `url` отказывает целиком,
+    а сообщение при этом не отправляется. `refuses='always'` — отказ без всякой
+    клавиатуры: так падает, например, слишком длинный текст.
+    """
+
+    def __init__(self, refuses: str = 'nothing'):
+        self.calls: list[dict] = []
+        self.refuses = refuses
+
+    async def answer(self, text, reply_markup=None):
+        self.calls.append({'text': text, 'reply_markup': reply_markup})
+        if self.refuses == 'always' or (self.refuses == 'keyboard' and reply_markup is not None):
+            raise TelegramBadRequest(
+                method=SendMessage(chat_id=1, text=text),
+                message='Bad Request: BUTTON_URL_INVALID',
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_confirmation_arrives_even_if_the_button_is_refused():
+    """Подтверждение не должно ехать на кнопке: тап ценен текстом, а не кнопкой."""
+    texts = get_texts('ru')
+    text, keyboard = app_login_reply(AppLoginResult.OK, texts)
+    message = _FakeMessage(refuses='keyboard')
+
+    with capture_logs() as captured:
+        await send_app_login_answer(message, text, keyboard)
+
+    assert [call['text'] for call in message.calls] == [text, text]
+    assert message.calls[0]['reply_markup'] is keyboard
+    assert message.calls[1]['reply_markup'] is None
+    assert [entry['log_level'] for entry in captured] == ['warning']
+
+
+@pytest.mark.asyncio
+async def test_a_text_only_answer_is_sent_once_and_its_error_is_not_swallowed():
+    message = _FakeMessage()
+    await send_app_login_answer(message, 'текст', None)
+    assert len(message.calls) == 1
+
+    # Без клавиатуры повторять нечего: ошибка уходит наверх, а не превращается
+    # в молчание — исходы входа и так честные, и падение не должно быть тихим.
+    refusing = _FakeMessage(refuses='always')
+    with pytest.raises(TelegramBadRequest):
+        await send_app_login_answer(refusing, 'текст', None)
+    assert len(refusing.calls) == 1
