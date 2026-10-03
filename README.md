@@ -180,18 +180,20 @@ docker compose up -d
 
 ## 🔧 Проверки в форке KarVPN
 
-В форке KarVPN автоматические прогоны GitHub Actions не запускаются: GitHub отключает
-workflow-файлы, которые были в репозитории на момент форка. Поэтому линт гоняется руками
-или локально, а образ публикуется через `workflow_dispatch`.
+CI в форке работает: `push` и `pull_request` запускают `Lint`, `docker-registry`,
+`docker-hub` и `release-please`. Исторически GitHub держал workflow-файлы форка
+выключенными (август — начало октября 2026), поэтому проверки шли только локально.
+Если прогоны снова пропали — смотреть вкладку Actions и **[docs/ci.md](docs/ci.md)**;
+там же ручной запуск линта и разбор локальных падений.
 
 ```bash
-gh workflow run lint.yml --ref <ветка>                                  # линт в CI, вручную
+gh workflow run lint.yml --ref <ветка>                                  # линт вручную
 .venv/bin/python -m pytest tests/ -q --continue-on-collection-errors    # тесты локально
 .venv/bin/ruff check . && .venv/bin/ruff format --check .               # линт локально
 ```
 
 Полный набор тестов на чистом `main` даёт **372 passed / 78 failed** и ошибки окружения —
-это baseline, а не регрессия. Команды, разбор падений и шаги для владельца: **[docs/ci.md](docs/ci.md)**.
+это baseline, а не регрессия.
 
 ---
 
