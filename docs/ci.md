@@ -116,10 +116,10 @@ uv sync --group dev        # создаёт .venv как в CI (ruff берёт�
   (`tests/test_miniapp_payments.py`, `tests/test_webapi_subscriptions_tariff.py`,
   `tests/webserver/test_unified_app.py`).
 
-## Известный долг: `Lint` на `main` красный
+## Долг форматирования: закрыт в PR #7
 
-`Lint` уже запускается, но на `main` (`ee2deac2`, и на `3b5d9ddd`) он **падает** — это
-существующий долг, все файлы в `app/**`:
+Пока запрет был снят, `Lint` на `main` (`ee2deac2`, `3b5d9ddd`) падал: наш снимок `app/**`
+отстал от апстрима, а `uv.lock` тянет ruff 0.14.14. Что показывал прогон:
 
 ```
 ruff check .            → 6 ошибок (ruff 0.14.14 из uv.lock)
@@ -137,5 +137,35 @@ ruff format --check .   → 4 файла
   app/services/pricing_engine.py
 ```
 
-Пока это не поправлено отдельным коммитом, любой PR в `main` будет красным по `Lint`
-не из-за своих изменений.
+В PR #7 это приведено к `ruff format` (поведение не меняется):
+
+* `ruff format` по четырём файлам — перенос длинных выражений и условий, кавычки в
+  f-строках, пустые строки перед определением, склейка `state.update_data` в одну строку;
+* `ruff check --fix` — порядок импортов в четырёх файлах;
+* `F841` в `select_tariff_extend_period`: `get_texts(...)` оставлен вызовом без
+  присваивания (так предлагает сам ruff — вызов читает файлы локалей), чистое
+  присваивание `actual_device_limit` удалено. Дифф `--unsafe-fixes` перед применением
+  просмотрен.
+
+Проверка: `ruff check .` и `ruff format --check .` по репозиторию проходят чисто, список
+падающих тестов до и после правки совпадает по id (78 failed / 372 passed / 17 errors).
+
+## Что в форке красное и почему (03.10.2026)
+
+| Workflow | Итог | Причина |
+|:---|:---|:---|
+| `Build and Publish Docker Image` | success | образ публикуется в `ghcr.io`, секреты не нужны |
+| `Lint` | success | после PR #7 |
+| `BedolagaBot` (`docker-hub.yml`) | failure | падает на шаге «Login to Docker Hub»: в форке нет секретов `DOCKER_USERNAME` и `DOCKER_PASSWORD` |
+| `Release Please` | failure | `release-please failed: GitHub Actions is not permitted to create or approve pull requests` |
+
+Что с этим делать (решает владелец):
+
+1. `Release Please` / `Release`: **Settings → Actions → General → Workflow permissions →
+   «Allow GitHub Actions to create and approve pull requests»** — без этого релизный
+   workflow не сможет открыть PR.
+2. `BedolagaBot`: либо добавить секреты Docker Hub в форк, либо пропускать публикацию,
+   когда секретов нет, либо отключить workflow в форке — сейчас он красный всегда.
+   Форк публикует образ в `ghcr.io`, поэтому Docker Hub ему, скорее всего, не нужен.
+3. Если прогоны снова пропадут — проверить, что на вкладке Actions не вернулся баннер
+   форка, а `state` у workflow не стал `disabled_fork`.
