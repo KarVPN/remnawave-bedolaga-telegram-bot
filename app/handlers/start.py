@@ -42,9 +42,11 @@ from app.middlewares.channel_checker import (
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.app_login_service import (
     AppLoginResult,
+    app_login_code,
     app_login_nonce,
     app_login_return_url,
     confirm_app_login,
+    confirm_app_login_by_code,
     is_app_login_payload,
 )
 from app.services.campaign_service import AdvertisingCampaignService
@@ -101,6 +103,32 @@ APP_LOGIN_MESSAGES: dict[AppLoginResult, tuple[str, str]] = {
 # outcomes are reported as they are, without a promise the app cannot keep.
 APP_LOGIN_RETURN_RESULTS = (AppLoginResult.OK, AppLoginResult.EXPIRED)
 
+# The same answers for the login confirmed by a code typed into the chat (#178).
+# Success and the two deployment outcomes are the same words as after the deep
+# link — one login, one answer — while "the code did not work" needs its own
+# text: the link answer explains that a *link* has expired, which is not what a
+# person who typed six digits is looking at. The code text covers both ways the
+# BFF says no (`not found` and `gone`), because for a code they are the same
+# story: the BFF searches only pending, unexpired logins, so a code that ran out
+# of its ten minutes is missing exactly like a code that never existed.
+APP_LOGIN_CODE_MESSAGES: dict[AppLoginResult, tuple[str, str]] = {
+    AppLoginResult.OK: APP_LOGIN_MESSAGES[AppLoginResult.OK],
+    AppLoginResult.EXPIRED: (
+        'APP_LOGIN_CODE_EXPIRED',
+        '❌ Код не найден или истёк. Проверьте цифры и отправьте код ещё раз; '
+        'если он показывался давно — начните вход в приложении заново.',
+    ),
+    AppLoginResult.UNAVAILABLE: APP_LOGIN_MESSAGES[AppLoginResult.UNAVAILABLE],
+    AppLoginResult.DISABLED: APP_LOGIN_MESSAGES[AppLoginResult.DISABLED],
+}
+
+# Only a real sign-in earns the way back here. The deep link also offers it on an
+# expired nonce, because the person is standing in the app that failed to log in
+# and has nowhere else to go; someone who typed a code is already looking at the
+# app on another device, and the button would take them into a login that has not
+# happened — so a refusal is answered without it (#178).
+APP_LOGIN_CODE_RETURN_RESULTS = (AppLoginResult.OK,)
+
 # Telegram reads an empty inline keyboard as "there is no keyboard": on an edit,
 # a keyboard that is simply not sent means the old one stays under the message.
 # That matters after a cabinet sign-in, where the confirmed prompt would keep its
@@ -142,6 +170,25 @@ def app_login_reply(
     key, default = APP_LOGIN_MESSAGES[result]
     text = texts.t(key, default)
     if result not in APP_LOGIN_RETURN_RESULTS:
+        return text, None
+
+    return text, app_login_return_keyboard(texts)
+
+
+def app_login_code_reply(
+    result: AppLoginResult,
+    texts: Texts,
+) -> tuple[str, types.InlineKeyboardMarkup | None]:
+    """The answer to a login code sent as a message: the text and, on success, the button back.
+
+    `app_login_reply` cannot be reused as it is: it offers the way back on an
+    expired outcome too, which belongs to the deep link but not here
+    (`APP_LOGIN_CODE_RETURN_RESULTS`). Everything else is shared — the same
+    outcome enum, the same words where they fit, the same keyboard helper (#178).
+    """
+    key, default = APP_LOGIN_CODE_MESSAGES[result]
+    text = texts.t(key, default)
+    if result not in APP_LOGIN_CODE_RETURN_RESULTS:
         return text, None
 
     return text, app_login_return_keyboard(texts)
@@ -208,6 +255,41 @@ async def edit_app_login_answer(
         lambda markup: message.edit_text(text, reply_markup=markup),
         keyboard,
         no_keyboard_markup=EMPTY_INLINE_KEYBOARD,
+    )
+
+
+async def handle_app_login_code(message: types.Message, db_user=None):
+    """Confirm an app login from the six digits the person typed into the chat (#178).
+
+    The same login as the deep link, confirmed from the other device: the app on
+    the phone shows the code, and the person — whose Telegram may be unusable on
+    that very phone — types it into the bot on a desktop. The code is handed to
+    the BFF (`confirm_app_login_by_code`) and answered with the same words and
+    the same way back into the app as the link (#78, #163).
+
+    Registration is left alone: this handler is registered for the free chat only
+    (`StateFilter(None)`), so six digits inside the registration flow stay what
+    they were — a referral or a promo code (`process_referral_code_input`,
+    `handle_potential_referral_code`). A promo code read through the menu is safe
+    for the same reason: its own step in the FSM is not the free chat either.
+    """
+    code = app_login_code(message.text)
+    if code is None:
+        # The filter lets only a code in, so this is the honest way out if the
+        # two ever disagree: silence beats an answer about a code nobody sent.
+        logger.warning('App login code handler reached without a code', telegram_id=message.from_user.id)
+        return
+
+    texts = get_texts(db_user.language if db_user else DEFAULT_LANGUAGE)
+    # The code itself is never logged: while the login is pending it is a
+    # credential, and the log is not the place for one.
+    app_login_result = await confirm_app_login_by_code(message.from_user.id, code)
+    app_login_text, app_login_keyboard = app_login_code_reply(app_login_result, texts)
+    await send_app_login_answer(message, app_login_text, app_login_keyboard)
+    logger.info(
+        'App login code answered in the chat',
+        telegram_id=message.from_user.id,
+        result=app_login_result.value,
     )
 
 
@@ -2775,6 +2857,16 @@ def register_handlers(dp: Dispatcher):
         process_referral_code_skip, F.data == 'referral_skip', StateFilter(RegistrationStates.waiting_for_referral_code)
     )
     logger.debug('Зарегистрирован process_referral_code_skip')
+
+    # Шесть цифр из приложения — вход с другого устройства (#178). Только
+    # свободный чат: в регистрации и в шаге промокода эти же шесть цифр остаются
+    # реферальным или промокодом, и порядок разбора задан здесь явно —
+    # StateFilter(None) у входа и состояния регистрации у её же обработчиков
+    # ниже. Схема промокода (`[A-Za-z0-9_-]{3,50}`) допускает `123456`, поэтому
+    # без этого разделения рукописный промокод из шести цифр перестал бы
+    # работать.
+    dp.message.register(handle_app_login_code, StateFilter(None), F.text.func(app_login_code))
+    logger.debug('Зарегистрирован handle_app_login_code')
 
     dp.message.register(process_referral_code_input, StateFilter(RegistrationStates.waiting_for_referral_code))
     logger.debug('Зарегистрирован process_referral_code_input')
