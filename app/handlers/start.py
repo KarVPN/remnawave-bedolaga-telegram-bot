@@ -1,5 +1,5 @@
 import html
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -101,6 +101,33 @@ APP_LOGIN_MESSAGES: dict[AppLoginResult, tuple[str, str]] = {
 # outcomes are reported as they are, without a promise the app cannot keep.
 APP_LOGIN_RETURN_RESULTS = (AppLoginResult.OK, AppLoginResult.EXPIRED)
 
+# Telegram reads an empty inline keyboard as "there is no keyboard": on an edit,
+# a keyboard that is simply not sent means the old one stays under the message.
+# That matters after a cabinet sign-in, where the confirmed prompt would keep its
+# own "yes/no" pair (#163).
+EMPTY_INLINE_KEYBOARD = types.InlineKeyboardMarkup(inline_keyboard=[])
+
+
+def app_login_return_keyboard(texts: Texts) -> types.InlineKeyboardMarkup | None:
+    """The one-tap way back into the app, or `None` when there is nothing to offer.
+
+    Both ways in end in the same chat — the app's own deep link (#78) and the
+    cabinet sign-in the app opens (#163) — so the way back is built here once and
+    looks the same in both. The button needs an http(s) address
+    (`KARVPN_APP_LOGIN_RETURN_URL`): Telegram refuses a keyboard whose URL uses
+    any other protocol, and the refusal costs the whole message, so an unusable
+    address means no button at all rather than a rejected answer.
+    """
+    return_url = app_login_return_url()
+    if return_url is None:
+        return None
+
+    button = types.InlineKeyboardButton(
+        text=texts.t('APP_LOGIN_RETURN_BUTTON', '↩️ Вернуться в приложение'),
+        url=return_url,
+    )
+    return types.InlineKeyboardMarkup(inline_keyboard=[[button]])
+
 
 def app_login_reply(
     result: AppLoginResult,
@@ -108,26 +135,39 @@ def app_login_reply(
 ) -> tuple[str, types.InlineKeyboardMarkup | None]:
     """The answer to an app login deep link: the text and, where it helps, the button back.
 
-    The button needs an http(s) address (`KARVPN_APP_LOGIN_RETURN_URL`, #163):
-    Telegram refuses a keyboard whose URL uses any other protocol, and the
-    refusal costs the whole message. When there is no such address the answer is
-    the same text without the button — what the person reads must not depend on a
-    link the server would reject anyway.
+    The button comes from `app_login_return_keyboard` (#163): without a usable
+    address the answer is the same text without the button — what the person
+    reads must not depend on a link the server would reject anyway.
     """
     key, default = APP_LOGIN_MESSAGES[result]
     text = texts.t(key, default)
     if result not in APP_LOGIN_RETURN_RESULTS:
         return text, None
 
-    return_url = app_login_return_url()
-    if return_url is None:
-        return text, None
+    return text, app_login_return_keyboard(texts)
 
-    button = types.InlineKeyboardButton(
-        text=texts.t('APP_LOGIN_RETURN_BUTTON', '↩️ Вернуться в приложение'),
-        url=return_url,
-    )
-    return text, types.InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+async def _deliver_answer_without_riding_on_the_button(
+    deliver: Callable[[types.InlineKeyboardMarkup | None], Awaitable[Any]],
+    keyboard: types.InlineKeyboardMarkup | None,
+    no_keyboard_markup: types.InlineKeyboardMarkup | None,
+) -> None:
+    """Deliver the answer, and deliver it again without the keyboard if it is refused.
+
+    Telegram validates a message together with its keyboard and refuses the whole
+    request if it dislikes either — an inline button URL it does not accept is
+    one such case (#163). The text is what the person needs, so on a refusal it
+    is sent once more without the keyboard. What "without the keyboard" means
+    depends on the call: a fresh message simply carries none, while an edit must
+    be given an empty markup to drop the one already there.
+    """
+    try:
+        await deliver(keyboard if keyboard is not None else no_keyboard_markup)
+    except TelegramBadRequest as error:
+        if keyboard is None:
+            raise
+        logger.warning('App login answer refused with the keyboard, sending it as text', error=str(error))
+        await deliver(no_keyboard_markup)
 
 
 async def send_app_login_answer(
@@ -137,21 +177,38 @@ async def send_app_login_answer(
 ) -> None:
     """Send the login answer so that the confirmation never rides on the button.
 
-    Telegram validates a message together with its keyboard and refuses the whole
-    request if it dislikes either — an inline button URL it does not accept is
-    one such case (#163). The point of the tap is the confirmation itself (#78),
-    so the text is sent again without the keyboard rather than lost: the person
-    sees "you are signed in" even when the button is refused. The address of the
-    button is checked before it is built (`app_login_return_url`), so this is the
-    second line of defence, not the first.
+    The point of the tap is the confirmation itself (#78), so the text arrives
+    even when the button does not: the address is checked before it is built
+    (`app_login_return_url`), and a refusal that slips through is answered with
+    the same text without the keyboard — the second line of defence, not the
+    first.
     """
-    try:
-        await message.answer(text, reply_markup=keyboard)
-    except TelegramBadRequest as error:
-        if keyboard is None:
-            raise
-        logger.warning('App login answer refused with the keyboard, sending it as text', error=str(error))
-        await message.answer(text)
+    await _deliver_answer_without_riding_on_the_button(
+        lambda markup: message.answer(text, reply_markup=markup),
+        keyboard,
+        no_keyboard_markup=None,
+    )
+
+
+async def edit_app_login_answer(
+    message: types.Message,
+    text: str,
+    keyboard: types.InlineKeyboardMarkup | None,
+) -> None:
+    """Rewrite the message the sign-in started from into its outcome (#163).
+
+    The cabinet sign-in is confirmed on the message that asked to confirm it, so
+    the answer is an edit. `edit_text` without a keyboard keeps the one already
+    under the message — the "yes/no" pair would stay under a sign-in that is
+    already linked — so a missing keyboard is sent as an empty one here. The
+    outcome is the same text either way: with the way back into the app on a
+    confirmed sign-in, and with nothing to press when the sign-in did not happen.
+    """
+    await _deliver_answer_without_riding_on_the_button(
+        lambda markup: message.edit_text(text, reply_markup=markup),
+        keyboard,
+        no_keyboard_markup=EMPTY_INLINE_KEYBOARD,
+    )
 
 
 async def _activate_pending_gift_after_registration(
@@ -586,8 +643,8 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
         web_auth_token = start_parameter.removeprefix('webauth_')
         if len(web_auth_token) >= WEB_AUTH_TOKEN_MIN_LENGTH:
             user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+            texts = get_texts(user.language if user else DEFAULT_LANGUAGE)
             if user and user.status != UserStatus.DELETED.value:
-                texts = get_texts(user.language)
                 keyboard = types.InlineKeyboardMarkup(
                     inline_keyboard=[
                         [
@@ -611,7 +668,12 @@ async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession,
                 )
             else:
                 logger.warning('Web auth attempt from unregistered user', telegram_id=message.from_user.id)
-                await message.answer('❌ Сначала зарегистрируйтесь в боте, затем попробуйте войти в кабинет.')
+                await message.answer(
+                    texts.t(
+                        'WEB_AUTH_NOT_REGISTERED',
+                        '❌ Сначала зарегистрируйтесь в боте, затем попробуйте войти в кабинет.',
+                    )
+                )
             return
         start_parameter = None  # Invalid token, ignore
 
@@ -2626,36 +2688,59 @@ async def process_webauth_confirm(
     callback: types.CallbackQuery,
     db: AsyncSession,
 ):
-    """Handle web auth confirmation or denial."""
+    """Handle web auth confirmation or denial.
+
+    The outcome replaces the prompt it was given on, and the prompt's own buttons
+    go with it: after a confirmed sign-in the way back into the app takes their
+    place (`app_login_return_keyboard`, #163), and after any other outcome there
+    is nothing left to tap.
+    """
     await callback.answer()
 
     if not isinstance(callback.message, types.Message):
         return
 
+    user = await get_user_by_telegram_id(db, callback.from_user.id)
+    texts = get_texts(user.language if user else DEFAULT_LANGUAGE)
+
     if callback.data == 'webauth_deny':
-        await callback.message.edit_text('❌ Вход отменён.')
+        await edit_app_login_answer(callback.message, texts.t('WEB_AUTH_DENIED', '❌ Вход отменён.'), None)
         return
 
     # Extract token from callback_data: "webauth_confirm:{token}"
     token = callback.data.split(':', 1)[1] if ':' in callback.data else ''
     if len(token) < WEB_AUTH_TOKEN_MIN_LENGTH:
-        await callback.message.edit_text('❌ Ошибка: неверный токен.')
+        await edit_app_login_answer(
+            callback.message,
+            texts.t('WEB_AUTH_INVALID_TOKEN', '❌ Ошибка: неверный токен.'),
+            None,
+        )
         return
 
-    user = await get_user_by_telegram_id(db, callback.from_user.id)
     if not user or user.status != UserStatus.ACTIVE.value:
-        await callback.message.edit_text('❌ Учётная запись неактивна.')
+        await edit_app_login_answer(
+            callback.message,
+            texts.t('WEB_AUTH_INACTIVE_ACCOUNT', '❌ Учётная запись неактивна.'),
+            None,
+        )
         return
 
     linked = await link_web_auth_token(token, callback.from_user.id, user.id)
-    texts = get_texts(user.language)
     if linked:
-        await callback.message.edit_text(
+        # The person came from the app, so the confirmed sign-in hands them the
+        # way back in the same message — one tap, as in the app's own login (#78).
+        await edit_app_login_answer(
+            callback.message,
             texts.t('WEB_AUTH_SUCCESS', '✅ Авторизация в кабинете подтверждена! Вернитесь в браузер.'),
+            app_login_return_keyboard(texts),
         )
     else:
-        await callback.message.edit_text(
+        # The token is gone: there is nothing left to confirm and nowhere to
+        # return to, so the answer carries no button at all.
+        await edit_app_login_answer(
+            callback.message,
             texts.t('WEB_AUTH_EXPIRED', '❌ Ссылка для входа истекла. Попробуйте снова.'),
+            None,
         )
 
 

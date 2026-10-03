@@ -12,7 +12,9 @@ reached or answered unexpectedly, `disabled` when this deployment has no BFF
 configured at all.
 
 The confirmation also carries the way back (`KARVPN_APP_LOGIN_RETURN_URL`): the
-person came from the app and the chat has nothing else to offer them (#78).
+person came from the app and the chat has nothing else to offer them (#78). The
+cabinet sign-in the app opens (#163) ends in the same chat and answers with the
+button built from that same address, so the setting is read here for both.
 """
 
 from enum import StrEnum
