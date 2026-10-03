@@ -775,7 +775,10 @@ class Settings(BaseSettings):
     CABINET_ENABLED: bool = False
     CABINET_JWT_SECRET: str | None = None
     CABINET_ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
-    CABINET_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    # 90 дней — цель из ADR 0005 (karvpn-apps): приложение входит тем же кабинетным
+    # входом, поэтому кабинетный refresh-токен и есть внешняя сессия приложения.
+    # Прежние 7 дней означали вылет из приложения раз в неделю.
+    CABINET_REFRESH_TOKEN_EXPIRE_DAYS: int = 90
     CABINET_ALLOWED_ORIGINS: str = ''
     CABINET_EMAIL_VERIFICATION_ENABLED: bool = True
     CABINET_EMAIL_VERIFICATION_EXPIRE_HOURS: int = 24
