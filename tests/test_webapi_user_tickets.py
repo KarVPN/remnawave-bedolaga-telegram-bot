@@ -93,6 +93,8 @@ class _Store:
         self.created_messages: list[TicketMessage] = []
         self.query_calls: list[tuple[str, dict]] = []
         self.telegram_notifications: list[str] = []
+        # Что ушло в анонс как вложение: (media_file_id, media_type).
+        self.announced_media: list[tuple[str | None, str | None]] = []
         self.cabinet_notifications: list[str] = []
         self.cabinet_websocket_events: list[str] = []
         self._ticket_seq = 0
@@ -244,9 +246,14 @@ def store(monkeypatch) -> _Store:
         return message
 
     async def notify_admins_about_new_ticket(ticket, _db):
+        first = ticket.messages[0] if ticket.messages else None
+        store.announced_media.append(
+            (first.media_file_id if first else None, first.media_type if first else None)
+        )
         store.telegram_notifications.append(f'new:{ticket.id}')
 
     async def notify_admins_about_ticket_reply(ticket, reply_text, _db, *, media_file_id=None, media_type=None):
+        store.announced_media.append((media_file_id, media_type))
         store.telegram_notifications.append(f'reply:{ticket.id}:{reply_text}')
 
     async def create_admin_notification_for_new_ticket(_db, ticket):
@@ -702,6 +709,7 @@ class TestContract:
 
         assert routes == {
             '/by-telegram-id/{telegram_id}',
+            '/by-telegram-id/{telegram_id}/media',
             '/by-telegram-id/{telegram_id}/{ticket_id}',
             '/by-telegram-id/{telegram_id}/{ticket_id}/messages',
         }
@@ -719,3 +727,214 @@ class TestContract:
         assert set(UserTicketSummaryResponse.model_fields) == set(CabinetTicketResponse.model_fields)
         assert set(UserTicketMessageResponse.model_fields) == set(CabinetTicketMessageResponse.model_fields)
         assert set(CabinetTicketDetailResponse.model_fields) <= set(UserTicketDetailResponse.model_fields)
+
+
+MEDIA_URL = f'{BASE}/media'
+UPLOADED_FILE_ID = 'AgACAgIAAxkBAAI'
+
+
+@pytest.fixture
+def media_uploads(monkeypatch) -> list[SimpleNamespace]:
+    """Подменяет настоящую загрузку в Telegram: проверяется контракт маршрута.
+
+    Настоящая загрузка (и «бот недоступен») проверяется отдельно; здесь важно,
+    что маршрут отдаёт вызывающему и что именно он передаёт загрузчику.
+    """
+    calls: list[SimpleNamespace] = []
+
+    async def upload_ticket_media(*, telegram_id, filename, data, media_type, caption):
+        calls.append(
+            SimpleNamespace(
+                telegram_id=telegram_id,
+                filename=filename,
+                data=data,
+                media_type=media_type,
+                caption=caption,
+            )
+        )
+        return UPLOADED_FILE_ID
+
+    monkeypatch.setattr(user_tickets_route, 'upload_ticket_media', upload_ticket_media)
+    return calls
+
+
+async def _upload(
+    app: FastAPI,
+    *,
+    filename: str = 'app.log',
+    content: bytes = b'log line\n',
+    content_type: str = 'text/plain',
+    caption: str | None = None,
+    key: str | None = MACHINE_KEY,
+):
+    """POST multipart на /media: файл как его отправит наша сторона."""
+    files = {'file': (filename, content, content_type)}
+    data = {} if caption is None else {'caption': caption}
+    headers = {}
+    if key is not None:
+        headers['X-API-Key'] = key
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url='http://bot') as client:
+        return await client.post(MEDIA_URL, files=files, data=data, headers=headers)
+
+
+class TestTicketMediaUpload:
+    """Логи и скриншоты приложения уходят вложением, а не текстом."""
+
+    async def test_upload_returns_the_triple_for_creation_or_message(self, machine_app, store, media_uploads):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        response = await _upload(machine_app, caption='Лог приложения')
+
+        assert response.status_code == 201
+        assert response.json() == {
+            'media_type': 'document',
+            'media_file_id': UPLOADED_FILE_ID,
+            'media_caption': 'Лог приложения',
+        }
+        assert len(media_uploads) == 1
+        upload = media_uploads[0]
+        assert upload.telegram_id == TELEGRAM_ID
+        assert upload.filename == 'app.log'
+        assert upload.data == b'log line\n'
+        assert upload.media_type == 'document'
+        assert upload.caption == 'Лог приложения'
+
+    async def test_photo_and_video_keep_their_kind(self, machine_app, store, media_uploads):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        photo = await _upload(machine_app, filename='shot.png', content=b'\x89PNG', content_type='image/png')
+        video = await _upload(machine_app, filename='clip.mp4', content=b'\x00\x00', content_type='video/mp4')
+
+        assert photo.status_code == 201
+        assert photo.json()['media_type'] == 'photo'
+        assert video.status_code == 201
+        assert video.json()['media_type'] == 'video'
+        assert [upload.media_type for upload in media_uploads] == ['photo', 'video']
+
+    async def test_content_type_can_be_derived_from_the_filename(self, machine_app, store, media_uploads):
+        """Телефон не всегда называет тип: .zip из имени файла достаточно."""
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        response = await _upload(
+            machine_app, filename='logs.zip', content=b'PK\x03\x04', content_type='application/octet-stream'
+        )
+
+        assert response.status_code == 201
+        assert response.json()['media_type'] == 'document'
+
+    async def test_oversize_file_is_rejected_before_upload(self, machine_app, store, media_uploads, monkeypatch):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+        monkeypatch.setattr(user_tickets_route, 'MAX_TICKET_MEDIA_BYTES', 8)
+
+        too_large = await _upload(machine_app, content=b'x' * 9)
+        at_limit = await _upload(machine_app, content=b'x' * 8)
+
+        assert too_large.status_code == 413
+        assert 'limit' in too_large.json()['detail']
+        assert at_limit.status_code == 201
+        assert len(media_uploads) == 1
+
+    async def test_unsupported_type_is_refused(self, machine_app, store, media_uploads):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        response = await _upload(machine_app, filename='voice.mp3', content=b'ID3', content_type='audio/mpeg')
+
+        assert response.status_code == 415
+        assert media_uploads == []
+
+    async def test_empty_file_is_refused(self, machine_app, store, media_uploads):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        response = await _upload(machine_app, content=b'')
+
+        assert response.status_code == 400
+        assert media_uploads == []
+
+    async def test_missing_file_is_refused(self, machine_app, store, media_uploads):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        response = await _call(machine_app, 'POST', MEDIA_URL, body={'caption': 'без файла'})
+
+        assert response.status_code == 422
+        assert media_uploads == []
+
+    async def test_caption_over_the_bound_is_refused(self, machine_app, store, media_uploads):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        response = await _upload(machine_app, caption='a' * 1001)
+
+        assert response.status_code == 422
+        assert media_uploads == []
+
+    async def test_unknown_person_is_not_found(self, machine_app, store, media_uploads):
+        response = await _upload(machine_app)
+
+        assert response.status_code == 404
+        assert response.json() == {'detail': 'User not found'}
+        assert media_uploads == []
+
+    async def test_support_disabled_answers_forbidden(self, machine_app, store, media_uploads, monkeypatch):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+        monkeypatch.setattr(type(settings), 'is_support_tickets_enabled', lambda _settings: False)
+
+        response = await _upload(machine_app)
+
+        assert response.status_code == 403
+        assert response.json() == {'detail': 'Support tickets are disabled'}
+        assert media_uploads == []
+
+    async def test_without_the_machine_key_nothing_is_uploaded(self, unauthorised_app, media_uploads):
+        response = await _upload(unauthorised_app, key=None)
+
+        assert response.status_code == 401
+        assert media_uploads == []
+
+    async def test_bot_unavailable_answers_service_unavailable(self, machine_app, store, media_uploads, monkeypatch):
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        async def broken_upload(**_kwargs):
+            raise RuntimeError('telegram is unreachable')
+
+        monkeypatch.setattr(user_tickets_route, 'upload_ticket_media', broken_upload)
+
+        response = await _upload(machine_app)
+
+        assert response.status_code == 503
+        assert 'temporarily unavailable' in response.json()['detail']
+
+    async def test_returned_file_id_lands_in_the_announcement(self, machine_app, store, media_uploads):
+        """Файл доходит до поддержки один раз: через анонс обращения/сообщения."""
+        store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+
+        uploaded = (await _upload(machine_app, caption='Лог приложения')).json()
+
+        created = await _call(
+            machine_app,
+            'POST',
+            BASE,
+            body={
+                'title': 'Лог приложения',
+                'message': 'Прикладываю лог приложения',
+                'media_type': uploaded['media_type'],
+                'media_file_id': uploaded['media_file_id'],
+                'media_caption': uploaded['media_caption'],
+            },
+        )
+        assert created.status_code == 201
+        assert store.announced_media[-1] == (UPLOADED_FILE_ID, 'document')
+
+        replied = await _call(
+            machine_app,
+            'POST',
+            f'{BASE}/{created.json()["id"]}/messages',
+            body={
+                'message': 'И ещё один лог приложения',
+                'media_type': uploaded['media_type'],
+                'media_file_id': uploaded['media_file_id'],
+            },
+        )
+        assert replied.status_code == 201
+        assert store.announced_media[-1] == (UPLOADED_FILE_ID, 'document')
+

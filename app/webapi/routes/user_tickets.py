@@ -24,7 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Security, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -32,12 +32,14 @@ from app.database.crud.ticket import TicketCRUD, TicketMessageCRUD
 from app.database.crud.ticket_notification import TicketNotificationCRUD
 from app.database.crud.user import get_user_by_telegram_id
 from app.database.models import Ticket, TicketMessage, TicketStatus, User
+from app.services.ticket_media_service import MAX_TICKET_MEDIA_BYTES, media_kind, upload_ticket_media
 
 from ..dependencies import get_db_session, require_api_token
 from ..schemas.user_tickets import (
     UserTicketCreateRequest,
     UserTicketDetailResponse,
     UserTicketListResponse,
+    UserTicketMediaUploadResponse,
     UserTicketMessageCreateRequest,
     UserTicketMessageResponse,
     UserTicketSummaryResponse,
@@ -159,6 +161,61 @@ async def _announce_ticket_reply(
             await notify_admins_ticket_reply(ticket.id, (message_text or '')[:100], ticket.user_id)
     except Exception as error:
         logger.error('Failed to create cabinet notification for a ticket reply from the machine API', error=error)
+
+
+@router.post(
+    '/by-telegram-id/{telegram_id}/media',
+    response_model=UserTicketMediaUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_person_ticket_media(
+    telegram_id: int,
+    _: Any = Security(require_api_token),
+    db: AsyncSession = Depends(get_db_session),
+    file: UploadFile = File(..., description='The file to attach to the ticket'),
+    caption: str | None = Form(None, max_length=1000, description='Optional caption'),
+) -> UserTicketMediaUploadResponse:
+    """Upload one attachment and return the Telegram triple for the ticket.
+
+    The file is uploaded to Telegram once to obtain a reusable `file_id` and the
+    temporary message is removed (see `app/services/ticket_media_service.py`):
+    the caller then passes `media_file_id` into ticket creation or a message, and
+    the support announcement delivers the attachment exactly once.
+    """
+    if not settings.is_support_tickets_enabled():
+        raise HTTPException(status.HTTP_403_FORBIDDEN, 'Support tickets are disabled')
+
+    await _require_person(db, telegram_id)
+
+    kind = media_kind(file.content_type, file.filename)
+    if kind is None:
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, 'Unsupported file type')
+
+    data = await file.read(MAX_TICKET_MEDIA_BYTES + 1)
+    if len(data) > MAX_TICKET_MEDIA_BYTES:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f'File is too large (limit {MAX_TICKET_MEDIA_BYTES // (1024 * 1024)} MiB)',
+        )
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'File is empty')
+
+    try:
+        file_id = await upload_ticket_media(
+            telegram_id=telegram_id,
+            filename=file.filename or 'upload',
+            data=data,
+            media_type=kind,
+            caption=caption,
+        )
+    except Exception as error:
+        logger.error('Failed to upload ticket media', telegram_id=telegram_id, error=error)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            'Support media upload is temporarily unavailable',
+        ) from error
+
+    return UserTicketMediaUploadResponse(media_type=kind, media_file_id=file_id, media_caption=caption)
 
 
 @router.get('/by-telegram-id/{telegram_id}', response_model=UserTicketListResponse)
