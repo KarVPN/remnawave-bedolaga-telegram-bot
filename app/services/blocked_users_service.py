@@ -53,6 +53,7 @@ from app.database.models import (
     WithdrawalRequest,
     YooKassaPayment,
 )
+from app.external.remnawave_api import RemnaWaveInvalidUserIdError
 from app.services.remnawave_service import RemnaWaveService
 
 
@@ -87,7 +88,9 @@ class BlockCheckResult:
     full_name: str
     status: BlockCheckStatus
     error_message: str | None = None
-    remnawave_uuid: str | None = None
+    # Панельная идентичность (Remnawave 3.0.0: числовой id).
+    remnawave_id: int | None = None
+    remnawave_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -159,6 +162,9 @@ class BlockedUsersService:
 
     async def _check_single_user(self, user: User) -> BlockCheckResult:
         """Проверяет одного пользователя."""
+        sub_ids = [s.remnawave_id for s in (getattr(user, 'subscriptions', None) or []) if s.remnawave_id]
+        remnawave_ids = sub_ids or ([user.remnawave_id] if user.remnawave_id else [])
+
         if not user.telegram_id:
             return BlockCheckResult(
                 user_id=user.id,
@@ -166,7 +172,8 @@ class BlockedUsersService:
                 username=user.username,
                 full_name=user.full_name,
                 status=BlockCheckStatus.NO_TELEGRAM_ID,
-                remnawave_uuid=user.remnawave_uuid,
+                remnawave_id=user.remnawave_id,
+                remnawave_ids=remnawave_ids,
             )
 
         status = await self.check_user_blocked(user.telegram_id)
@@ -177,7 +184,8 @@ class BlockedUsersService:
             username=user.username,
             full_name=user.full_name,
             status=status,
-            remnawave_uuid=user.remnawave_uuid,
+            remnawave_id=user.remnawave_id,
+            remnawave_ids=remnawave_ids,
         )
 
     async def scan_all_users(
@@ -204,7 +212,7 @@ class BlockedUsersService:
         result = BlockedUsersScanResult()
 
         # Формируем запрос
-        query = select(User).options(selectinload(User.subscription))
+        query = select(User).options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
         if only_active:
             query = query.where(User.status == UserStatus.ACTIVE.value)
         query = query.where(User.telegram_id.isnot(None))
@@ -255,7 +263,7 @@ class BlockedUsersService:
         result.scan_duration_seconds = (datetime.now(tz=UTC) - start_time).total_seconds()
 
         logger.info(
-            'Сканирование завершено: заблокированных из проверенных за с',
+            'Сканирование завершено',
             blocked_count=result.blocked_count,
             total_checked=result.total_checked,
             scan_duration_seconds=round(result.scan_duration_seconds, 1),
@@ -263,9 +271,15 @@ class BlockedUsersService:
 
         return result
 
-    async def delete_user_from_remnawave(self, remnawave_uuid: str) -> bool:
-        """Удаляет пользователя из панели Remnawave."""
-        if not remnawave_uuid:
+    async def delete_user_from_remnawave(self, remnawave_id: int) -> bool:
+        """Удаляет пользователя из панели Remnawave.
+
+        ``REMNAWAVE_USER_DELETE_MODE`` здесь намеренно не спрашивается: это не
+        побочная уборка, а явно выбранное админом действие «удалить из Remnawave»
+        в разделе заблокированных — как ``force_panel_delete`` при полном удалении
+        пользователя. Кому нужна только деактивация, выбирает соседнее действие.
+        """
+        if not remnawave_id:
             return False
 
         try:
@@ -274,15 +288,21 @@ class BlockedUsersService:
                 return False
 
             async with self.remnawave_service.get_api_client() as api:
-                await api.delete_user(remnawave_uuid)
-                logger.info('Удален пользователь из Remnawave', remnawave_uuid=remnawave_uuid)
+                # 3.0.0: DELETE отвечает 204/202 без тела — успех это отсутствие исключения.
+                await api.delete_user(remnawave_id)
+                logger.info('Удален пользователь из Remnawave', remnawave_id=remnawave_id)
                 return True
+        except RemnaWaveInvalidUserIdError as e:
+            # Битая панельная ссылка в БД бота — это не «пользователя уже нет»,
+            # иначе строка молча зачлась бы как успешная очистка панели.
+            logger.error('Непригодный панельный id, удаление пропущено', remnawave_id=remnawave_id, error=e)
+            return False
         except Exception as e:
             error_msg = str(e).lower()
             if 'not found' in error_msg or '404' in error_msg:
-                logger.info('Пользователь уже удален из Remnawave', remnawave_uuid=remnawave_uuid)
+                logger.info('Пользователь уже удален из Remnawave', remnawave_id=remnawave_id)
                 return True
-            logger.error('Ошибка удаления из Remnawave', remnawave_uuid=remnawave_uuid, error=e)
+            logger.error('Ошибка удаления из Remnawave', remnawave_id=remnawave_id, error=e)
             return False
 
     async def delete_user_from_db(self, db: AsyncSession, user_id: int) -> bool:
@@ -292,7 +312,9 @@ class BlockedUsersService:
         try:
             # Получаем пользователя
             user_result = await db.execute(
-                select(User).options(selectinload(User.subscription)).where(User.id == user_id)
+                select(User)
+                .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
+                .where(User.id == user_id)
             )
             user = user_result.scalar_one_or_none()
 
@@ -302,6 +324,22 @@ class BlockedUsersService:
 
             user_display = user.telegram_id or user.email or f'#{user.id}'
 
+            # Best-effort: stop Platega SBP autopay for every subscription of
+            # this user before anything is deleted — the platega_subscriptions
+            # record CASCADE-deletes with its subscription below, so cancelling
+            # afterwards would find nothing to cancel on Platega's side and the
+            # user keeps getting charged for a deleted account. This path has
+            # no grace-access guard (unlike UserService.delete_user_account), so
+            # a plain best-effort cancel loop is enough — no lock to re-acquire.
+            from app.services.cashera_recurring_cancel import cancel_cashera_recurring_for_subscription_safe
+            from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+            from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+            for sub in getattr(user, 'subscriptions', None) or []:
+                await cancel_platega_recurring_for_subscription_safe(db, sub.id)
+
+                await cancel_lava_recurring_for_subscription_safe(db, sub.id)
+                await cancel_cashera_recurring_for_subscription_safe(db, sub.id)
             # Удаляем связанные записи (порядок важен из-за foreign keys)
 
             # 1. Платежные системы (до транзакций, т.к. ссылаются на них)
@@ -319,12 +357,10 @@ class BlockedUsersService:
             # 2. Транзакции (после платежей)
             await db.execute(delete(Transaction).where(Transaction.user_id == user.id))
 
-            # 3. Подписки
-            if user.subscription:
-                await db.execute(
-                    delete(SubscriptionServer).where(SubscriptionServer.subscription_id == user.subscription.id)
-                )
-                await db.execute(delete(Subscription).where(Subscription.user_id == user.id))
+            # 3. Подписки — cleanup ALL subscriptions' servers, then delete all subscriptions
+            for sub in getattr(user, 'subscriptions', None) or []:
+                await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id == sub.id))
+            await db.execute(delete(Subscription).where(Subscription.user_id == user.id))
             await db.execute(delete(SubscriptionConversion).where(SubscriptionConversion.user_id == user.id))
             await db.execute(delete(SubscriptionEvent).where(SubscriptionEvent.user_id == user.id))
 
@@ -379,6 +415,15 @@ class BlockedUsersService:
             if not user:
                 return False
 
+            from app.services.rbac_bootstrap_service import is_protected_from_blocking
+
+            if is_protected_from_blocking(user):
+                logger.info(
+                    'Пропуск пометки заблокированным: аккаунт админа из env',
+                    telegram_id=user.telegram_id or user.id,
+                )
+                return False
+
             user.status = UserStatus.BLOCKED.value
             user.updated_at = datetime.now(tz=UTC)
             await db.commit()
@@ -416,15 +461,45 @@ class BlockedUsersService:
 
         for i, user_result in enumerate(blocked_users):
             try:
+                if action in (
+                    BlockedUserAction.DELETE_FROM_REMNAWAVE,
+                    BlockedUserAction.DELETE_FROM_DB,
+                    BlockedUserAction.DELETE_BOTH,
+                ):
+                    from app.services.grace_access_runtime import (
+                        GraceAccessDeletionBlocked,
+                        ensure_no_open_grace_for_user,
+                    )
+
+                    try:
+                        await ensure_no_open_grace_for_user(db, user_result.user_id)
+                    except GraceAccessDeletionBlocked:
+                        result.errors.append(
+                            f'Удаление {user_result.telegram_id} пропущено: сначала завершите grace-доступ'
+                        )
+                        if progress_callback:
+                            await progress_callback(i + 1, total)
+                        continue
+
                 if action in (BlockedUserAction.DELETE_FROM_REMNAWAVE, BlockedUserAction.DELETE_BOTH):
-                    if user_result.remnawave_uuid:
-                        success = await self.delete_user_from_remnawave(user_result.remnawave_uuid)
+                    ids_to_delete = user_result.remnawave_ids or (
+                        [user_result.remnawave_id] if user_result.remnawave_id else []
+                    )
+                    for rw_id in ids_to_delete:
+                        success = await self.delete_user_from_remnawave(rw_id)
                         if success:
                             result.deleted_from_remnawave += 1
                         else:
-                            result.errors.append(f'Ошибка удаления {user_result.telegram_id} из Remnawave')
+                            result.errors.append(
+                                f'Ошибка удаления {user_result.telegram_id} (panel_id={rw_id}) из Remnawave'
+                            )
                         # Задержка для избежания rate limit
                         await asyncio.sleep(self.API_DELAY_SECONDS)
+
+                    if action == BlockedUserAction.DELETE_FROM_REMNAWAVE:
+                        # Release the pre-delete advisory/SQLite write guard;
+                        # this action intentionally makes no database changes.
+                        await db.rollback()
 
                 if action in (BlockedUserAction.DELETE_FROM_DB, BlockedUserAction.DELETE_BOTH):
                     success = await self.delete_user_from_db(db, user_result.user_id)

@@ -5,6 +5,7 @@ import csv
 import io
 import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from aiogram.types import BufferedInputFile
@@ -21,6 +22,8 @@ from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.traffic import (
     ExportCsvRequest,
     ExportCsvResponse,
+    SubscriptionEnrichmentInfo,
+    SubscriptionTrafficInfo,
     TrafficEnrichmentResponse,
     TrafficNodeInfo,
     TrafficUsageResponse,
@@ -34,10 +37,9 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix='/admin/traffic', tags=['Admin Traffic'])
 
 _ALLOWED_PERIODS = frozenset({1, 3, 7, 14, 30})
-_CONCURRENCY_LIMIT = 5  # Max parallel API calls to avoid rate limiting
 
 # In-memory cache: {(start_str, end_str): (timestamp, aggregated_data, nodes_info)}
-_traffic_cache: dict[tuple[str, str], tuple[float, dict[str, dict[str, int]], list[TrafficNodeInfo]]] = {}
+_traffic_cache: dict[tuple[str, str], tuple[float, dict[int, dict[str, int]], list[TrafficNodeInfo]]] = {}
 _CACHE_TTL = 300  # 5 minutes
 _cache_lock = asyncio.Lock()
 
@@ -60,17 +62,20 @@ def _validate_period(period: int) -> None:
 
 
 async def _aggregate_traffic(
-    start_str: str, end_str: str, user_uuids: list[str]
-) -> tuple[dict[str, dict[str, int]], list[TrafficNodeInfo]]:
+    start_str: str, end_str: str, panel_user_ids: list[int]
+) -> tuple[dict[int, dict[str, int]], list[TrafficNodeInfo]]:
     """Aggregate per-user traffic across all nodes for a given date range.
 
-    Uses legacy per-node endpoint to fetch all users' traffic per node —
-    O(nodes) API calls instead of O(users). The legacy endpoint returns
-    {userUuid, nodeUuid, total} per entry (non-legacy only returns topUsers
-    without userUuid).
+    Remnawave 3.0.0 удалил legacy-эндпоинт с построчной разбивкой
+    ({userUuid, nodeUuid, total}), а его нелегаси-замена
+    ``GET /api/bandwidth-stats/nodes/{uuid}/users`` отдаёт ``topUsers`` вообще
+    без идентификатора пользователя — для таблицы «пользователь × узел» она
+    непригодна. Поэтому берём ``POST /api/bandwidth-stats/nodes/usage``:
+    ``{nodes: [{uuid, users: [{id, totalBytes}]}]}`` — один запрос на все узлы
+    вместо O(nodes), ценой потери разбивки по дням (страница её и не показывала).
 
     Returns (user_traffic, nodes_info) where:
-      user_traffic = {remnawave_uuid: {node_uuid: total_bytes, ...}}
+      user_traffic = {remnawave_id: {node_uuid: total_bytes, ...}}
       nodes_info = [TrafficNodeInfo, ...]
     """
     cache_key = (start_str, end_str)
@@ -93,48 +98,61 @@ async def _aggregate_traffic(
         if not service.is_configured:
             return {}, []
 
-        user_uuids_set = set(user_uuids)
+        known_panel_user_ids = set(panel_user_ids)
 
         async with service.get_api_client() as api:
             try:
                 nodes = await api.get_all_nodes()
             except Exception:
                 logger.warning('Failed to fetch nodes for traffic aggregation', exc_info=True)
-                # Cache empty result to avoid hammering the failing API
-                _traffic_cache[cache_key] = (now, {}, [])
+                # Не кэшируем: `_cache_lock` и так сериализует медленный путь в
+                # один запрос к панели, поэтому «завалить» её нельзя, а вот
+                # запомнить пустой результат — значит показывать всем админам и
+                # CSV-экспорту пустую таблицу ещё пять минут после того, как
+                # панель уже поднялась. Тот же довод, что и у сбоя usage ниже.
                 return {}, []
 
-            # Fetch per-node user stats — O(nodes) calls instead of O(users)
-            semaphore = asyncio.Semaphore(_CONCURRENCY_LIMIT)
-
-            async def fetch_node_users(node):
-                async with semaphore:
-                    try:
-                        stats = await api.get_bandwidth_stats_node_users_legacy(node.uuid, start_str, end_str)
-                        return node.uuid, stats
-                    except Exception:
-                        logger.warning('Failed to get traffic for node', node_name=node.name, exc_info=True)
-                        return node.uuid, None
-
-            results = await asyncio.gather(*(fetch_node_users(n) for n in nodes))
+            usage: dict[str, Any] = {}
+            usage_failed = False
+            node_uuids = [node.uuid for node in nodes]
+            if node_uuids:
+                try:
+                    # Эндпоинт принимает даты только как YYYY-MM-DD; ISO с `Z`
+                    # (в котором строятся ключи кэша) панель отвергает с 400.
+                    usage = await api.get_bandwidth_stats_nodes_usage(node_uuids, start_str[:10], end_str[:10])
+                except Exception:
+                    logger.warning('Failed to get per-user traffic for nodes', exc_info=True)
+                    usage = {}
+                    usage_failed = True
 
         nodes_info: list[TrafficNodeInfo] = [
             TrafficNodeInfo(node_uuid=node.uuid, node_name=node.name, country_code=node.country_code) for node in nodes
         ]
         nodes_info.sort(key=lambda n: n.node_name)
 
-        # Legacy response: [{userUuid, username, nodeUuid, total, date}, ...]
-        user_traffic: dict[str, dict[str, int]] = {}
-        for node_uuid, entries in results:
-            if not isinstance(entries, list):
+        # Response: {nodes: [{uuid, users: [{id, totalBytes}, ...]}, ...]}
+        user_traffic: dict[int, dict[str, int]] = {}
+        for node_entry in usage.get('nodes') or []:
+            node_uuid = node_entry.get('uuid')
+            if not node_uuid:
                 continue
-            for entry in entries:
-                uid = entry.get('userUuid', '')
-                total = int(entry.get('total', 0))
-                if uid and total > 0 and uid in user_uuids_set:
-                    user_traffic.setdefault(uid, {})[node_uuid] = user_traffic.get(uid, {}).get(node_uuid, 0) + total
+            for user_entry in node_entry.get('users') or []:
+                try:
+                    panel_user_id = int(user_entry['id'])
+                    total = int(user_entry.get('totalBytes') or 0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if total > 0 and panel_user_id in known_panel_user_ids:
+                    per_node = user_traffic.setdefault(panel_user_id, {})
+                    per_node[node_uuid] = per_node.get(node_uuid, 0) + total
 
-        _traffic_cache[cache_key] = (now, user_traffic, nodes_info)
+        # Раньше трафик собирался по одной ноде за раз, и сбой одной ноды терял
+        # только её колонку. Теперь это один запрос на все ноды, поэтому его
+        # провал обнуляет ВСЮ таблицу — и закэшировать такой результат значит
+        # показывать всем админам (и отдавать в CSV-экспорт) нули следующие
+        # пять минут. Отдаём пустой результат, но не запоминаем его.
+        if not usage_failed:
+            _traffic_cache[cache_key] = (now, user_traffic, nodes_info)
 
         # Evict expired entries to prevent unbounded growth
         expired = [k for k, (ts, _, _) in _traffic_cache.items() if (now - ts) >= _CACHE_TTL]
@@ -155,21 +173,48 @@ def _compute_date_range(period_days: int) -> tuple[str, str]:
     return start_dt.strftime('%Y-%m-%dT%H:%M:%SZ'), end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-async def _load_user_map(db: AsyncSession) -> dict[str, User]:
-    """Load all users with remnawave_uuid, eagerly loading subscription + tariff."""
-    stmt = (
+async def _load_user_map(db: AsyncSession) -> dict[int, User]:
+    """Load all users with remnawave_id, eagerly loading subscription + tariff.
+
+    In multi-tariff mode panel ids live on Subscription rows, not on User.
+    Both sources are merged so the caller gets a complete panel id → User map.
+    """
+    from app.config import settings
+
+    # Build user map from both user-level and subscription-level panel ids
+    user_map: dict[int, User] = {}
+
+    # Legacy: user-level panel ids
+    stmt_users = (
         select(User)
-        .where(User.remnawave_uuid.isnot(None))
-        .options(selectinload(User.subscription).selectinload(Subscription.tariff))
+        .where(User.remnawave_id.isnot(None))
+        .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
     )
-    result = await db.execute(stmt)
-    users = result.scalars().all()
-    return {u.remnawave_uuid: u for u in users if u.remnawave_uuid}
+    result_users = await db.execute(stmt_users)
+    users = result_users.scalars().all()
+    for u in users:
+        if u.remnawave_id:
+            user_map[u.remnawave_id] = u
+
+    # Multi-tariff: subscription-level panel ids
+    if settings.is_multi_tariff_enabled():
+        stmt_subs = (
+            select(Subscription)
+            .where(Subscription.remnawave_id.isnot(None))
+            .options(selectinload(Subscription.user).selectinload(User.subscriptions).selectinload(Subscription.tariff))
+        )
+        result_subs = await db.execute(stmt_subs)
+        subs = result_subs.scalars().all()
+        for sub in subs:
+            if sub.remnawave_id and sub.user and sub.remnawave_id not in user_map:
+                user_map[sub.remnawave_id] = sub.user
+
+    return user_map
 
 
 def _build_traffic_items(
-    user_traffic: dict[str, dict[str, int]],
-    user_map: dict[str, User],
+    user_traffic: dict[int, dict[str, int]],
+    user_map: dict[int, User],
     nodes_info: list[TrafficNodeInfo],
     search: str = '',
     sort_by: str = 'total_bytes',
@@ -182,13 +227,13 @@ def _build_traffic_items(
     items: list[UserTrafficItem] = []
     search_lower = search.lower().strip()
 
-    all_uuids = set(user_traffic.keys()) | set(user_map.keys())
-    for uuid in all_uuids:
-        user = user_map.get(uuid)
+    all_panel_user_ids = set(user_traffic.keys()) | set(user_map.keys())
+    for panel_user_id in all_panel_user_ids:
+        user = user_map.get(panel_user_id)
         if not user:
             continue
 
-        traffic = user_traffic.get(uuid, {})
+        traffic = user_traffic.get(panel_user_id, {})
 
         full_name = user.full_name
         username = user.username
@@ -202,19 +247,23 @@ def _build_traffic_items(
             ):
                 continue
 
-        sub = user.subscription
+        subs = getattr(user, 'subscriptions', None) or []
+
+        # Primary subscription for backward-compat top-level fields
+        primary_sub = next((s for s in subs if s.is_active), subs[0] if subs else None)
         tariff_name = None
         subscription_status = None
         traffic_limit_gb = 0.0
         device_limit = 1
 
-        if sub:
-            subscription_status = _get_status(sub)
-            traffic_limit_gb = float(sub.traffic_limit_gb or 0)
-            device_limit = sub.device_limit or 1
-            if sub.tariff:
-                tariff_name = sub.tariff.name
+        if primary_sub:
+            subscription_status = _get_status(primary_sub)
+            traffic_limit_gb = float(primary_sub.traffic_limit_gb or 0)
+            device_limit = primary_sub.device_limit or 1
+            if primary_sub.tariff:
+                tariff_name = primary_sub.tariff.name
 
+        # Filtering uses primary sub values (keeps existing filter semantics)
         if tariff_filter is not None:
             if (tariff_name or '') not in tariff_filter:
                 continue
@@ -229,6 +278,18 @@ def _build_traffic_items(
 
         total_bytes = sum(traffic.values())
 
+        # Build per-subscription detail list for multi-subscription display
+        subscriptions_traffic = [
+            SubscriptionTrafficInfo(
+                subscription_id=sub.id,
+                tariff_name=sub.tariff.name if sub.tariff else None,
+                status=_get_status(sub),
+                traffic_limit_gb=float(sub.traffic_limit_gb or 0),
+                device_limit=sub.device_limit or 1,
+            )
+            for sub in subs
+        ]
+
         items.append(
             UserTrafficItem(
                 user_id=user.id,
@@ -242,6 +303,7 @@ def _build_traffic_items(
                 device_limit=device_limit,
                 node_traffic=traffic,
                 total_bytes=total_bytes,
+                subscriptions=subscriptions_traffic,
             )
         )
 
@@ -305,15 +367,21 @@ async def get_traffic_usage(
     # Collect all available tariff names (before filtering)
     available_tariffs = sorted(
         {
-            u.subscription.tariff.name
+            sub.tariff.name
             for u in user_map.values()
-            if u.subscription and u.subscription.tariff and u.subscription.tariff.name
+            for sub in (getattr(u, 'subscriptions', None) or [])
+            if sub.tariff and sub.tariff.name
         }
     )
 
     # Collect all available statuses (before filtering)
     available_statuses = sorted(
-        {_get_status(sub) for u in user_map.values() if (sub := u.subscription) and _get_status(sub)}
+        {
+            _get_status(sub)
+            for u in user_map.values()
+            for sub in (getattr(u, 'subscriptions', None) or [])
+            if _get_status(sub)
+        }
     )
 
     # Parse tariff filter
@@ -347,7 +415,7 @@ async def get_traffic_usage(
     )
 
     if is_enrichment_sort:
-        enrichment_data = await _build_enrichment(db, user_map)
+        enrichment_data, _ = await _build_enrichment(db, user_map)
         enr_key_map = {
             'connected': lambda e: e.devices_connected,
             'total_spent': lambda e: e.total_spent_kopeks,
@@ -399,11 +467,20 @@ async def _get_bulk_spending(db: AsyncSession, user_ids: list[int]) -> dict[int,
     return {row[0]: int(row[1]) for row in result.all()}
 
 
-async def _build_enrichment(db: AsyncSession, user_map: dict[str, User]) -> dict[int, UserTrafficEnrichment]:
-    """Build enrichment data for all users: devices, spending, dates, last node."""
-    uuid_to_user_id: dict[str, int] = {}
-    for uuid, user in user_map.items():
-        uuid_to_user_id[uuid] = user.id
+async def _build_enrichment(
+    db: AsyncSession, user_map: dict[int, User]
+) -> tuple[dict[int, UserTrafficEnrichment], bool]:
+    """Build enrichment data for all users: devices, spending, dates, last node.
+
+    Второй элемент — признак того, что панельные данные получить не удалось.
+    Без него результат с обнулёнными «устройствами» и «последней нодой» попадал
+    в общий 5-минутный кэш и продолжал показываться всем админам и CSV-экспорту
+    ещё долго после того, как панель поднялась.
+    """
+    panel_degraded = False
+    panel_user_id_to_user_id: dict[int, int] = {}
+    for panel_user_id, user in user_map.items():
+        panel_user_id_to_user_id[panel_user_id] = user.id
 
     service = RemnaWaveService()
     devices_by_user: dict[int, int] = {}
@@ -418,6 +495,7 @@ async def _build_enrichment(db: AsyncSession, user_map: dict[str, User]) -> dict
             except Exception:
                 logger.warning('Failed to fetch nodes for enrichment', exc_info=True)
                 nodes_list = []
+                panel_degraded = True
 
             for node in nodes_list:
                 node_uuid_to_name[node.uuid] = node.name
@@ -439,9 +517,14 @@ async def _build_enrichment(db: AsyncSession, user_map: dict[str, User]) -> dict
                             panel_users.extend(page['users'])
             except Exception:
                 logger.warning('Failed to fetch panel users for enrichment', exc_info=True)
+                panel_degraded = True
 
+            # HWID-устройства ссылаются на пользователя по числовому panel id
+            # (device['userId']) — тем же, которым панельная запись теперь и
+            # идентифицируется, поэтому отдельная карта больше не нужна: берём
+            # только тех панельных юзеров, которых знаем локально.
             for pu in panel_users:
-                uid = uuid_to_user_id.get(pu.uuid)
+                uid = panel_user_id_to_user_id.get(pu.id)
                 if uid is None:
                     continue
                 if pu.user_traffic and pu.user_traffic.last_connected_node_uuid:
@@ -451,12 +534,12 @@ async def _build_enrichment(db: AsyncSession, user_map: dict[str, User]) -> dict
             try:
                 devices_data = await api.get_all_hwid_devices()
                 for device in devices_data.get('devices', []):
-                    user_uuid = device.get('userUuid', '')
-                    uid = uuid_to_user_id.get(user_uuid)
+                    uid = panel_user_id_to_user_id.get(device.get('userId'))
                     if uid is not None:
                         devices_by_user[uid] = devices_by_user.get(uid, 0) + 1
             except Exception:
                 logger.warning('Failed to fetch bulk devices for enrichment', exc_info=True)
+                panel_degraded = True
 
     # Bulk spending stats
     all_user_ids = [u.id for u in user_map.values()]
@@ -464,22 +547,36 @@ async def _build_enrichment(db: AsyncSession, user_map: dict[str, User]) -> dict
 
     # Build enrichment data
     enrichment: dict[int, UserTrafficEnrichment] = {}
-    for uuid, user in user_map.items():
+    for user in user_map.values():
         uid = user.id
-        sub = user.subscription
+        subs_list = getattr(user, 'subscriptions', None) or []
+
+        # Primary subscription for backward-compat top-level date fields
+        primary_sub = next((s for s in subs_list if s.is_active), subs_list[0] if subs_list else None)
 
         start_date = None
         end_date = None
-        if sub:
-            if sub.start_date:
-                start_date = sub.start_date.isoformat()
-            if sub.end_date:
-                end_date = sub.end_date.isoformat()
+        if primary_sub:
+            if primary_sub.start_date:
+                start_date = primary_sub.start_date.isoformat()
+            if primary_sub.end_date:
+                end_date = primary_sub.end_date.isoformat()
 
         last_node_name = None
         last_uuid = last_node_uuid_by_user.get(uid)
         if last_uuid:
             last_node_name = node_uuid_to_name.get(last_uuid)
+
+        # Build per-subscription enrichment list for multi-subscription display
+        subscriptions_enrichment = [
+            SubscriptionEnrichmentInfo(
+                subscription_id=sub.id,
+                tariff_name=sub.tariff.name if sub.tariff else None,
+                start_date=sub.start_date.isoformat() if sub.start_date else None,
+                end_date=sub.end_date.isoformat() if sub.end_date else None,
+            )
+            for sub in subs_list
+        ]
 
         enrichment[uid] = UserTrafficEnrichment(
             devices_connected=devices_by_user.get(uid, 0),
@@ -487,9 +584,10 @@ async def _build_enrichment(db: AsyncSession, user_map: dict[str, User]) -> dict
             subscription_start_date=start_date,
             subscription_end_date=end_date,
             last_node_name=last_node_name,
+            subscriptions=subscriptions_enrichment,
         )
 
-    return enrichment
+    return enrichment, panel_degraded
 
 
 @router.get('/enrichment', response_model=TrafficEnrichmentResponse)
@@ -512,9 +610,12 @@ async def get_traffic_enrichment(
             return TrafficEnrichmentResponse(data=cached[1])
 
         user_map = await _load_user_map(db)
-        enrichment = await _build_enrichment(db, user_map)
+        enrichment, panel_degraded = await _build_enrichment(db, user_map)
 
-        _enrichment_cache[cache_key] = (now, enrichment)
+        # Тот же довод, что и у _aggregate_traffic: запомнить деградированный
+        # ответ значит показывать нули ещё пять минут после восстановления.
+        if not panel_degraded:
+            _enrichment_cache[cache_key] = (now, enrichment)
 
         # Evict expired
         expired = [k for k, (ts, _) in _enrichment_cache.items() if (now - ts) >= _ENRICHMENT_CACHE_TTL]
@@ -557,14 +658,21 @@ async def export_traffic_csv(
         start_str = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
         end_str = end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
         period_label = f'{request.start_date}_{request.end_date}'
+        # Длину периода считаем здесь же, где разобрали даты. Раньше она
+        # вычислялась ниже под ПОВТОРНЫМ `if request.start_date and
+        # request.end_date`, то есть start_dt/end_dt читались за 60 строк от
+        # места присваивания под скопированным условием: разойдись эти два
+        # условия — UnboundLocalError и 500 на выгрузке CSV.
+        period_days = max((end_dt - start_dt).days, 1)
     else:
         _validate_period(request.period)
         start_str, end_str = _compute_date_range(request.period)
         period_label = f'{request.period}d'
+        period_days = request.period
 
     user_map = await _load_user_map(db)
     user_traffic, nodes_info = await _aggregate_traffic(start_str, end_str, list(user_map.keys()))
-    enrichment = await _build_enrichment(db, user_map)
+    enrichment, _ = await _build_enrichment(db, user_map)
 
     # Parse filters
     tariff_filter: set[str] | None = None
@@ -595,12 +703,6 @@ async def export_traffic_csv(
 
     # Determine which nodes to include in CSV columns
     csv_nodes = [n for n in nodes_info if n.node_uuid in node_filter] if node_filter else nodes_info
-
-    # Compute period days for risk calculation
-    if request.start_date and request.end_date:
-        period_days = max((end_dt - start_dt).days, 1)
-    else:
-        period_days = request.period
 
     total_thr = request.total_threshold_gb or 0
     node_thr = request.node_threshold_gb or 0

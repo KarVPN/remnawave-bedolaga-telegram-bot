@@ -3,12 +3,84 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services import referral_service
+
+
+@pytest.mark.parametrize(
+    ('notifications_enabled', 'referral_notifications_enabled'),
+    [
+        (False, True),
+        (True, False),
+    ],
+)
+async def test_referral_notification_respects_notification_switches(
+    monkeypatch,
+    notifications_enabled,
+    referral_notifications_enabled,
+):
+    bot = SimpleNamespace(send_message=AsyncMock())
+    user = SimpleNamespace(id=2)
+
+    monkeypatch.setattr(referral_service.settings, 'ENABLE_NOTIFICATIONS', notifications_enabled)
+    monkeypatch.setattr(
+        referral_service.settings,
+        'REFERRAL_NOTIFICATIONS_ENABLED',
+        referral_notifications_enabled,
+    )
+
+    await referral_service.send_referral_notification(
+        bot,
+        telegram_id=202,
+        message='Реферал пополнил баланс',
+        user=user,
+    )
+
+    bot.send_message.assert_not_awaited()
+
+
+async def test_referral_notification_enabled_sends_telegram_message(monkeypatch):
+    bot = SimpleNamespace(send_message=AsyncMock())
+
+    monkeypatch.setattr(referral_service.settings, 'ENABLE_NOTIFICATIONS', True)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_NOTIFICATIONS_ENABLED', True)
+
+    await referral_service.send_referral_notification(
+        bot,
+        telegram_id=202,
+        message='Реферал пополнил баланс',
+    )
+
+    bot.send_message.assert_awaited_once_with(202, 'Реферал пополнил баланс', parse_mode='HTML')
+
+
+async def test_disabled_referral_notifications_skip_email_delivery(monkeypatch):
+    user = SimpleNamespace(id=2)
+    notify_referral_bonus = AsyncMock()
+
+    monkeypatch.setattr(referral_service.settings, 'ENABLE_NOTIFICATIONS', True)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_NOTIFICATIONS_ENABLED', False)
+    monkeypatch.setattr(
+        referral_service.notification_delivery_service,
+        'notify_referral_bonus',
+        notify_referral_bonus,
+    )
+
+    await referral_service.send_referral_notification(
+        SimpleNamespace(send_message=AsyncMock()),
+        telegram_id=None,
+        message='Начислен реферальный бонус',
+        user=user,
+        bonus_kopeks=1000,
+    )
+
+    notify_referral_bonus.assert_not_awaited()
 
 
 async def test_commission_accrues_before_minimum_first_topup(monkeypatch):
@@ -37,11 +109,14 @@ async def test_commission_accrues_before_minimum_first_topup(monkeypatch):
     create_referral_earning_mock = AsyncMock()
     monkeypatch.setattr(referral_service, 'create_referral_earning', create_referral_earning_mock)
     monkeypatch.setattr(referral_service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_service, 'get_referral_reward_payment_count', AsyncMock(return_value=0))
 
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 20000)
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 5000)
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 10000)
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', None)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '')
 
     topup_amount = 15000
 
@@ -52,6 +127,7 @@ async def test_commission_accrues_before_minimum_first_topup(monkeypatch):
 
     add_user_balance_mock.assert_awaited_once()
     add_call = add_user_balance_mock.await_args
+    assert add_call is not None
     assert add_call.args[1] is referrer
     assert add_call.args[2] == 3750
     assert 'Комиссия' in add_call.args[3]
@@ -59,6 +135,7 @@ async def test_commission_accrues_before_minimum_first_topup(monkeypatch):
 
     create_referral_earning_mock.assert_awaited_once()
     earning_call = create_referral_earning_mock.await_args
+    assert earning_call is not None
     assert earning_call.kwargs['amount_kopeks'] == 3750
     assert earning_call.kwargs['reason'] == 'referral_commission_topup'
 
@@ -92,12 +169,15 @@ async def test_first_topup_inviter_gets_fixed_plus_commission(monkeypatch):
     monkeypatch.setattr(referral_service, 'create_referral_earning', create_referral_earning_mock)
     monkeypatch.setattr(referral_service, 'get_commission_payment_count', AsyncMock(return_value=0))
     monkeypatch.setattr(referral_service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_service, 'get_referral_reward_payment_count', AsyncMock(return_value=0))
     monkeypatch.setattr(referral_service, 'get_effective_referral_commission_percent', lambda u: 15)
 
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 10000)
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 5000)
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 5000)  # 50 rub
     monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 15)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', None)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '')
 
     topup_amount = 50000  # 500 rub
 
@@ -125,6 +205,8 @@ async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypat
         telegram_id=None,
         email='new@example.com',
         full_name='New User',
+        first_name='New',
+        language='ru',
         referred_by_id=2,
     )
     referrer = SimpleNamespace(
@@ -132,9 +214,11 @@ async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypat
         telegram_id=None,
         email='ref@example.com',
         full_name='Referrer',
+        first_name='Referrer',
+        language='ru',
     )
 
-    db = SimpleNamespace()
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)))
 
     get_user_mock = AsyncMock(side_effect=[new_user, referrer])
     monkeypatch.setattr(referral_service, 'get_user_by_id', get_user_mock)
@@ -143,6 +227,7 @@ async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypat
     monkeypatch.setattr(referral_service, 'get_effective_referral_commission_percent', lambda u: 25)
 
     notify_bonus_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(referral_service.notification_delivery_service, 'notify_referral_welcome', AsyncMock(return_value=True))
     notify_registered_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(
         referral_service.notification_delivery_service,
@@ -167,3 +252,312 @@ async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypat
     notify_registered_mock.assert_awaited_once()
     assert notify_registered_mock.await_args.kwargs['user'] is referrer
     assert notify_registered_mock.await_args.kwargs['referral_name'] == new_user.full_name
+async def test_first_payment_commission_percent_overrides_flat_percent(monkeypatch):
+    referrer = SimpleNamespace(
+        id=2,
+        telegram_id=202,
+        email=None,
+        referral_commission_percent=15,
+    )
+    db = SimpleNamespace()
+
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', 40)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '0:10,10:15')
+
+    percent = await referral_service.calculate_referral_commission_percent(db, referrer, is_first_payment=True)
+
+    assert percent == 40
+
+
+async def test_recurring_commission_percent_uses_paid_referrals_tier(monkeypatch):
+    referrer = SimpleNamespace(
+        id=2,
+        telegram_id=202,
+        email=None,
+        referral_commission_percent=25,
+    )
+    db = SimpleNamespace()
+
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', 40)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '0:10,10:15,50:20')
+    monkeypatch.setattr(referral_service, 'get_paid_referrals_count', AsyncMock(return_value=12))
+
+    percent = await referral_service.calculate_referral_commission_percent(db, referrer, is_first_payment=False)
+
+    assert percent == 15
+
+
+async def test_second_small_topup_uses_recurring_tier_not_first_payment_percent(monkeypatch):
+    user = SimpleNamespace(
+        id=1,
+        telegram_id=101,
+        full_name='Test User',
+        referred_by_id=2,
+        has_made_first_topup=False,
+    )
+    referrer = SimpleNamespace(
+        id=2,
+        telegram_id=202,
+        full_name='Referrer',
+        email=None,
+        referral_commission_percent=None,
+    )
+
+    db = SimpleNamespace(
+        commit=AsyncMock(),
+        execute=AsyncMock(),
+    )
+
+    monkeypatch.setattr(referral_service, 'get_user_by_id', AsyncMock(side_effect=[user, referrer]))
+    add_user_balance_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(referral_service, 'add_user_balance', add_user_balance_mock)
+    create_referral_earning_mock = AsyncMock()
+    monkeypatch.setattr(referral_service, 'create_referral_earning', create_referral_earning_mock)
+    monkeypatch.setattr(referral_service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_service, 'get_commission_payment_count', AsyncMock(return_value=1))
+    monkeypatch.setattr(referral_service, 'get_referral_reward_payment_count', AsyncMock(return_value=1))
+    monkeypatch.setattr(referral_service, 'get_paid_referrals_count', AsyncMock(return_value=12))
+
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 20000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 5000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 10000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', 40)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '0:10,10:15,50:20')
+
+    result = await referral_service.process_referral_topup(db, user.id, 15000)
+
+    assert result is True
+    add_user_balance_mock.assert_awaited_once()
+    add_call = add_user_balance_mock.await_args
+    assert add_call is not None
+    assert add_call.args[2] == 2250
+    assert 'Комиссия 15%' in add_call.args[3]
+
+
+@pytest.mark.parametrize(
+    'raw_tiers, expected',
+    [
+        ('', []),
+        (None, []),
+        ('0:10,10:15,50:20', [(0, 10), (10, 15), (50, 20)]),
+        # Out-of-order input must be normalized ascending so tier selection works.
+        ('50:20,0:10,10:15', [(0, 10), (10, 15), (50, 20)]),
+        # Whitespace tolerance around both fields and separators.
+        (' 0 : 10 , 10 : 15 ', [(0, 10), (10, 15)]),
+        # Negative thresholds are clamped to 0 (preserves "everyone is at least at tier 0").
+        ('-5:10,10:15', [(0, 10), (10, 15)]),
+        # Percent > 100 is clamped to 100 (avoid accidental >100% commission via typo).
+        ('0:10,10:150', [(0, 10), (10, 100)]),
+        # Percent < 0 is clamped to 0.
+        ('0:-5,10:15', [(0, 0), (10, 15)]),
+        # Malformed items are skipped, valid ones survive.
+        ('abc:xyz,0:10,bad,10:15,:,foo:', [(0, 10), (10, 15)]),
+        # Trailing comma must not produce an empty tier.
+        ('0:10,10:15,', [(0, 10), (10, 15)]),
+    ],
+)
+def test_parse_recurring_commission_tiers_handles_edge_cases(raw_tiers, expected, monkeypatch):
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+    assert referral_service._parse_recurring_commission_tiers(raw_tiers) == expected
+
+
+@pytest.mark.parametrize(
+    'paid_count, expected_percent',
+    [
+        # Boundary case: exactly at threshold must fire the tier (the loop uses `>=`).
+        (0, 10),
+        (1, 10),
+        (9, 10),
+        (10, 15),  # exactly at second tier threshold
+        (11, 15),
+        (49, 15),
+        (50, 20),  # exactly at third tier threshold
+        (51, 20),
+        (1000, 20),  # far above highest tier — still uses highest
+    ],
+)
+async def test_calculate_recurring_commission_tier_boundary(paid_count, expected_percent, monkeypatch):
+    referrer = SimpleNamespace(id=1, telegram_id=1, email=None, referral_commission_percent=None)
+    db = SimpleNamespace()
+
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_PAYMENT_COMMISSION_PERCENT', None)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_RECURRING_COMMISSION_TIERS', '0:10,10:15,50:20')
+    monkeypatch.setattr(referral_service, 'get_paid_referrals_count', AsyncMock(return_value=paid_count))
+
+    percent = await referral_service.calculate_referral_commission_percent(db, referrer, is_first_payment=False)
+    assert percent == expected_percent
+
+
+# ---------------------------------------------------------------------------
+# Вид письма выбирается событием, а не суммой. Отчёт из «Багов»: пригласившему
+# без Telegram на регистрацию реферала приходило «Реферальный бонус: +0 ₽» —
+# единственный email-путь диспетчера вёл в шаблон бонуса, а шаблон «Новый
+# реферал» существовал, но никем не вызывался. Сам приглашённый без Telegram
+# получал то же письмо вместо приветствия.
+# ---------------------------------------------------------------------------
+
+
+def _email_only_user(user_id: int, name: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=user_id,
+        telegram_id=None,
+        full_name=name,
+        first_name=name,
+        language='ru',
+        email=f'user{user_id}@example.com',
+        email_verified=True,
+        referred_by_id=None,
+    )
+
+
+def _capture_referral_channels(monkeypatch) -> dict[str, AsyncMock]:
+    mocks = {
+        'bonus': AsyncMock(return_value=True),
+        'registered': AsyncMock(return_value=True),
+        'welcome': AsyncMock(return_value=True),
+    }
+    delivery = referral_service.notification_delivery_service
+    monkeypatch.setattr(delivery, 'notify_referral_bonus', mocks['bonus'])
+    monkeypatch.setattr(delivery, 'notify_referral_registered', mocks['registered'])
+    monkeypatch.setattr(delivery, 'notify_referral_welcome', mocks['welcome'])
+    monkeypatch.setattr(referral_service.settings, 'ENABLE_NOTIFICATIONS', True)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_NOTIFICATIONS_ENABLED', True)
+    return mocks
+
+
+async def test_registration_notice_to_email_referrer_uses_registered_template(monkeypatch):
+    from app.services.notification_delivery_service import NotificationType
+
+    mocks = _capture_referral_channels(monkeypatch)
+    referrer = _email_only_user(2, 'Пригласивший')
+
+    await referral_service.send_referral_notification(
+        SimpleNamespace(send_message=AsyncMock()),
+        telegram_id=None,
+        message='👥 <b>Новый реферал!</b>',
+        user=referrer,
+        referral_name='Новичок',
+        notification_type=NotificationType.REFERRAL_REGISTERED,
+    )
+
+    mocks['bonus'].assert_not_awaited()
+    mocks['welcome'].assert_not_awaited()
+    mocks['registered'].assert_awaited_once()
+    kwargs = mocks['registered'].await_args.kwargs
+    assert kwargs['user'] is referrer
+    assert kwargs['referral_name'] == 'Новичок'
+    assert kwargs['telegram_message'] == '👥 <b>Новый реферал!</b>'
+
+
+async def test_welcome_notice_to_email_referee_uses_welcome_template(monkeypatch):
+    from app.services.notification_delivery_service import NotificationType
+
+    mocks = _capture_referral_channels(monkeypatch)
+    newcomer = _email_only_user(10, 'Новичок')
+
+    await referral_service.send_referral_notification(
+        SimpleNamespace(send_message=AsyncMock()),
+        telegram_id=None,
+        message='🎉 <b>Добро пожаловать!</b>',
+        user=newcomer,
+        notification_type=NotificationType.REFERRAL_WELCOME,
+        referrer_name='Пригласивший',
+        bonus_promise='7 дн. подписки',
+    )
+
+    mocks['bonus'].assert_not_awaited()
+    mocks['registered'].assert_not_awaited()
+    kwargs = mocks['welcome'].await_args.kwargs
+    assert kwargs['user'] is newcomer
+    assert kwargs['referrer_name'] == 'Пригласивший'
+    assert kwargs['bonus_promise'] == '7 дн. подписки'
+
+
+async def test_reward_notice_keeps_bonus_template_by_default(monkeypatch):
+    mocks = _capture_referral_channels(monkeypatch)
+
+    await referral_service.send_referral_notification(
+        SimpleNamespace(send_message=AsyncMock()),
+        telegram_id=None,
+        message='💰 Награда',
+        user=_email_only_user(2, 'Пригласивший'),
+        bonus_kopeks=25_000,
+        referral_name='Новичок',
+    )
+
+    mocks['registered'].assert_not_awaited()
+    mocks['welcome'].assert_not_awaited()
+    assert mocks['bonus'].await_args.kwargs['bonus_kopeks'] == 25_000
+
+
+async def test_non_referral_type_is_rejected(monkeypatch):
+    from app.services.notification_delivery_service import NotificationType
+
+    _capture_referral_channels(monkeypatch)
+
+    with pytest.raises(ValueError):
+        await referral_service.send_referral_notification(
+            None,
+            None,
+            'x',
+            user=_email_only_user(2, 'x'),
+            notification_type=NotificationType.BALANCE_LOW,
+        )
+
+
+@pytest.mark.parametrize('scheme', ['classic', 'levels'])
+async def test_registration_of_email_only_pair_never_sends_bonus_email(monkeypatch, scheme):
+    """Сквозной: регистрация реферала, оба участника без Telegram."""
+    from unittest.mock import patch
+
+    mocks = _capture_referral_channels(monkeypatch)
+    newcomer = _email_only_user(10, 'Новичок')
+    referrer = _email_only_user(20, 'Пригласивший')
+    newcomer.referred_by_id = referrer.id
+
+    db = AsyncMock()
+    existing_row = AsyncMock()
+    existing_row.scalar_one_or_none = lambda: None  # аудит-строки ещё нет — путь идёт до уведомлений
+    db.execute = AsyncMock(return_value=existing_row)
+
+    monkeypatch.setattr(referral_service, 'get_user_by_id', AsyncMock(side_effect=[newcomer, referrer]))
+    monkeypatch.setattr(referral_service, 'get_user_campaign_id', AsyncMock(return_value=None))
+    monkeypatch.setattr(referral_service, 'create_referral_earning', AsyncMock())
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_REWARD_SCHEME', scheme)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_MINIMUM_TOPUP_KOPEKS', 10_000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS', 5_000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_INVITER_BONUS_KOPEKS', 10_000)
+    monkeypatch.setattr(referral_service.settings, 'REFERRAL_COMMISSION_PERCENT', 25)
+
+    with (
+        patch(
+            'app.services.referral_contest_service.referral_contest_service.on_referral_registration',
+            AsyncMock(),
+        ),
+        patch('app.services.referral_reward_service.award_referral_rewards', AsyncMock(return_value=[])),
+        patch(
+            'app.services.referral_reward_service.describe_referee_bonus',
+            AsyncMock(return_value='7 дн. подписки'),
+        ),
+        patch(
+            'app.services.referral_reward_service.describe_active_levels',
+            AsyncMock(return_value=['уровень 1 — 10 %']),
+        ),
+    ):
+        result = await referral_service.process_referral_registration(
+            db, newcomer.id, referrer.id, bot=SimpleNamespace(send_message=AsyncMock())
+        )
+
+    assert result is True
+    mocks['bonus'].assert_not_awaited()
+    welcome = mocks['welcome'].await_args.kwargs
+    assert welcome['user'] is newcomer
+    assert welcome['referrer_name'] == 'Пригласивший'
+    assert welcome['bonus_promise']
+    registered = mocks['registered'].await_args.kwargs
+    assert registered['user'] is referrer
+    assert registered['referral_name'] == 'Новичок'

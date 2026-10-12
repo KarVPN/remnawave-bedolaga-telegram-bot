@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Cabinet (Personal Account) routes
-from app.cabinet.routes import router as cabinet_router
+from app.cabinet.apple_iap import apple_iap_only_router
 from app.config import settings
 from app.webapi.docs import add_redoc_endpoint
 
-from .middleware import RequestLoggingMiddleware
+from .middleware import RequestLoggingMiddleware, RequestPathContextMiddleware
 from .routes import (
     backups,
     ban_notifications,
@@ -172,7 +173,7 @@ OPENAPI_TAGS = [
 ]
 
 
-def create_web_api_app() -> FastAPI:
+def create_web_api_app(lifespan: Any = None) -> FastAPI:
     docs_config = settings.get_web_api_docs_config()
 
     # Убираем openapi_tags для предотвращения ошибок при генерации openapi.json
@@ -183,6 +184,8 @@ def create_web_api_app() -> FastAPI:
         redoc_url=None,
         openapi_url=docs_config.get('openapi_url'),
         swagger_ui_parameters={'persistAuthorization': True},
+        redirect_slashes=False,
+        lifespan=lifespan,
     )
 
     add_redoc_endpoint(
@@ -215,6 +218,9 @@ def create_web_api_app() -> FastAPI:
 
     if settings.WEB_API_REQUEST_LOGGING:
         app.add_middleware(RequestLoggingMiddleware)
+
+    # Всегда: путь запроса нужен логу действий пользователя (таймлайн активности).
+    app.add_middleware(RequestPathContextMiddleware)
 
     app.include_router(health.router)
     app.include_router(stats.router, prefix='/stats', tags=['stats'])
@@ -281,6 +287,10 @@ def create_web_api_app() -> FastAPI:
 
     # Cabinet (Personal Account) routes
     if settings.is_cabinet_enabled():
+        from app.cabinet.routes import router as cabinet_router
+
         app.include_router(cabinet_router)
+    elif settings.is_apple_iap_enabled():
+        app.include_router(apple_iap_only_router)
 
     return app

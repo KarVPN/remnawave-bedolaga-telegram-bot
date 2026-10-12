@@ -35,8 +35,8 @@ class TributeService:
 
     def verify_webhook_signature(self, payload: str, signature: str) -> bool:
         if not self.api_key:
-            logger.warning('API key не настроен, пропускаем проверку')
-            return True
+            logger.error('Tribute API key не настроен — отклоняем webhook')
+            return False
 
         try:
             expected_signature = hmac.new(self.api_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -91,10 +91,23 @@ class TributeService:
             if not payment_id and 'name' in webhook_data:
                 event_name = webhook_data.get('name')
                 data = webhook_data.get('payload', {})
-                payment_id = str(data.get('donation_request_id'))
                 amount_kopeks = data.get('amount', 0)
                 telegram_user_id = data.get('telegram_user_id')
                 trb_user_id = data.get('trb_user_id')
+
+                # У new_donation НЕТ id платежа: donation_request_id — id донат-ссылки,
+                # общий для всех платежей через неё (purchase_id есть только у цифровых
+                # товаров). Ключ идемпотентности собираем per-событие: created_at из
+                # конверта стабилен при ретраях доставки и различен у разных донатов;
+                # user и amount добавлены на случай одинакового created_at.
+                donation_request_id = data.get('donation_request_id')
+                created_at = webhook_data.get('created_at')
+                if donation_request_id is not None and created_at:
+                    payment_id = f'{donation_request_id}_{telegram_user_id}_{amount_kopeks}_{created_at}'
+                elif donation_request_id is not None:
+                    # Без created_at ключ не уникален — уходим в fallback tribute_<tg>_<amount>,
+                    # который дедуп-слой считает неуникальным и не блокирует повторные донаты.
+                    payment_id = None
 
                 if event_name in ('new_donation', 'recurrent_donation'):
                     status = 'paid'
@@ -104,7 +117,7 @@ class TributeService:
                     status = 'unknown'
 
             logger.info(
-                '📝 Извлеченные данные: payment_id=, status=, amount_kopeks=, telegram_user_id=, trb_user_id=',
+                '📝 Извлеченные данные',
                 payment_id=payment_id,
                 status=status,
                 amount_kopeks=amount_kopeks,

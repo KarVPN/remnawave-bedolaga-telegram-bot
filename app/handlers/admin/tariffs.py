@@ -15,13 +15,21 @@ from app.database.crud.server_squad import get_all_server_squads
 from app.database.crud.tariff import (
     create_tariff,
     delete_tariff,
+    get_active_subscriptions_count_by_tariff_id,
     get_tariff_by_id,
     get_tariff_subscriptions_count,
     get_tariffs_with_subscriptions_count,
     update_tariff,
 )
 from app.database.models import Tariff, User
-from app.localization.texts import get_texts
+from app.handlers.admin.tariff_custom_days import format_custom_days_settings, register_custom_days_handlers
+from app.handlers.admin.tariff_custom_traffic import (
+    format_custom_traffic_settings,
+    register_custom_traffic_handlers,
+)
+from app.handlers.admin.tariff_panel_settings import format_panel_settings, register_panel_settings_handlers
+from app.handlers.admin.tariff_server_limits import format_server_limits_summary, register_server_limits_handlers
+from app.localization.texts import Texts, get_texts
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
@@ -60,8 +68,8 @@ def _parse_period_prices(text: str) -> dict[str, int]:
     return prices
 
 
-def _format_period_prices_display(prices: dict[str, int]) -> str:
-    """Форматирует цены периодов для отображения."""
+def _format_period_prices_display(prices: dict[str, int], highlight: int | None = None) -> str:
+    """Форматирует цены периодов для отображения; выделенный период отмечен звездой."""
     if not prices:
         return 'Не заданы'
 
@@ -69,7 +77,8 @@ def _format_period_prices_display(prices: dict[str, int]) -> str:
     for period_str in sorted(prices.keys(), key=int):
         period = int(period_str)
         price = prices[period_str]
-        lines.append(f'  • {format_period(period)}: {format_price_kopeks(price)}')
+        mark = ' ⭐' if highlight is not None and int(highlight) == period else ''
+        lines.append(f'  • {format_period(period)}: {format_price_kopeks(price)}{mark}')
 
     return '\n'.join(lines)
 
@@ -149,6 +158,15 @@ def get_tariff_view_keyboard(
                 InlineKeyboardButton(text='🎚️ Уровень', callback_data=f'admin_tariff_edit_tier:{tariff.id}'),
             ]
         )
+        # Выделять нечего, пока нет ни одного периода.
+        if tariff.period_prices:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text='⭐ Выгодный период', callback_data=f'admin_tariff_edit_highlight:{tariff.id}'
+                    ),
+                ]
+            )
     else:
         buttons.append(
             [
@@ -173,6 +191,18 @@ def get_tariff_view_keyboard(
     buttons.append(
         [
             InlineKeyboardButton(
+                text='⚙️ Произвольный трафик',
+                callback_data=f'admin_tariff_edit_custom_traffic:{tariff.id}',
+            ),
+            InlineKeyboardButton(
+                text='📅 Произвольные дни',
+                callback_data=f'admin_tariff_edit_custom_days:{tariff.id}',
+            ),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton(
                 text='📈 Докупка трафика', callback_data=f'admin_tariff_edit_traffic_topup:{tariff.id}'
             ),
         ]
@@ -186,6 +216,14 @@ def get_tariff_view_keyboard(
         [
             InlineKeyboardButton(text='🌐 Серверы', callback_data=f'admin_tariff_edit_squads:{tariff.id}'),
             InlineKeyboardButton(text='👥 Промогруппы', callback_data=f'admin_tariff_edit_promo:{tariff.id}'),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text='🗄️ Лимиты по серверам', callback_data=f'admin_tariff_edit_server_limits:{tariff.id}'
+            ),
+            InlineKeyboardButton(text='⚙️ Ещё настройки', callback_data=f'admin_tariff_edit_more:{tariff.id}'),
         ]
     )
 
@@ -212,6 +250,13 @@ def get_tariff_view_keyboard(
         )
 
     # Переключение активности
+    highlight_label = (
+        '⭐ ❌ Снять выделение тарифа' if getattr(tariff, 'is_highlighted', False) else '⭐ Выделить тариф'
+    )
+    buttons.append(
+        [InlineKeyboardButton(text=highlight_label, callback_data=f'admin_tariff_toggle_highlight:{tariff.id}')]
+    )
+
     if tariff.is_active:
         buttons.append(
             [InlineKeyboardButton(text='❌ Деактивировать', callback_data=f'admin_tariff_toggle:{tariff.id}')]
@@ -234,6 +279,7 @@ def _format_traffic_reset_mode(mode: str | None) -> str:
         'DAY': '📅 Ежедневно',
         'WEEK': '📆 Еженедельно',
         'MONTH': '🗓️ Ежемесячно',
+        'MONTH_ROLLING': '🔄 Скользящий месяц',
         'NO_RESET': '🚫 Никогда',
     }
     if mode is None:
@@ -263,8 +309,10 @@ def format_tariff_info(tariff: Tariff, language: str, subs_count: int = 0) -> st
     get_texts(language)
 
     status = '✅ Активен' if tariff.is_active else '❌ Неактивен'
+    if getattr(tariff, 'is_highlighted', False):
+        status += ' · ⭐ выделен'
     traffic = format_traffic(tariff.traffic_limit_gb)
-    prices_display = _format_period_prices_display(tariff.period_prices or {})
+    prices_display = _format_period_prices_display(tariff.period_prices or {}, tariff.highlight_period_days)
 
     # Форматируем список серверов
     squads_list = tariff.allowed_squads or []
@@ -300,8 +348,12 @@ def format_tariff_info(tariff: Tariff, language: str, subs_count: int = 0) -> st
     else:
         max_devices_display = '∞ (без лимита)'
 
-    # Форматируем докупку трафика
+    # Форматируем произвольный трафик и докупку трафика
+    custom_traffic_display = format_custom_traffic_settings(tariff)
+    custom_days_display = format_custom_days_settings(tariff)
     traffic_topup_display = _format_traffic_topup_packages(tariff)
+    server_limits_display = format_server_limits_summary(tariff)
+    panel_settings_display = format_panel_settings(tariff)
 
     # Форматируем режим сброса трафика
     traffic_reset_mode = getattr(tariff, 'traffic_reset_mode', None)
@@ -327,11 +379,17 @@ def format_tariff_info(tariff: Tariff, language: str, subs_count: int = 0) -> st
 
 <b>Параметры:</b>
 • Трафик: {traffic}
-• Устройств: {tariff.device_limit}
+• Устройств: {Texts.format_device_limit(tariff.device_limit)}
 • Макс. устройств: {max_devices_display}
 • Цена за доп. устройство: {device_price_display}
 • Триал: {trial_status}
 • Дней триала: {trial_days_display}
+
+<b>Произвольный трафик:</b>
+{custom_traffic_display}
+
+<b>Произвольные дни:</b>
+{custom_days_display}
 
 <b>Докупка трафика:</b>
 {traffic_topup_display}
@@ -341,7 +399,11 @@ def format_tariff_info(tariff: Tariff, language: str, subs_count: int = 0) -> st
 {price_block}
 
 <b>Серверы:</b> {squads_display}
+<b>Лимиты по серверам:</b> {server_limits_display}
 <b>Промогруппы:</b> {promo_display}
+
+<b>Панель и прочее:</b>
+{panel_settings_display}
 
 📊 Подписок на тарифе: {subs_count}
 
@@ -463,6 +525,32 @@ async def view_tariff(
         parse_mode='HTML',
     )
     await callback.answer()
+
+
+@admin_required
+@error_handler
+async def toggle_tariff_highlight(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+):
+    """Отмечает тариф как выгодный — в списке тарифов он показывается с подписью."""
+    tariff_id = int(callback.data.split(':')[1])
+    tariff = await get_tariff_by_id(db, tariff_id)
+
+    if not tariff:
+        await callback.answer('Тариф не найден', show_alert=True)
+        return
+
+    tariff = await update_tariff(db, tariff, is_highlighted=not getattr(tariff, 'is_highlighted', False))
+    subs_count = await get_tariff_subscriptions_count(db, tariff_id)
+
+    await callback.answer('Тариф выделен' if tariff.is_highlighted else 'Выделение снято', show_alert=True)
+    await callback.message.edit_text(
+        format_tariff_info(tariff, db_user.language, subs_count),
+        reply_markup=get_tariff_view_keyboard(tariff, db_user.language),
+        parse_mode='HTML',
+    )
 
 
 @admin_required
@@ -1412,6 +1500,106 @@ async def process_edit_tariff_prices(
     )
 
 
+# ============ ВЫГОДНЫЙ ПЕРИОД ============
+
+
+def _highlight_keyboard(tariff: Tariff, language: str) -> InlineKeyboardMarkup:
+    """Список периодов тарифа: текущий выделенный отмечен звездой."""
+    texts = get_texts(language)
+    prices = tariff.period_prices or {}
+    current = tariff.highlight_period_days
+    buttons = []
+
+    for period_str in sorted(prices.keys(), key=int):
+        period = int(period_str)
+        mark = '⭐ ' if current is not None and int(current) == period else ''
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f'{mark}{format_period(period)} — {format_price_kopeks(prices[period_str])}',
+                    callback_data=f'admin_tariff_highlight_set:{tariff.id}:{period}',
+                )
+            ]
+        )
+
+    if current is not None:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text='🚫 Убрать выделение', callback_data=f'admin_tariff_highlight_set:{tariff.id}:0'
+                )
+            ]
+        )
+
+    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff.id}')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@admin_required
+@error_handler
+async def start_edit_tariff_highlight(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+):
+    """Показывает выбор периода, который будет отмечен как самый выгодный."""
+    tariff_id = int(callback.data.split(':')[1])
+    tariff = await get_tariff_by_id(db, tariff_id)
+
+    if not tariff:
+        await callback.answer('Тариф не найден', show_alert=True)
+        return
+
+    current = tariff.highlight_period_days
+    current_display = format_period(int(current)) if current is not None else 'не выбран'
+
+    await callback.message.edit_text(
+        '⭐ <b>Выгодный период</b>\n\n'
+        f'Сейчас выделен: <b>{current_display}</b>\n\n'
+        'Выделенный период показывается клиенту с отметкой при покупке, '
+        'продлении и смене тарифа. Выделить можно только один период.',
+        reply_markup=_highlight_keyboard(tariff, db_user.language),
+        parse_mode='HTML',
+    )
+    await callback.answer()
+
+
+@admin_required
+@error_handler
+async def set_tariff_highlight(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+):
+    """Сохраняет выделенный период. 0 — снять выделение."""
+    _, tariff_id_raw, period_raw = callback.data.split(':')
+    tariff = await get_tariff_by_id(db, int(tariff_id_raw))
+
+    if not tariff:
+        await callback.answer('Тариф не найден', show_alert=True)
+        return
+
+    period = int(period_raw)
+    # Повторное нажатие на уже выделенный период снимает выделение: иначе снять
+    # его можно было бы только отдельной кнопкой, которой легко не заметить.
+    if period == 0 or (tariff.highlight_period_days is not None and int(tariff.highlight_period_days) == period):
+        new_value = None
+    else:
+        new_value = period
+
+    tariff = await update_tariff(db, tariff, highlight_period_days=new_value)
+    subs_count = await get_tariff_subscriptions_count(db, tariff.id)
+
+    await callback.message.edit_text(
+        ('✅ Выделение снято!' if new_value is None else f'✅ Выделен период: {format_period(new_value)}')
+        + '\n\n'
+        + format_tariff_info(tariff, db_user.language, subs_count),
+        reply_markup=get_tariff_view_keyboard(tariff, db_user.language),
+        parse_mode='HTML',
+    )
+    await callback.answer()
+
+
 # ============ РЕДАКТИРОВАНИЕ ЦЕНЫ ЗА УСТРОЙСТВО ============
 
 
@@ -2158,11 +2346,33 @@ async def confirm_delete_tariff(
         await callback.answer('Тариф не найден', show_alert=True)
         return
 
+    active_count = await get_active_subscriptions_count_by_tariff_id(db, tariff_id)
+
+    if active_count > 0:
+        total_count = await get_tariff_subscriptions_count(db, tariff_id)
+        await callback.message.edit_text(
+            f'🗑️ <b>Удаление тарифа</b>\n\n'
+            f'Невозможно удалить тариф <b>{html.escape(tariff.name)}</b>.\n\n'
+            f'⚠️ <b>Активных подписок:</b> {active_count} (всего: {total_count})\n'
+            f'Сначала деактивируйте тариф и дождитесь окончания всех активных подписок, '
+            f'либо переведите подписки на другой тариф.',
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text='◀️ Назад к тарифу', callback_data=f'admin_tariff_view:{tariff_id}')],
+                ]
+            ),
+            parse_mode='HTML',
+        )
+        await callback.answer()
+        return
+
     subs_count = await get_tariff_subscriptions_count(db, tariff_id)
 
     warning = ''
     if subs_count > 0:
-        warning = f'\n\n⚠️ <b>Внимание!</b> На этом тарифе {subs_count} подписок.\nОни будут отвязаны от тарифа.'
+        warning = (
+            f'\n\n⚠️ <b>Внимание!</b> На этом тарифе {subs_count} неактивных подписок.\nОни потеряют привязку к тарифу.'
+        )
 
     await callback.message.edit_text(
         f'🗑️ <b>Удаление тарифа</b>\n\nВы действительно хотите удалить тариф <b>{html.escape(tariff.name)}</b>?{warning}',
@@ -2195,6 +2405,15 @@ async def delete_tariff_confirmed(
 
     if not tariff:
         await callback.answer('Тариф не найден', show_alert=True)
+        return
+
+    # Защита от удаления тарифа с активными подписками (FK RESTRICT)
+    active_count = await get_active_subscriptions_count_by_tariff_id(db, tariff.id)
+    if active_count > 0:
+        await callback.answer(
+            f'Невозможно удалить тариф: {active_count} активных подписок. Сначала деактивируйте тариф.',
+            show_alert=True,
+        )
         return
 
     tariff_name = tariff.name
@@ -2684,6 +2903,7 @@ TRAFFIC_RESET_MODES = [
     ('DAY', '📅 Ежедневно', 'Трафик сбрасывается каждый день'),
     ('WEEK', '📆 Еженедельно', 'Трафик сбрасывается каждую неделю'),
     ('MONTH', '🗓️ Ежемесячно', 'Трафик сбрасывается каждый месяц'),
+    ('MONTH_ROLLING', '🔄 Скользящий месяц', 'Трафик сбрасывается через 30 дней от первого подключения'),
     ('NO_RESET', '🚫 Никогда', 'Трафик не сбрасывается автоматически'),
 ]
 
@@ -2792,6 +3012,12 @@ async def set_traffic_reset_mode(
 
 def register_handlers(dp: Dispatcher):
     """Регистрирует обработчики для управления тарифами."""
+    # Отдельные экраны регистрируются до общего toggle-фильтра.
+    register_custom_traffic_handlers(dp)
+    register_custom_days_handlers(dp)
+    register_panel_settings_handlers(dp)
+    register_server_limits_handlers(dp)
+
     # Список тарифов
     dp.callback_query.register(show_tariffs_list, F.data == 'admin_tariffs')
     dp.callback_query.register(show_tariffs_page, F.data.startswith('admin_tariffs_page:'))
@@ -2805,6 +3031,7 @@ def register_handlers(dp: Dispatcher):
         & ~F.data.startswith('trf_sq:')
         & ~F.data.startswith('admin_tariff_toggle_promo:')
         & ~F.data.startswith('admin_tariff_toggle_traffic_topup:')
+        & ~F.data.startswith('admin_tariff_toggle_custom_traffic:')
         & ~F.data.startswith('admin_tariff_toggle_daily:'),
     )
     dp.callback_query.register(toggle_trial_tariff, F.data.startswith('admin_tariff_toggle_trial:'))
@@ -2842,6 +3069,9 @@ def register_handlers(dp: Dispatcher):
 
     # Редактирование цен
     dp.callback_query.register(start_edit_tariff_prices, F.data.startswith('admin_tariff_edit_prices:'))
+    dp.callback_query.register(start_edit_tariff_highlight, F.data.startswith('admin_tariff_edit_highlight:'))
+    dp.callback_query.register(toggle_tariff_highlight, F.data.startswith('admin_tariff_toggle_highlight:'))
+    dp.callback_query.register(set_tariff_highlight, F.data.startswith('admin_tariff_highlight_set:'))
     dp.message.register(process_edit_tariff_prices, AdminStates.editing_tariff_prices)
 
     # Редактирование цены за устройство

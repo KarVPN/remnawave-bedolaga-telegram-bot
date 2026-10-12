@@ -1,8 +1,39 @@
+import re
+
 from aiogram import types
 from aiogram.types import InlineKeyboardButton
 
 from app.config import settings
 from app.utils.button_styles_cache import CALLBACK_TO_SECTION, get_cached_button_styles
+
+
+# Юникод-диапазоны для одиночного emoji в начале строки + модификаторы (skin tone,
+# variation selector, zero-width joiner-цепочки) + опциональный пробел после.
+# Используется когда у кнопки задан icon_custom_emoji_id — Telegram сам рендерит
+# кастом emoji слева, и если оставить юникод-emoji в тексте, юзер увидит дубль.
+_EMOJI_CHAR_CLASS = (
+    r'[℀-⅏'  # Letterlike (ℹ ™ ©)
+    r'←-⇿'  # Arrows
+    r'⌀-⏿'  # Misc Technical (⌚ ⌨ ⏰ etc.)
+    r'①-⓿'  # Enclosed Alphanumerics
+    r'■-⛿'  # Geometric Shapes + Misc Symbols (☀ ★ ✈ etc.)
+    r'✀-➿'  # Dingbats (✂ ✅ ✔ etc.)
+    r'⬀-⯿'  # Misc Symbols/Arrows (⬅ ⭐ etc.)
+    r'〰-〽'  # CJK swung dash etc.
+    r'㊗㊙'  # Japanese marks
+    r'\U0001F000-\U0001FFFF'  # Все supplementary planes (emoticons, pictographs, transport, supp symbols)
+    r']'
+)
+_LEADING_EMOJI_RE = re.compile(
+    r'^' + _EMOJI_CHAR_CLASS + r'(?:[️‍\U0001F3FB-\U0001F3FF]|' + _EMOJI_CHAR_CLASS + r')*' + r'\s*'
+)
+
+
+def strip_leading_emoji(text: str) -> str:
+    """Удалить ведущий юникод-emoji + следующий пробел. Безопасно для текста без emoji."""
+    if not text:
+        return text
+    return _LEADING_EMOJI_RE.sub('', text, count=1)
 
 
 # Mapping from callback_data to cabinet frontend paths.
@@ -26,7 +57,16 @@ CALLBACK_TO_CABINET_PATH: dict[str, str] = {
     'menu_support': '/support',
     'menu_info': '/info',
     'menu_profile': '/profile',
-    'back_to_menu': '/',
+    # NB: ``back_to_menu`` is intentionally NOT mapped here.
+    # The callback semantically means "return to the bot's main menu"
+    # — every other call site in the codebase uses raw
+    # ``InlineKeyboardButton(callback_data='back_to_menu')`` for it.
+    # Routing it through this helper in cabinet mode would silently
+    # turn the button into a WebApp launcher that opens the cabinet
+    # root, which is NOT what the user-visible label "Главное меню"
+    # promises. Without an entry here, the helper falls through to
+    # an InlineKeyboardButton with callback_data and the bot's
+    # ``back_to_menu`` handler runs as expected.
 }
 
 # Default button styles per callback_data for cabinet mode.
@@ -49,10 +89,24 @@ CALLBACK_TO_CABINET_STYLE: dict[str, str] = {
     'menu_support': 'primary',
     'menu_info': 'primary',
     'menu_profile': 'primary',
-    'back_to_menu': 'primary',
+    # See CALLBACK_TO_CABINET_PATH comment — back_to_menu is bot-menu only,
+    # not a cabinet-routed action, so styling here is dead config.
 }
 
-# Mapping from broadcast button keys to cabinet paths.
+# Mapping from broadcast button keys to cabinet paths. Used by the
+# admin-broadcast custom-button builder in app/handlers/admin/messages.py
+# to swap selected buttons for WebApp launchers in cabinet mode.
+#
+# ``'home'`` is intentionally NOT mapped here — same reason as
+# ``back_to_menu`` above. A broadcast button labelled "Home" must
+# always be a bot-menu callback regardless of MAIN_MENU_MODE; otherwise
+# users tapping it in cabinet mode get stuck in cabinet root with no
+# way back to the bot view. The set-membership gate
+# ``CABINET_MINIAPP_BUTTON_KEYS`` in admin/messages.py already excludes
+# ``'home'``, but removing the foot-gun entry here is the structural fix:
+# even if someone adds ``'home'`` to that set in a future commit, the
+# mapping lookup falls through to empty string and ``build_miniapp_or_callback_button``
+# returns a callback button.
 BUTTON_KEY_TO_CABINET_PATH: dict[str, str] = {
     'balance': '/balance/top-up',
     'referrals': '/referral',
@@ -60,11 +114,32 @@ BUTTON_KEY_TO_CABINET_PATH: dict[str, str] = {
     'connect': '/subscription',
     'subscription': '/subscription',
     'support': '/support',
-    'home': '/',
 }
 
 # Valid style values accepted by the Telegram Bot API.
 _VALID_STYLES = frozenset({'primary', 'success', 'danger'})
+
+
+def build_main_menu_button(text: str) -> InlineKeyboardButton:
+    """Always-callback button for "Main Menu" / "Главное меню" navigation.
+
+    Exists as a typed alternative to ``build_miniapp_or_callback_button``
+    for the one case where cabinet-routing is semantically wrong:
+    a button explicitly labelled "Главное меню" must return the user
+    to the bot's inline menu (``back_to_menu`` callback handler),
+    NOT open the cabinet root via WebApp. Otherwise a user in
+    ``MAIN_MENU_MODE=cabinet`` who taps "Главное меню" lands back in
+    the cabinet they're trying to exit — an infinite loop UX.
+
+    Production incident (2026-05-18): the top-up success notification
+    used ``build_miniapp_or_callback_button(callback_data='back_to_menu')``
+    which silently routed to cabinet root in cabinet mode. Defense at
+    two layers: ``back_to_menu`` is intentionally absent from
+    ``CALLBACK_TO_CABINET_PATH`` so the helper falls through to
+    callback even if called wrongly, AND this dedicated factory is
+    what callers should reach for to express intent.
+    """
+    return InlineKeyboardButton(text=text, callback_data='back_to_menu')
 
 
 def _resolve_style(style: str | None) -> str | None:
@@ -103,6 +178,7 @@ def build_miniapp_or_callback_button(
     cabinet_path: str | None = None,
     style: str | None = None,
     icon_custom_emoji_id: str | None = None,
+    style_key: str | None = None,
 ) -> InlineKeyboardButton:
     """Create a button that opens the cabinet miniapp or falls back to a callback.
 
@@ -125,6 +201,11 @@ def build_miniapp_or_callback_button(
     Only ``MINIAPP_CUSTOM_URL`` is considered here — the purchase-only URL
     (``MINIAPP_PURCHASE_URL``) is intentionally excluded because it cannot
     display subscription details and would load indefinitely.
+
+    ``style_key`` overrides which key is used to look up section styling.
+    Needed for dynamic callbacks (``se:{id}``) that carry an id and therefore
+    can never appear in the static style maps: without it such a button would
+    silently lose the color its static twin has.
     """
 
     if settings.is_cabinet_mode():
@@ -133,7 +214,8 @@ def build_miniapp_or_callback_button(
             url = build_cabinet_url(path)
             if url:
                 # Resolve per-section config from cache
-                section = CALLBACK_TO_SECTION.get(callback_data)
+                lookup_key = style_key or callback_data
+                section = CALLBACK_TO_SECTION.get(lookup_key)
                 section_cfg = get_cached_button_styles().get(section or '', {}) if section else {}
 
                 # Style chain: explicit param > per-section DB > global config > hardcoded default
@@ -144,17 +226,115 @@ def build_miniapp_or_callback_button(
                     resolved_style = _resolve_style(section_cfg['style'])
                 else:
                     resolved_style = _resolve_style((settings.CABINET_BUTTON_STYLE or '').strip()) or _resolve_style(
-                        CALLBACK_TO_CABINET_STYLE.get(callback_data)
+                        CALLBACK_TO_CABINET_STYLE.get(lookup_key)
                     )
 
                 # Emoji chain: explicit param > per-section DB
                 resolved_emoji = icon_custom_emoji_id or section_cfg.get('icon_custom_emoji_id') or None
 
+                # Если есть кастом emoji — стрипаем ведущий юникод-эмодзи из текста,
+                # иначе у юзера будут две иконки слева (custom + default).
+                final_text = strip_leading_emoji(text) if resolved_emoji else text
+
                 return InlineKeyboardButton(
-                    text=text,
+                    text=final_text,
                     web_app=types.WebAppInfo(url=url),
                     style=resolved_style,
                     icon_custom_emoji_id=resolved_emoji or None,
                 )
 
     return InlineKeyboardButton(text=text, callback_data=callback_data)
+
+
+SUBSCRIPTION_EXTEND_CALLBACK = 'subscription_extend'
+
+
+def build_subscription_extend_button(
+    text: str,
+    subscription_id: int | None = None,
+    *,
+    style: str | None = None,
+    icon_custom_emoji_id: str | None = None,
+) -> InlineKeyboardButton:
+    """Кнопка «Продлить подписку» для уведомлений — единая точка на весь бот.
+
+    Ветвление «мультитариф → ``se:{id}``, иначе ``subscription_extend``» жило
+    копипастой в шести уведомлениях, и в cabinet-режиме половина из них уводила
+    пользователя в бота: динамический ``se:{id}`` в ``CALLBACK_TO_CABINET_PATH``
+    отсутствует (id заранее неизвестен), помощник не находил путь и молча
+    отдавал callback-кнопку. Получалось, что в одиночном режиме уведомление
+    вело в кабинет, а в мультитарифном — в бота.
+
+    В cabinet-режиме мультитарифа кнопка открывает страницу продления ИМЕННО
+    той подписки, о которой уведомление: ``/subscriptions/{id}/renew``. Без id
+    (и в одиночном режиме) — обычный ``subscription_extend``.
+    """
+    if settings.is_multi_tariff_enabled() and subscription_id:
+        return build_miniapp_or_callback_button(
+            text=text,
+            callback_data=f'se:{subscription_id}',
+            cabinet_path=f'/subscriptions/{subscription_id}/renew',
+            style=style,
+            icon_custom_emoji_id=icon_custom_emoji_id,
+            style_key=SUBSCRIPTION_EXTEND_CALLBACK,
+        )
+
+    return build_miniapp_or_callback_button(
+        text=text,
+        callback_data=SUBSCRIPTION_EXTEND_CALLBACK,
+        style=style,
+        icon_custom_emoji_id=icon_custom_emoji_id,
+    )
+
+
+# Префикс startapp/маршрута для диплинка на конкретный тикет в админ-кабинете.
+# Должен совпадать с разбором на стороне фронта (bedolaga-cabinet): start_param
+# 'admin_ticket_<id>' и маршрут '/admin/tickets/<id>'.
+ADMIN_TICKET_DEEPLINK_PREFIX = 'admin_ticket_'
+
+
+def build_miniapp_startapp_url(start_param: str) -> str:
+    """Собрать t.me Mini App deep link, открывающий кабинет в ЛЮБОМ типе чата.
+
+    ``https://t.me/<bot>/<app>?startapp=<start_param>`` — работает и в группах/
+    каналах, где ``web_app``-кнопки недоступны. Требует и имя бота, и
+    зарегистрированное короткое имя Mini App (``MINIAPP_APP_SHORT_NAME``,
+    BotFather → /newapp). Возвращает '' если чего-то не хватает.
+    """
+    bot_username = settings.get_bot_username()
+    app_name = (getattr(settings, 'MINIAPP_APP_SHORT_NAME', '') or '').strip()
+    if not bot_username or not app_name:
+        return ''
+    return f'https://t.me/{bot_username}/{app_name}?startapp={start_param}'
+
+
+def build_admin_ticket_cabinet_button(
+    ticket_id: int,
+    *,
+    text: str,
+    in_group: bool,
+) -> InlineKeyboardButton | None:
+    """Кнопка «открыть тикет в админ-кабинете» для уведомления о тикете.
+
+    Строится только в cabinet-режиме (``is_cabinet_mode``):
+    - личный чат (``in_group=False``) → ``web_app`` на ``/admin/tickets/<id>``
+      (Telegram сам прокидывает initData → кабинет авторизует и роутит к тикету);
+    - группа/канал (``in_group=True``) → ``web_app`` недоступен, поэтому t.me
+      Mini App startapp-диплинк (нужен ``MINIAPP_APP_SHORT_NAME``).
+
+    Возвращает ``None``, если подходящую кнопку построить нельзя (не cabinet-режим,
+    не задан URL кабинета, или в группе не зарегистрирован Mini App).
+    """
+    if not settings.is_cabinet_mode():
+        return None
+
+    if in_group:
+        url = build_miniapp_startapp_url(f'{ADMIN_TICKET_DEEPLINK_PREFIX}{ticket_id}')
+        if not url:
+            return None
+        return InlineKeyboardButton(text=text, url=url)
+
+    url = build_cabinet_url(f'/admin/tickets/{ticket_id}')
+    if not url:
+        return None
+    return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=url))

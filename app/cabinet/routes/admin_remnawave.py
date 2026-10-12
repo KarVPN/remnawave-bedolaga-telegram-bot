@@ -5,6 +5,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.crud.server_squad import (
@@ -15,6 +16,7 @@ from app.database.crud.server_squad import (
 )
 from app.database.models import User
 from app.utils.cache import cache
+from app.utils.panel_node_usage import normalize_node_usage
 
 from ..dependencies import get_cabinet_db, require_permission
 from ..schemas.remnawave import (
@@ -24,6 +26,14 @@ from ..schemas.remnawave import (
     AutoSyncToggleRequest,
     Bandwidth,
     ConnectionStatus,
+    DevicesStatsResponse,
+    # GeoCheck
+    GeocheckImage,
+    GeocheckJobResponse,
+    GeocheckRequest,
+    GeocheckResult,
+    GeocheckStartResponse,
+    HealthResponse,
     # Inbounds
     InboundsListResponse,
     # Migration
@@ -39,6 +49,8 @@ from ..schemas.remnawave import (
     NodesOverview,
     NodeStatisticsResponse,
     NodeUsageResponse,
+    # Recap / devices / top consumers / health / sub-requests
+    RecapResponse,
     # Status & Connection
     RemnaWaveStatusResponse,
     ServerInfo,
@@ -50,12 +62,14 @@ from ..schemas.remnawave import (
     SquadUpdateRequest,
     # Squads
     SquadWithLocalInfo,
+    SubscriptionRequestStatsResponse,
     # Manual Sync
     SyncMode,
     SyncResponse,
     # System Statistics
     SystemStatsResponse,
     SystemSummary,
+    TopConsumersResponse,
     TrafficPeriod,
     TrafficPeriods,
 )
@@ -67,7 +81,15 @@ try:
         RemnaWaveService,
     )
 except Exception:
-    RemnaWaveConfigurationError = None
+
+    class RemnaWaveConfigurationError(Exception):
+        """Заглушка на случай, когда сервис панели не импортировался.
+
+        Именно класс, а не None: иначе `except RemnaWaveConfigurationError`
+        ниже падал бы с TypeError вместо обработки ошибки. Реально сюда никто
+        не попадёт — при отсутствии сервиса `_get_service()` отдаёт 503 раньше.
+        """
+
     RemnaWaveService = None
 
 try:
@@ -129,22 +151,42 @@ def _serialize_node(node_data: dict[str, Any]) -> NodeInfo:
         is_disabled=bool(node_data.get('is_disabled')),
         is_node_online=bool(node_data.get('is_node_online')),
         is_xray_running=bool(node_data.get('is_xray_running')),
-        users_online=node_data.get('users_online'),
+        users_online=node_data.get('users_online', 0),
         traffic_used_bytes=node_data.get('traffic_used_bytes'),
         traffic_limit_bytes=node_data.get('traffic_limit_bytes'),
         last_status_change=_parse_datetime(node_data.get('last_status_change')),
         last_status_message=node_data.get('last_status_message'),
-        xray_uptime=node_data.get('xray_uptime'),
+        xray_uptime=node_data.get('xray_uptime', 0) or 0,
         is_traffic_tracking_active=bool(node_data.get('is_traffic_tracking_active', False)),
         traffic_reset_day=node_data.get('traffic_reset_day'),
         notify_percent=node_data.get('notify_percent'),
         consumption_multiplier=float(node_data.get('consumption_multiplier', 1.0)),
-        cpu_count=node_data.get('cpu_count'),
-        cpu_model=node_data.get('cpu_model'),
-        total_ram=node_data.get('total_ram'),
         created_at=_parse_datetime(node_data.get('created_at')),
         updated_at=_parse_datetime(node_data.get('updated_at')),
         provider_uuid=node_data.get('provider_uuid'),
+        provider_name=node_data.get('provider_name'),
+        provider_favicon=node_data.get('provider_favicon'),
+        versions=node_data.get('versions'),
+        system=node_data.get('system'),
+        active_plugin_uuid=node_data.get('active_plugin_uuid'),
+        ips=node_data.get('ips') or [],
+    )
+
+
+def _serialize_geocheck_result(result: dict[str, Any] | None) -> GeocheckResult | None:
+    """Приводит результат GeoCheck из camelCase панели к схеме кабинета."""
+    if not result:
+        return None
+
+    image_data = result.get('image') or None
+    image = GeocheckImage(**image_data) if isinstance(image_data, dict) else None
+
+    return GeocheckResult(
+        success=bool(result.get('success')),
+        node_uuid=result.get('nodeUuid'),
+        image=image,
+        raw_report=result.get('rawReport'),
+        message=result.get('message'),
     )
 
 
@@ -200,6 +242,7 @@ async def get_system_statistics(
             total_users=system_data.get('total_users', 0),
             active_connections=system_data.get('active_connections', 0),
             nodes_online=system_data.get('nodes_online', 0),
+            total_nodes=system_data.get('total_nodes', 0),
             users_last_day=system_data.get('users_last_day', 0),
             users_last_week=system_data.get('users_last_week', 0),
             users_never_online=system_data.get('users_never_online', 0),
@@ -208,11 +251,9 @@ async def get_system_statistics(
         users_by_status=stats.get('users_by_status', {}),
         server_info=ServerInfo(
             cpu_cores=server_data.get('cpu_cores', 0),
-            cpu_physical_cores=server_data.get('cpu_physical_cores', 0),
             memory_total=server_data.get('memory_total', 0),
             memory_used=server_data.get('memory_used', 0),
             memory_free=server_data.get('memory_free', 0),
-            memory_available=server_data.get('memory_available', 0),
             uptime_seconds=server_data.get('uptime_seconds', 0),
         ),
         bandwidth=Bandwidth(
@@ -231,6 +272,73 @@ async def get_system_statistics(
         nodes_weekly=stats.get('nodes_weekly', []),
         last_updated=_parse_datetime(stats.get('last_updated')),
     )
+
+
+@router.get('/recap', response_model=RecapResponse)
+async def get_recap(
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> RecapResponse:
+    """Panel recap: lifetime/this-month traffic, version, uptime, distinct countries."""
+    service = _get_service()
+    _ensure_configured(service)
+    data = await service.get_recap_statistics()
+    if isinstance(data, dict) and data.get('error'):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Failed to get RemnaWave recap')
+    return RecapResponse(**data)
+
+
+@router.get('/devices-stats', response_model=DevicesStatsResponse)
+async def get_devices_stats(
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> DevicesStatsResponse:
+    """HWID device statistics: breakdown by platform and app + totals."""
+    service = _get_service()
+    _ensure_configured(service)
+    data = await service.get_devices_statistics()
+    if isinstance(data, dict) and data.get('error'):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Failed to get device statistics')
+    return DevicesStatsResponse(**data)
+
+
+@router.get('/top-consumers', response_model=TopConsumersResponse)
+async def get_top_consumers_route(
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(10, ge=1, le=50),
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> TopConsumersResponse:
+    """Top traffic-consuming users aggregated across nodes for the last N days."""
+    service = _get_service()
+    _ensure_configured(service)
+    data = await service.get_top_consumers(days=days, limit=limit)
+    if isinstance(data, dict) and data.get('error'):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Failed to get top consumers')
+    return TopConsumersResponse(**data)
+
+
+@router.get('/health', response_model=HealthResponse)
+async def get_health_route(
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> HealthResponse:
+    """Panel process runtime health: RAM, event-loop p99 lag, uptime."""
+    service = _get_service()
+    _ensure_configured(service)
+    data = await service.get_health_statistics()
+    if isinstance(data, dict) and data.get('error'):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Failed to get panel health')
+    return HealthResponse(**data)
+
+
+@router.get('/subscription-requests', response_model=SubscriptionRequestStatsResponse)
+async def get_subscription_requests_route(
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> SubscriptionRequestStatsResponse:
+    """Subscription-link request stats by client app."""
+    service = _get_service()
+    _ensure_configured(service)
+    data = await service.get_subscription_request_statistics()
+    if isinstance(data, dict) and data.get('error'):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail='Failed to get subscription request stats')
+    return SubscriptionRequestStatsResponse(**data)
 
 
 # ============ Nodes ============
@@ -325,7 +433,10 @@ async def get_node_statistics(
     return NodeStatisticsResponse(
         node=_serialize_node(stats['node']),
         realtime=stats.get('realtime'),
-        usage_history=stats.get('usage_history') or [],
+        # Нормализуем той же функцией, что и Web API-близнец: схема здесь
+        # `list[dict[str, Any]]`, поэтому расхождение ключей pydantic не поймает,
+        # и фронт молча отрисовал бы пустые ячейки.
+        usage_history=normalize_node_usage(stats.get('usage_history'), node_uuid),
         last_updated=_parse_datetime(stats.get('last_updated')),
     )
 
@@ -351,7 +462,7 @@ async def get_node_usage(
         )
 
     usage = await service.get_node_user_usage_by_range(node_uuid, start_dt, end_dt)
-    return NodeUsageResponse(items=usage or [])
+    return NodeUsageResponse(items=normalize_node_usage(usage, node_uuid))
 
 
 @router.post('/nodes/{node_uuid}/action', response_model=NodeActionResponse)
@@ -397,15 +508,21 @@ async def perform_node_action(
     )
 
 
+class RestartAllNodesPayload(BaseModel):
+    force_restart: bool = False
+
+
 @router.post('/nodes/restart-all', response_model=NodeActionResponse)
 async def restart_all_nodes(
+    payload: RestartAllNodesPayload | None = None,
     admin: User = Depends(require_permission('remnawave:manage')),
 ) -> NodeActionResponse:
     """Restart all nodes."""
     service = _get_service()
     _ensure_configured(service)
 
-    success = await service.restart_all_nodes()
+    force = payload.force_restart if payload else False
+    success = await service.restart_all_nodes(force_restart=force)
 
     if success:
         logger.info('Admin restarted all nodes', telegram_id=admin.telegram_id)
@@ -413,6 +530,88 @@ async def restart_all_nodes(
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail='Failed to restart all nodes',
+    )
+
+
+# ============ GeoCheck (Remnawave 3.3.0) ============
+
+GEOCHECK_MIN_PANEL_VERSION = '3.3.0'
+
+
+def _geocheck_http_error(exc: Exception, *, missing_is_404: bool) -> HTTPException:
+    """Переводит ошибку панели в понятный админу ответ.
+
+    На панели старее 3.3.0 эндпоинта просто нет, и 404 при постановке задачи
+    означает не «нода не найдена», а «панель не умеет GeoCheck» — иначе админ
+    получит загадочное «не найдено» и пойдёт искать ноду.
+    """
+    status_code = getattr(exc, 'status_code', None)
+    message = getattr(exc, 'message', None) or str(exc)
+
+    if status_code == 404:
+        if missing_is_404:
+            return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message)
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'GeoCheck requires Remnawave Panel and Node {GEOCHECK_MIN_PANEL_VERSION} or newer',
+        )
+
+    if status_code and 400 <= status_code < 500:
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+
+    return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=message)
+
+
+@router.post('/nodes/{node_uuid}/geocheck', response_model=GeocheckStartResponse)
+async def start_node_geocheck(
+    node_uuid: str,
+    payload: GeocheckRequest,
+    admin: User = Depends(require_permission('remnawave:manage')),
+) -> GeocheckStartResponse:
+    """Queue a GeoCheck on the node and return its job id."""
+    service = _get_service()
+    _ensure_configured(service)
+
+    try:
+        job_id = await service.request_node_geocheck(node_uuid, ip=payload.ip, interface=payload.interface)
+    except RemnaWaveConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning('GeoCheck запуск не удался', node_uuid=node_uuid, error=exc)
+        raise _geocheck_http_error(exc, missing_is_404=False) from exc
+
+    logger.info(
+        'Admin started GeoCheck',
+        telegram_id=admin.telegram_id,
+        node_uuid=node_uuid,
+        job_id=job_id,
+        route='ip' if payload.ip else 'interface' if payload.interface else 'default',
+    )
+    return GeocheckStartResponse(job_id=job_id)
+
+
+@router.get('/geocheck/{job_id}', response_model=GeocheckJobResponse)
+async def get_node_geocheck(
+    job_id: str,
+    admin: User = Depends(require_permission('remnawave:read')),
+) -> GeocheckJobResponse:
+    """Poll a GeoCheck job: the node may take up to a minute to answer."""
+    service = _get_service()
+    _ensure_configured(service)
+
+    try:
+        payload = await service.get_node_geocheck_result(job_id)
+    except RemnaWaveConfigurationError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning('GeoCheck опрос не удался', job_id=job_id, error=exc)
+        raise _geocheck_http_error(exc, missing_is_404=True) from exc
+
+    return GeocheckJobResponse(
+        job_id=job_id,
+        is_completed=bool(payload.get('isCompleted')),
+        is_failed=bool(payload.get('isFailed')),
+        result=_serialize_geocheck_result(payload.get('result')),
     )
 
 
@@ -877,6 +1076,30 @@ async def sync_to_panel(
         success=True,
         message='Sync to panel completed',
         data=stats,
+    )
+
+
+@router.post('/sync/full', response_model=SyncResponse)
+async def sync_full(
+    admin: User = Depends(require_permission('remnawave:sync')),
+    db: AsyncSession = Depends(get_cabinet_db),
+) -> SyncResponse:
+    """Полная синхронизация: из панели в бота и серверы — как в боте и по расписанию. Панель — истина, в неё не пишем."""
+    from app.services.remnawave_sync_service import FullSyncAlreadyRunning, perform_full_sync
+
+    service = _get_service()
+    _ensure_configured(service)
+
+    try:
+        user_stats, server_stats = await perform_full_sync(db, service)
+    except FullSyncAlreadyRunning as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    logger.info('Admin ran full sync', telegram_id=admin.telegram_id)
+
+    return SyncResponse(
+        success=True,
+        message='Full sync completed',
+        data={**user_stats, 'servers': server_stats},
     )
 
 

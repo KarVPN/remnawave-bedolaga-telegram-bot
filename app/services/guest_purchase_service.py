@@ -4,21 +4,35 @@ import asyncio
 import re
 import secrets
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+
+if TYPE_CHECKING:
+    # Только для аннотаций: в рантайме эти модули импортируются лениво (цикл
+    # cabinet services -> services -> cabinet).
+    from app.cabinet.services.email_templates import EmailNotificationTemplates
+    from app.services.notification_delivery_service import NotificationType
+
 
 import structlog
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.cabinet.auth.jwt_handler import create_auto_login_token
 from app.cabinet.auth.password_utils import hash_password
 from app.config import settings
 from app.database.crud.landing import create_guest_purchase
-from app.database.crud.subscription import create_paid_subscription, get_subscription_by_user_id, replace_subscription
+from app.database.crud.subscription import (
+    create_paid_subscription,
+    extend_subscription,
+    get_subscription_by_user_id,
+    replace_subscription,
+)
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.transaction import create_transaction
-from app.database.crud.user import _get_or_create_default_promo_group
+from app.database.crud.user import _get_or_create_default_promo_group, create_unique_referral_code
 from app.database.models import (
     GuestPurchase,
     GuestPurchaseStatus,
@@ -28,13 +42,65 @@ from app.database.models import (
     Transaction,
     TransactionType,
     User,
+    _aware,
+)
+from app.services.registration_access_service import (
+    RegistrationAccessContext,
+    RegistrationAccessDecision,
+    RegistrationAccessService,
+    RegistrationChannel,
+    VerifiedRegistrationIdentity,
 )
 from app.services.subscription_service import SubscriptionService
+from app.utils.gift_links import GIFT_TOKEN_MIN_PREFIX_LENGTH
 
 
 logger = structlog.get_logger(__name__)
 
+_guest_registration_access_service = RegistrationAccessService()
+
 _TELEGRAM_USERNAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]{4,31}$')
+
+
+async def _attribute_purchase_campaign(
+    db: AsyncSession,
+    purchase: GuestPurchase,
+    user: User,
+) -> None:
+    """Attribute a delivered guest purchase to its advertising campaign.
+
+    MUST be called only after the caller's final ``commit()``. The balance
+    bonus commits on its own (``add_user_balance``), which would otherwise
+    release the ``FOR UPDATE`` lock ``fulfill_purchase`` holds on the purchase
+    row halfway through delivery.
+
+    Gifts are deliberately skipped: the user created on this path is the
+    recipient, while the campaign brought in the buyer. A guest buyer has no
+    account at all, so there is nobody to attribute — the slug still stays on
+    the purchase row for reporting.
+    """
+    if not purchase.campaign_slug or purchase.is_gift:
+        return
+
+    try:
+        from app.services.campaign_service import AdvertisingCampaignService
+
+        service = AdvertisingCampaignService()
+        result = await service.attribute_campaign(db, user, purchase.campaign_slug)
+        if result and result.success:
+            logger.info(
+                'Guest purchase attributed to campaign',
+                purchase_id=purchase.id,
+                user_id=user.id,
+                campaign_slug=purchase.campaign_slug,
+                bonus_type=result.bonus_type,
+            )
+    except Exception:
+        logger.exception(
+            'Failed to attribute guest purchase to campaign',
+            purchase_id=purchase.id,
+            campaign_slug=purchase.campaign_slug,
+        )
 
 
 async def _send_admin_notification(
@@ -59,6 +125,46 @@ async def _send_admin_notification(
             )
     except Exception:
         logger.warning('Failed to send admin notification for guest purchase', purchase_id=purchase.id, exc_info=True)
+
+
+CLAIMABLE_GIFT_STATUSES = (
+    GuestPurchaseStatus.PAID.value,
+    GuestPurchaseStatus.PENDING_ACTIVATION.value,
+)
+
+
+async def get_claimable_gift(
+    db: AsyncSession,
+    token_or_prefix: str,
+    *,
+    for_update: bool,
+) -> GuestPurchase | None:
+    """Resolve one still-activatable gift by full token or deep-link prefix.
+
+    Короткий префикс не ищем вовсе: совпадение по нему позволяло бы перебором
+    забрать чужой неактивированный подарок.
+    """
+    token = (token_or_prefix or '').strip()
+    if len(token) >= 64:
+        token_filter = GuestPurchase.token == token
+    elif len(token) >= GIFT_TOKEN_MIN_PREFIX_LENGTH:
+        token_filter = GuestPurchase.token.startswith(token)
+    else:
+        return None
+
+    query = (
+        select(GuestPurchase)
+        .options(selectinload(GuestPurchase.tariff))
+        .where(
+            token_filter,
+            GuestPurchase.is_gift.is_(True),
+            GuestPurchase.status.in_(CLAIMABLE_GIFT_STATUSES),
+        )
+    )
+    if for_update:
+        query = query.with_for_update()
+    result = await db.execute(query)
+    return result.scalars().first()
 
 
 class GuestPurchaseError(Exception):
@@ -98,16 +204,16 @@ async def validate_and_calculate(
                 raise GuestPurchaseError('Period is not available for this tariff on this landing page')
         else:
             # No override for this tariff -> all tariff periods allowed
-            available = tariff.get_available_periods()
+            available = tariff.get_purchasable_periods()
             if period_days not in available:
                 raise GuestPurchaseError('Period is not available for this tariff')
     else:
         # No overrides at all -> use tariff's own periods
-        available = tariff.get_available_periods()
+        available = tariff.get_purchasable_periods()
         if period_days not in available:
             raise GuestPurchaseError('Period is not available for this tariff')
 
-    price_kopeks = tariff.get_price_for_period(period_days)
+    price_kopeks = tariff.get_purchasable_price_for_period(period_days)
     if price_kopeks is None:
         raise GuestPurchaseError('Price is not configured for this period')
 
@@ -139,13 +245,20 @@ async def create_purchase(
     gift_recipient_value: str | None = None,
     gift_message: str | None = None,
     source: str = 'landing',
+    subid: str | None = None,
+    referrer: str | None = None,
+    campaign_slug: str | None = None,
     buyer_user_id: int | None = None,
     commit: bool = True,
+    idempotency_key: str | None = None,
 ) -> GuestPurchase:
     """Create a guest purchase record."""
     purchase = await create_guest_purchase(
         db,
         commit=commit,
+        subid=subid,
+        referrer=referrer,
+        campaign_slug=campaign_slug,
         landing_id=landing.id if landing else None,
         tariff_id=tariff.id,
         period_days=period_days,
@@ -159,13 +272,14 @@ async def create_purchase(
         gift_message=gift_message,
         source=source,
         buyer_user_id=buyer_user_id,
+        idempotency_key=idempotency_key,
         status=GuestPurchaseStatus.PENDING.value,
     )
 
     logger.info(
         'Guest purchase created',
         purchase_id=purchase.id,
-        token_prefix=purchase.token[:5],
+        token_length=len(purchase.token),
         landing_slug=landing.slug if landing else None,
         tariff_id=tariff.id,
         period_days=period_days,
@@ -185,6 +299,16 @@ async def _create_nalogo_receipt_for_purchase(
 ) -> None:
     """Create NaloGO fiscal receipt for a guest purchase (best-effort)."""
     if not settings.is_nalogo_enabled():
+        return
+
+    # Чеки НПД формируются только для оплат через YooKassa — как и в основном потоке бота,
+    # где NaloGO вызывает исключительно адаптер YooKassa
+    if _resolve_base_payment_method(purchase.payment_method) != PaymentMethod.YOOKASSA.value:
+        logger.debug(
+            'Skipping NaloGO receipt: guest purchase paid not via YooKassa',
+            purchase_id=purchase.id,
+            payment_method=purchase.payment_method,
+        )
         return
 
     # Без payment_id нет dedup-ключа в Redis — нельзя гарантировать идемпотентность
@@ -227,13 +351,17 @@ async def _create_nalogo_receipt_for_purchase(
         # Не передаём telegram_user_id в описание чека — privacy (VPN-сервис)
         receipt_name = settings.get_balance_payment_description(purchase.amount_kopeks)
 
+        # Адресат чека — покупатель, а не одаряемый (см. _get_receipt_contact)
+        receipt_telegram_id, receipt_email = _get_receipt_contact(purchase, user)
+
         receipt_uuid = await nalogo_service.create_receipt(
             name=receipt_name,
             amount=amount_rubles,
             quantity=1,
             payment_id=purchase.payment_id,
-            telegram_user_id=user.telegram_id,
+            telegram_user_id=receipt_telegram_id,
             amount_kopeks=purchase.amount_kopeks,
+            user_email=receipt_email,
         )
 
         if receipt_uuid:
@@ -258,6 +386,29 @@ async def _create_nalogo_receipt_for_purchase(
                     purchase_id=purchase.id,
                     receipt_uuid=receipt_uuid,
                 )
+
+            # Отправляем чек покупателю (Telegram или почта) и дублируем в админ-топик
+            try:
+                from app.bot_factory import create_bot
+                from app.services.nalogo_service import send_nalogo_receipt_notifications
+
+                async with create_bot() as bot:
+                    await send_nalogo_receipt_notifications(
+                        bot=bot,
+                        nalogo_service=nalogo_service,
+                        receipt_uuid=receipt_uuid,
+                        amount_kopeks=purchase.amount_kopeks,
+                        telegram_user_id=receipt_telegram_id,
+                        context_label=f'Источник: гостевая покупка с лендинга (purchase_id={purchase.id})',
+                        user_email=receipt_email,
+                    )
+            except Exception as notify_error:
+                logger.warning(
+                    'Failed to send NaloGO receipt notifications for guest purchase',
+                    purchase_id=purchase.id,
+                    receipt_uuid=receipt_uuid,
+                    error=notify_error,
+                )
     except Exception as exc:
         from app.utils.proxy import sanitize_proxy_error
 
@@ -273,12 +424,7 @@ async def fulfill_purchase(
     purchase_token: str,
     pre_resolved_telegram_id: int | None = None,
 ) -> GuestPurchase | None:
-    """After payment: find/create user, create subscription, send notification.
-
-    Uses SELECT ... FOR UPDATE to prevent concurrent fulfillment of the same purchase.
-    The PENDING_ACTIVATION path commits early and returns (terminal for this call).
-    The DELIVERED path commits after subscription creation.
-    Returns the updated purchase or None if not found.
+    """Fulfill a paid guest purchase by creating/extending the user account and subscription.
 
     Args:
         pre_resolved_telegram_id: If caller already resolved the recipient's telegram_id
@@ -288,20 +434,40 @@ async def fulfill_purchase(
     purchase = result.scalars().first()
 
     if purchase is None:
-        logger.warning('Fulfill called for unknown purchase', token_prefix=purchase_token[:5])
+        logger.warning('Fulfill called for unknown purchase', token_length=len(purchase_token))
         return None
 
     if purchase.status != GuestPurchaseStatus.PAID.value:
         logger.warning(
             'Fulfill called for purchase not in PAID status',
-            token_prefix=purchase_token[:5],
+            purchase_id=purchase.id,
             current_status=purchase.status,
         )
         return purchase
 
     try:
+        # Paid gifts are bearer claims. They must stay unbound until a Telegram or
+        # web claim proves the recipient; fulfillment must never create a phantom.
+        if purchase.is_gift:
+            logger.info(
+                'Gift fulfillment deferred until claim',
+                purchase_id=purchase.id,
+                token_prefix=purchase_token[:5],
+            )
+            return purchase
+
         # Determine recipient contact info
         recipient_type, recipient_value = _get_recipient_contact(purchase)
+
+        # Re-check current invite-only policy immediately before mutating User.
+        _, access_decision = await evaluate_guest_purchase_registration(
+            db,
+            channel=RegistrationChannel.LANDING_PURCHASE,
+            contact_type=recipient_type,
+            contact_value=recipient_value,
+            pre_resolved_telegram_id=pre_resolved_telegram_id,
+        )
+        _raise_guest_registration_denial(access_decision)
 
         # Find or create user for the recipient (no commit — stays within our transaction)
         user, is_new_account = await _find_or_create_user(
@@ -310,6 +476,7 @@ async def fulfill_purchase(
             recipient_value,
             purchase=purchase,
             pre_resolved_telegram_id=pre_resolved_telegram_id,
+            tariff_id=purchase.tariff_id,
         )
 
         # Load tariff early — needed for both PENDING_ACTIVATION and DELIVERED paths
@@ -340,7 +507,14 @@ async def fulfill_purchase(
             return purchase
 
         # Check if user already has a subscription
-        existing_subscription = await get_subscription_by_user_id(db, user.id)
+        if settings.is_multi_tariff_enabled():
+            from app.database.crud.subscription import get_subscription_by_user_and_tariff
+
+            # In multi-tariff mode, only block if user already has THIS SPECIFIC tariff active.
+            # Different tariffs can be purchased simultaneously — that's the whole point.
+            existing_subscription = await get_subscription_by_user_and_tariff(db, user.id, tariff.id)
+        else:
+            existing_subscription = await get_subscription_by_user_id(db, user.id)
         if existing_subscription is not None and (existing_subscription.is_active or purchase.is_gift):
             # Active subscription or gift with any existing subscription — hold for manual activation
             purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
@@ -348,7 +522,7 @@ async def fulfill_purchase(
             if recipient_type == 'email' and not purchase.is_gift and is_new_account:
                 purchase.auto_login_token = create_auto_login_token(user.id)
             await db.commit()
-            await db.refresh(purchase, attribute_names=['landing', 'user'])
+            await db.refresh(purchase, attribute_names=['landing', 'user', 'buyer'])
 
             try:
                 await send_guest_notification(
@@ -372,10 +546,11 @@ async def fulfill_purchase(
                 purchase.cabinet_password = None
                 await db.commit()
 
+            await _attribute_purchase_campaign(db, purchase, user)
+
             logger.info(
                 'Guest purchase held for activation (existing subscription)',
                 purchase_id=purchase.id,
-                token_prefix=purchase_token[:5],
                 user_id=user.id,
             )
             return purchase
@@ -424,28 +599,100 @@ async def fulfill_purchase(
         purchase.status = GuestPurchaseStatus.DELIVERED.value
         purchase.user_id = user.id
         purchase.delivered_at = datetime.now(UTC)
+
+        # Extract subid from Redis cache (saved at purchase creation)
+        try:
+            from app.utils.cache import cache
+
+            _cached_subid = await cache.get(f'subid:purchase:{purchase.token}')
+            if _cached_subid:
+                purchase.subid = _cached_subid if isinstance(_cached_subid, str) else _cached_subid.decode()
+                from app.database.crud.yandex_client_id import upsert_subid
+
+                await upsert_subid(db, user.id, purchase.subid, source='landing')
+        except Exception:
+            pass
+
         if recipient_type == 'email' and not purchase.is_gift and is_new_account:
             purchase.auto_login_token = create_auto_login_token(user.id)
 
         await db.commit()
-        await db.refresh(purchase, attribute_names=['landing', 'user'])
+        await db.refresh(purchase, attribute_names=['landing', 'user', 'buyer'])
 
-        # Create transaction so promo group auto-assignment and contest tracking work
-        transaction = None
+        # Save Yandex CID from Redis → DB BEFORE create_transaction, so the
+        # central purchase hook fired from create_transaction (every completed
+        # SUBSCRIPTION_PAYMENT) can read the stored CID. Without this ordering
+        # the background fire would race the CID write and no-op.
         try:
-            payment_method_enum = _resolve_payment_method(purchase.payment_method)
-            transaction = await create_transaction(
-                db=db,
-                user_id=user.id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
-                amount_kopeks=purchase.amount_kopeks,
-                description=f'Покупка подписки через лендинг ({notification_tariff_name}, {purchase.period_days} дн.)',
-                payment_method=payment_method_enum,
-                external_id=purchase.payment_id,
-                is_completed=True,
-            )
+            from app.services import yandex_offline_conv_service as yandex_conv
+            from app.utils.cache import cache
+
+            _cached_cid = await cache.get(f'yacid:purchase:{purchase.token}')
+            _cached_yclid = await cache.get(f'yclid:purchase:{purchase.token}')
+            if _cached_cid:
+                await yandex_conv.store_cid(db, user.id, _cached_cid, source='landing', yclid=_cached_yclid)
+                await db.commit()
         except Exception:
-            logger.exception('Failed to create transaction for guest purchase', purchase_id=purchase.id)
+            logger.debug('Failed to save CID from Redis')
+
+        # Create transaction so promo group auto-assignment and contest tracking work.
+        # Skip for gift recipients — they didn't pay, so their spending shouldn't be inflated.
+        transaction = None
+        if not purchase.is_gift:
+            try:
+                payment_method_enum = _resolve_payment_method(purchase.payment_method)
+                transaction = await create_transaction(
+                    db=db,
+                    user_id=user.id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    amount_kopeks=purchase.amount_kopeks,
+                    description=f'Покупка подписки через лендинг ({notification_tariff_name}, {purchase.period_days} дн.)',
+                    payment_method=payment_method_enum,
+                    external_id=purchase.payment_id,
+                    is_completed=True,
+                )
+            except Exception:
+                logger.exception('Failed to create transaction for guest purchase', purchase_id=purchase.id)
+                # Доставка уже закоммичена выше; транзакция — побочный учётный след
+                # (промогруппа/конкурс). Если её запись упала (например, дубль
+                # external_id при ретрае платёжки), откатываем ТОЛЬКО её, чтобы не
+                # «отравить» сессию и не сорвать дальнейшие коммиты (CID, постбэки).
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+        # Registration event (new accounts only) + S2S postback
+        if is_new_account:
+            try:
+                from app.services import yandex_offline_conv_service as yandex_conv
+
+                await yandex_conv.on_registration(db, user.id)
+            except Exception:
+                logger.debug('Yandex on_registration hook error')
+
+            try:
+                from app.database.crud.yandex_client_id import get_subid
+                from app.services.s2s_postback_service import send_postback
+
+                _subid = purchase.subid or await get_subid(db, user.id)
+                if _subid:
+                    await send_postback('registration', _subid, user_id=user.id)
+            except Exception:
+                logger.debug('S2S postback registration hook error')
+
+        # Purchase event fires centrally from create_transaction (the
+        # SUBSCRIPTION_PAYMENT created above, after the CID was persisted).
+        # S2S postback is independent and still fires here.
+        try:
+            from app.database.crud.yandex_client_id import get_subid
+            from app.services.s2s_postback_service import send_postback
+
+            _subid = purchase.subid or await get_subid(db, user.id)
+            if _subid:
+                await send_postback('purchase', _subid, amount=purchase.amount_kopeks / 100, user_id=user.id)
+        except Exception:
+            logger.debug('S2S postback purchase hook error')
 
         try:
             await send_guest_notification(
@@ -471,10 +718,11 @@ async def fulfill_purchase(
             purchase.cabinet_password = None
             await db.commit()
 
+        await _attribute_purchase_campaign(db, purchase, user)
+
         logger.info(
             'Guest purchase fulfilled',
             purchase_id=purchase.id,
-            token_prefix=purchase_token[:5],
             user_id=user.id,
             recipient_type=recipient_type,
         )
@@ -486,7 +734,6 @@ async def fulfill_purchase(
         await db.rollback()
         logger.exception(
             'Failed to fulfill purchase',
-            token_prefix=purchase_token[:5],
             purchase_id=purchase.id,
         )
         raise GuestPurchaseError('Purchase fulfillment failed', status_code=500)
@@ -547,12 +794,100 @@ def _mask_email(email: str) -> str:
     return f'{local}@{domain}.{tld}'
 
 
+async def find_guest_purchase_user(
+    db: AsyncSession,
+    contact_type: Literal['email', 'telegram'],
+    contact_value: str,
+    *,
+    pre_resolved_telegram_id: int | None = None,
+) -> User | None:
+    """Find a guest-purchase user without mutating the account or session state."""
+    if contact_type == 'email':
+        result = await db.execute(select(User).where(User.email == contact_value))
+        return result.scalars().first()
+
+    if contact_type != 'telegram':
+        raise GuestPurchaseError(f'Unsupported contact type: {contact_type}', status_code=500)
+
+    username = contact_value.lstrip('@')
+    if not _TELEGRAM_USERNAME_RE.match(username):
+        raise GuestPurchaseError('Invalid Telegram username format', status_code=400)
+    normalized = username.lower()
+
+    resolved_telegram_id = pre_resolved_telegram_id
+    if resolved_telegram_id is None:
+        try:
+            from app.bot_factory import create_bot
+
+            async with create_bot() as bot:
+                chat = await asyncio.wait_for(bot.get_chat(chat_id=f'@{username}'), timeout=5.0)
+                resolved_telegram_id = chat.id
+                if chat.username:
+                    normalized = chat.username.lower()
+        except Exception as exc:
+            logger.debug('Could not resolve telegram_id for username', username=username, error=str(exc))
+
+    if resolved_telegram_id:
+        result = await db.execute(select(User).where(User.telegram_id == resolved_telegram_id))
+        user = result.scalars().first()
+        if user is not None:
+            return user
+
+    result = await db.execute(select(User).where(func.lower(User.username) == normalized))
+    return result.scalars().first()
+
+
+async def evaluate_guest_purchase_registration(
+    db: AsyncSession,
+    *,
+    channel: RegistrationChannel,
+    contact_type: Literal['email', 'telegram'],
+    contact_value: str,
+    pre_resolved_telegram_id: int | None = None,
+) -> tuple[User | None, RegistrationAccessDecision]:
+    """Evaluate invite-only policy before a landing flow may mutate ``User``."""
+    existing_user = await find_guest_purchase_user(
+        db,
+        contact_type,
+        contact_value,
+        pre_resolved_telegram_id=pre_resolved_telegram_id,
+    )
+    identity = VerifiedRegistrationIdentity(
+        user_id=getattr(existing_user, 'id', None),
+        telegram_id=(getattr(existing_user, 'telegram_id', None) if contact_type == 'telegram' else None),
+        email=contact_value if contact_type == 'email' else None,
+        email_verified=False,
+        verified_admin=False,
+    )
+    decision = await _guest_registration_access_service.evaluate(
+        db,
+        RegistrationAccessContext(
+            channel=channel,
+            identity=identity,
+            existing_user=existing_user,
+            lock_limited_invite=False,
+        ),
+    )
+    return existing_user, decision
+
+
+def _raise_guest_registration_denial(decision: RegistrationAccessDecision) -> None:
+    if decision.allowed:
+        return
+    if decision.reason.value == 'check_unavailable':
+        raise GuestPurchaseError('Registration check unavailable', status_code=503)
+    if decision.reason.value == 'blocked':
+        raise GuestPurchaseError('User account is not active', status_code=403)
+    raise GuestPurchaseError('Registration is available by invitation only', status_code=403)
+
+
 async def _find_or_create_user(
     db: AsyncSession,
     contact_type: Literal['email', 'telegram'],
     contact_value: str,
     purchase: GuestPurchase | None = None,
     pre_resolved_telegram_id: int | None = None,
+    tariff_id: int | None = None,
 ) -> tuple[User, bool]:
     """Find user by email/telegram username or create a new one.
 
@@ -588,18 +923,29 @@ async def _find_or_create_user(
             if not user.promo_group_id:
                 default_group = await _get_or_create_default_promo_group(db)
                 user.promo_group_id = default_group.id
+            if not user.referral_code:
+                user.referral_code = await create_unique_referral_code(db)
             return user, is_new_account
 
         # Create new email user with verified cabinet account
         plain_password = secrets.token_urlsafe(12)
-        default_group = await _get_or_create_default_promo_group(db)
+        # Resolve promo group: prefer tariff's allowed group, fallback to default
+        resolved_group = None
+        if tariff_id:
+            tariff_obj = await get_tariff_by_id(db, tariff_id)
+            if tariff_obj and tariff_obj.allowed_promo_groups:
+                resolved_group = tariff_obj.allowed_promo_groups[0]
+        if not resolved_group:
+            resolved_group = await _get_or_create_default_promo_group(db)
+        referral_code = await create_unique_referral_code(db)
         user = User(
             auth_type='email',
             email=contact_value,
             email_verified=True,
             email_verified_at=datetime.now(UTC),
             password_hash=hash_password(plain_password),
-            promo_group_id=default_group.id,
+            promo_group_id=resolved_group.id,
+            referral_code=referral_code,
         )
         if purchase:
             purchase.cabinet_password = plain_password
@@ -627,6 +973,8 @@ async def _find_or_create_user(
                 if not user.promo_group_id:
                     default_group = await _get_or_create_default_promo_group(db)
                     user.promo_group_id = default_group.id
+                if not user.referral_code:
+                    user.referral_code = await create_unique_referral_code(db)
                 return user, is_new_account
             raise
         logger.info(
@@ -695,15 +1043,19 @@ async def _find_or_create_user(
         if not user.promo_group_id:
             default_group = await _get_or_create_default_promo_group(db)
             user.promo_group_id = default_group.id
+        if not user.referral_code:
+            user.referral_code = await create_unique_referral_code(db)
         return user, False
 
     # Create new telegram user
     default_group = await _get_or_create_default_promo_group(db)
+    referral_code = await create_unique_referral_code(db)
     user = User(
         auth_type='telegram',
         username=username,
         telegram_id=resolved_telegram_id,
         promo_group_id=default_group.id,
+        referral_code=referral_code,
     )
     try:
         async with db.begin_nested():
@@ -717,6 +1069,8 @@ async def _find_or_create_user(
                 if not user.promo_group_id:
                     default_group = await _get_or_create_default_promo_group(db)
                     user.promo_group_id = default_group.id
+                if not user.referral_code:
+                    user.referral_code = await create_unique_referral_code(db)
                 return user, False
         result = await db.execute(select(User).where(func.lower(User.username) == normalized))
         user = result.scalars().first()
@@ -724,6 +1078,8 @@ async def _find_or_create_user(
             if not user.promo_group_id:
                 default_group = await _get_or_create_default_promo_group(db)
                 user.promo_group_id = default_group.id
+            if not user.referral_code:
+                user.referral_code = await create_unique_referral_code(db)
             return user, False
         raise
     logger.info(
@@ -740,6 +1096,31 @@ def _get_recipient_contact(purchase: GuestPurchase) -> tuple[str, str]:
     if purchase.is_gift and purchase.gift_recipient_type and purchase.gift_recipient_value:
         return purchase.gift_recipient_type, purchase.gift_recipient_value
     return purchase.contact_type, purchase.contact_value
+
+
+def _get_receipt_contact(purchase: GuestPurchase, user: User) -> tuple[int | None, str | None]:
+    """Return (telegram_id, email) для адресата чека НПД — это ПОКУПАТЕЛЬ.
+
+    Для обычных покупок покупатель и получатель — одно лицо, и user подходит.
+    Для подарочных user — это одаряемый (см. _get_recipient_contact), а чек
+    остаётся финансовым документом дарителя: слать чек получателю нельзя —
+    он раскрывает третьему лицу уплаченную сумму (в подарочном письме
+    GUEST_GIFT_RECEIVED суммы нет), а до самого покупателя чек по 422-ФЗ всё
+    равно обязан дойти.
+    """
+    if not purchase.is_gift:
+        return user.telegram_id, user.email
+
+    buyer = purchase.buyer
+    if buyer is not None:
+        return buyer.telegram_id, buyer.email
+
+    # Гостевой подарок с лендинга: аккаунта покупателя нет, но его собственный
+    # контакт лежит в contact_type/contact_value самой покупки. Telegram-контакт
+    # там — username, отправить чек по нему нельзя, остаётся только почта.
+    if purchase.contact_type == 'email':
+        return None, purchase.contact_value
+    return None, None
 
 
 async def _send_telegram_gift_notification(
@@ -814,6 +1195,71 @@ async def _send_telegram_gift_notification(
         )
 
 
+async def _send_guest_main_email(
+    templates: 'EmailNotificationTemplates',
+    purchase: GuestPurchase,
+    notification_type: 'NotificationType',
+    language: str,
+    context: dict,
+    recipient_email: str,
+) -> None:
+    """Основное письмо гостевой покупки (доставка / активация / подарок).
+
+    Письмо с доступами кабинета уходит отдельно и от этого письма не зависит:
+    ни выключатель типа, ни отсутствие шаблона не должны его глушить — иначе
+    покупатель остался бы без пароля.
+    """
+    from app.cabinet.services.email_service import email_service
+    from app.cabinet.services.email_type_switch import is_email_type_enabled
+
+    if not is_email_type_enabled(notification_type.value):
+        logger.info('Гостевое письмо отключено админом', notification_type=notification_type.value)
+        return
+
+    # Check DB override first, then fall back to hardcoded template
+    template = None
+    try:
+        from app.cabinet.services.email_template_overrides import get_rendered_override
+
+        rendered = await get_rendered_override(notification_type.value, language, context)
+        if rendered:
+            subject, body_html = rendered
+            template = {
+                'subject': subject,
+                'body_html': body_html,
+            }
+    except Exception as e:
+        logger.debug('Failed to check template override', e=e)
+
+    if not template:
+        template = templates.get_template(notification_type, language, context)
+
+    if not template:
+        logger.warning('No email template found for guest notification', notification_type=notification_type.value)
+        return
+
+    result = await asyncio.to_thread(
+        email_service.send_email,
+        to_email=recipient_email,
+        subject=template['subject'],
+        body_html=template['body_html'],
+    )
+
+    if result:
+        logger.info(
+            'Guest purchase notification sent',
+            purchase_id=purchase.id,
+            notification_type=notification_type.value,
+            recipient_masked=_mask_email(recipient_email),
+        )
+    else:
+        logger.warning(
+            'Failed to send guest purchase notification',
+            purchase_id=purchase.id,
+            notification_type=notification_type.value,
+        )
+
+
 async def send_guest_notification(
     purchase: GuestPurchase,
     *,
@@ -871,6 +1317,7 @@ async def send_guest_notification(
         'cabinet_url': cabinet_base,
         'cabinet_email': recipient_email,
         'cabinet_password': purchase.cabinet_password,
+        'email': recipient_email,
     }
 
     if is_pending_activation:
@@ -881,49 +1328,7 @@ async def send_guest_notification(
         notification_type = NotificationType.GUEST_SUBSCRIPTION_DELIVERED
 
     templates = EmailNotificationTemplates()
-
-    # Check DB override first, then fall back to hardcoded template
-    template = None
-    try:
-        from app.cabinet.services.email_template_overrides import get_rendered_override
-
-        rendered = await get_rendered_override(notification_type.value, language, context)
-        if rendered:
-            subject, body_html = rendered
-            template = {
-                'subject': subject,
-                'body_html': body_html,
-            }
-    except Exception as e:
-        logger.debug('Failed to check template override', e=e)
-
-    if not template:
-        template = templates.get_template(notification_type, language, context)
-
-    if not template:
-        logger.warning('No email template found for guest notification', notification_type=notification_type.value)
-        return
-
-    result = await asyncio.to_thread(
-        email_service.send_email,
-        to_email=recipient_email,
-        subject=template['subject'],
-        body_html=template['body_html'],
-    )
-
-    if result:
-        logger.info(
-            'Guest purchase notification sent',
-            purchase_id=purchase.id,
-            notification_type=notification_type.value,
-            recipient_masked=_mask_email(recipient_email),
-        )
-    else:
-        logger.warning(
-            'Failed to send guest purchase notification',
-            purchase_id=purchase.id,
-            notification_type=notification_type.value,
-        )
+    await _send_guest_main_email(templates, purchase, notification_type, language, context, recipient_email)
 
     # Send separate credentials email for new accounts (self-purchases and gifts)
     if purchase.cabinet_password:
@@ -932,7 +1337,10 @@ async def send_guest_notification(
             from app.cabinet.services.email_template_overrides import get_rendered_override
 
             cred_rendered = await get_rendered_override(
-                NotificationType.GUEST_CABINET_CREDENTIALS.value, language, context
+                NotificationType.GUEST_CABINET_CREDENTIALS.value,
+                language,
+                context,
+                required_vars=['cabinet_email', 'cabinet_password'],
             )
             if cred_rendered:
                 cred_subject, cred_body = cred_rendered
@@ -959,6 +1367,115 @@ async def send_guest_notification(
                 )
             else:
                 logger.warning('Failed to send cabinet credentials email', purchase_id=purchase.id)
+
+
+async def notify_gift_claim_available(
+    purchase: GuestPurchase,
+    *,
+    tariff_name: str = '',
+    period_days: int | None = None,
+    language: str = 'ru',
+) -> None:
+    """Best-effort: tell people a paid gift is waiting, with the CLAIM link.
+
+    Sends the transferable claim link (NOT a pre-bound subscription) to:
+      - the typed recipient, only if they gave an email (telegram usernames are
+        NOT auto-DMed — a spoofed @username would receive the gift; the buyer
+        forwards the link manually instead);
+      - the BUYER, if they gave an email — a durable backstop so the claim link
+        is never lost if the buyer closes the success page.
+
+    Never raises — a notification failure must never break the payment flow.
+    """
+    if not purchase.is_gift:
+        return
+    cabinet_base = (settings.CABINET_URL or '').rstrip('/')
+    if not cabinet_base:
+        return
+    claim_url = f'{cabinet_base}/buy/gift/{purchase.token}'
+
+    from app.cabinet.services.email_service import email_service
+    from app.cabinet.services.email_templates import EmailNotificationTemplates
+
+    # Recipient: reuse the gift-received template, but its CTA now points at the
+    # claim page and it carries no credentials/subscription (none exist yet).
+    from app.cabinet.services.email_type_switch import is_email_type_enabled
+    from app.services.notification_delivery_service import NotificationType
+
+    if (
+        purchase.gift_recipient_type == 'email'
+        and purchase.gift_recipient_value
+        and is_email_type_enabled(NotificationType.GUEST_GIFT_RECEIVED.value)
+    ):
+        try:
+            context = {
+                'tariff_name': tariff_name,
+                'period_days': period_days if period_days is not None else purchase.period_days,
+                'success_page_url': claim_url,
+                'subscription_url': '',
+                'is_gift': True,
+                'gift_message': purchase.gift_message,
+                'is_existing_user': False,
+                'cabinet_url': cabinet_base,
+                'cabinet_email': '',
+                'cabinet_password': '',
+            }
+            # Сохранённый в редакторе шаблон, как и в остальных гостевых письмах;
+            # иначе получатель подарка по ссылке видел только стандартный.
+            from app.cabinet.services.email_template_overrides import get_rendered_override
+
+            rendered = await get_rendered_override(NotificationType.GUEST_GIFT_RECEIVED.value, language, context)
+            if rendered:
+                template = {'subject': rendered[0], 'body_html': rendered[1]}
+            else:
+                templates = EmailNotificationTemplates()
+                template = templates.get_template(NotificationType.GUEST_GIFT_RECEIVED, language, context)
+            if template:
+                await asyncio.to_thread(
+                    email_service.send_email,
+                    to_email=purchase.gift_recipient_value,
+                    subject=template['subject'],
+                    body_html=template['body_html'],
+                )
+        except Exception:
+            logger.warning('Failed to send gift claim email to recipient', purchase_id=purchase.id, exc_info=True)
+
+    # Buyer backstop: a durable copy of the link to forward, regardless of which
+    # channel the recipient used or whether the buyer kept the success tab open.
+    if (
+        purchase.contact_type == 'email'
+        and purchase.contact_value
+        and is_email_type_enabled(NotificationType.GUEST_GIFT_LINK_BUYER.value)
+    ):
+        try:
+            # Шаблон guest_gift_link_buyer: сохранённый в редакторе, иначе дефолтный.
+            # Раньше текст был зашит здесь на двух языках и без обёртки.
+            buyer_context = {
+                'claim_url': claim_url,
+                'tariff_name': tariff_name,
+                'period_days': period_days if period_days is not None else purchase.period_days,
+                'cabinet_url': cabinet_base,
+            }
+            from app.cabinet.services.email_template_overrides import get_rendered_override
+
+            rendered = await get_rendered_override(
+                NotificationType.GUEST_GIFT_LINK_BUYER.value, language, buyer_context
+            )
+            if rendered:
+                buyer_template = {'subject': rendered[0], 'body_html': rendered[1]}
+            else:
+                buyer_template = EmailNotificationTemplates().get_template(
+                    NotificationType.GUEST_GIFT_LINK_BUYER, language, buyer_context
+                )
+            if buyer_template:
+                await asyncio.to_thread(
+                    email_service.send_email,
+                    to_email=purchase.contact_value,
+                    subject=buyer_template['subject'],
+                    body_html=buyer_template['body_html'],
+                )
+        except Exception:
+            logger.warning('Failed to send gift link to buyer', purchase_id=purchase.id, exc_info=True)
 
 
 async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notification: bool = False) -> GuestPurchase:
@@ -1009,7 +1526,6 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     notification_language = user.language or 'ru'
 
     try:
-        existing_subscription = await get_subscription_by_user_id(db, user.id)
         subscription_service = SubscriptionService()
 
         squads = list(tariff.allowed_squads or [])
@@ -1019,31 +1535,98 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
             all_servers, _ = await get_all_server_squads(db, available_only=True)
             squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
-        if existing_subscription is not None:
-            subscription = await replace_subscription(
-                db,
-                existing_subscription,
-                duration_days=purchase.period_days,
-                traffic_limit_gb=tariff.traffic_limit_gb,
-                device_limit=tariff.device_limit,
-                connected_squads=squads,
-                is_trial=False,
-                update_server_counters=True,
-                commit=False,
+        # In multi-tariff mode, always create a new subscription (new Remnawave user)
+        if settings.is_multi_tariff_enabled():
+            from app.database.crud.subscription import get_subscription_by_user_and_tariff
+
+            existing_for_tariff = await get_subscription_by_user_and_tariff(db, user.id, tariff.id)
+            _has_time = (
+                existing_for_tariff is not None
+                and existing_for_tariff.end_date is not None
+                and _aware(existing_for_tariff.end_date) > datetime.now(UTC)
             )
-            subscription.tariff_id = tariff.id
+            if existing_for_tariff and _has_time:
+                # Extend existing active/trial subscription instead of replacing (preserve remaining days)
+                subscription = await extend_subscription(
+                    db,
+                    existing_for_tariff,
+                    purchase.period_days,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    commit=False,
+                )
+            elif existing_for_tariff:
+                # Expired subscription — replace with fresh dates
+                subscription = await replace_subscription(
+                    db,
+                    existing_for_tariff,
+                    duration_days=purchase.period_days,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    is_trial=False,
+                    tariff_id=tariff.id,
+                    update_server_counters=True,
+                    commit=False,
+                )
+            else:
+                subscription = await create_paid_subscription(
+                    db=db,
+                    user_id=user.id,
+                    duration_days=purchase.period_days,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    tariff_id=tariff.id,
+                    update_server_counters=True,
+                    commit=False,
+                )
         else:
-            subscription = await create_paid_subscription(
-                db=db,
-                user_id=user.id,
-                duration_days=purchase.period_days,
-                traffic_limit_gb=tariff.traffic_limit_gb,
-                device_limit=tariff.device_limit,
-                connected_squads=squads,
-                tariff_id=tariff.id,
-                update_server_counters=True,
-                commit=False,
+            existing_subscription = await get_subscription_by_user_id(db, user.id)
+            _sub_has_time = (
+                existing_subscription is not None
+                and existing_subscription.end_date is not None
+                and _aware(existing_subscription.end_date) > datetime.now(UTC)
             )
+            if existing_subscription is not None and _sub_has_time:
+                # Extend existing active subscription (preserve remaining days)
+                subscription = await extend_subscription(
+                    db,
+                    existing_subscription,
+                    purchase.period_days,
+                    tariff_id=tariff.id,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    commit=False,
+                )
+            elif existing_subscription is not None:
+                # Expired subscription — replace with fresh dates
+                subscription = await replace_subscription(
+                    db,
+                    existing_subscription,
+                    duration_days=purchase.period_days,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    is_trial=False,
+                    tariff_id=tariff.id,
+                    update_server_counters=True,
+                    commit=False,
+                )
+            else:
+                subscription = await create_paid_subscription(
+                    db=db,
+                    user_id=user.id,
+                    duration_days=purchase.period_days,
+                    traffic_limit_gb=tariff.traffic_limit_gb,
+                    device_limit=tariff.device_limit,
+                    connected_squads=squads,
+                    tariff_id=tariff.id,
+                    update_server_counters=True,
+                    commit=False,
+                )
 
         await subscription_service.create_remnawave_user(db, subscription)
         await db.refresh(subscription)
@@ -1052,28 +1635,43 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
         purchase.subscription_crypto_link = subscription.subscription_crypto_link
         purchase.status = GuestPurchaseStatus.DELIVERED.value
         purchase.delivered_at = datetime.now(UTC)
-        if user.auth_type == 'email' and not purchase.is_gift and is_new_account:
+        # Issue a one-click cabinet login token for any email recipient who just
+        # got a fresh account — INCLUDING gift recipients claiming via the web
+        # arm. Without this, an email gift recipient who never sees the emailed
+        # password is locked out of the account holding their subscription.
+        # The token is surfaced only to the claimer (claim endpoint), never on
+        # the buyer's success page (_build_purchase_status_response gates that).
+        if user.auth_type == 'email' and is_new_account:
             purchase.auto_login_token = create_auto_login_token(user.id)
 
         # Single atomic commit: subscription + purchase status + user changes
         await db.commit()
-        await db.refresh(purchase, attribute_names=['landing', 'user'])
+        await db.refresh(purchase, attribute_names=['landing', 'user', 'buyer'])
 
-        # Create transaction so promo group auto-assignment and contest tracking work
-        try:
-            payment_method_enum = _resolve_payment_method(purchase.payment_method)
-            await create_transaction(
-                db=db,
-                user_id=user.id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
-                amount_kopeks=purchase.amount_kopeks,
-                description=f'Покупка подписки через лендинг ({notification_tariff_name}, {purchase.period_days} дн.)',
-                payment_method=payment_method_enum,
-                external_id=purchase.payment_id,
-                is_completed=True,
-            )
-        except Exception:
-            logger.exception('Failed to create transaction for activated purchase', purchase_id=purchase.id)
+        # Create transaction so promo group auto-assignment and contest tracking work.
+        # Skip for gift recipients — they didn't pay, so their spending shouldn't be inflated.
+        if not purchase.is_gift:
+            try:
+                payment_method_enum = _resolve_payment_method(purchase.payment_method)
+                await create_transaction(
+                    db=db,
+                    user_id=user.id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    amount_kopeks=purchase.amount_kopeks,
+                    description=f'Покупка подписки через лендинг ({notification_tariff_name}, {purchase.period_days} дн.)',
+                    payment_method=payment_method_enum,
+                    external_id=purchase.payment_id,
+                    is_completed=True,
+                )
+            except Exception:
+                logger.exception('Failed to create transaction for activated purchase', purchase_id=purchase.id)
+                # Доставка уже закоммичена (db.commit выше). Транзакция — побочный
+                # учётный след; при сбое откатываем только её, иначе отравленная
+                # сессия сорвёт очистку пароля (db.commit ниже) и уведомления.
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
 
         if not skip_notification:
             try:
@@ -1097,7 +1695,6 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
         logger.info(
             'Guest purchase activated',
             purchase_id=purchase.id,
-            token_prefix=purchase_token[:5],
             user_id=user.id,
         )
 
@@ -1143,8 +1740,11 @@ async def retry_stuck_paid_purchases(
             GuestPurchase.retry_count < max_retries,
             or_(GuestPurchase.paid_at < cutoff, GuestPurchase.paid_at.is_(None)),
             or_(GuestPurchase.paid_at > max_age, GuestPurchase.paid_at.is_(None)),
-            # Exclude code-only gifts — they stay PAID intentionally until activated
-            ~(GuestPurchase.is_gift.is_(True) & GuestPurchase.gift_recipient_type.is_(None)),
+            # Exclude ALL gifts — they stay PAID intentionally until claimed via
+            # the gift link (the subscription is created at claim time, bound to
+            # whoever activates). Retrying would eagerly fulfill a directed gift
+            # to a phantom recipient and re-introduce the wrong-recipient binding.
+            ~GuestPurchase.is_gift.is_(True),
         )
         .order_by(GuestPurchase.paid_at.asc().nulls_first())
         .limit(limit)
@@ -1164,9 +1764,9 @@ async def retry_stuck_paid_purchases(
                 await _increment_retry_count(retry_db, token)
                 await fulfill_purchase(retry_db, token)
                 retried += 1
-                logger.info('Retried stuck purchase successfully', token_prefix=token[:5])
+                logger.info('Retried stuck purchase successfully', token_length=len(token))
         except Exception:
-            logger.exception('Failed to retry stuck purchase', token_prefix=token[:5])
+            logger.exception('Failed to retry stuck purchase', token_length=len(token))
 
     return retried
 
@@ -1218,9 +1818,9 @@ async def retry_stuck_pending_activation(
                 await _increment_retry_count(retry_db, token)
                 await activate_purchase(retry_db, token)
                 retried += 1
-                logger.info('Retried stuck pending_activation successfully', token_prefix=token[:5])
+                logger.info('Retried stuck pending_activation successfully', token_length=len(token))
         except Exception:
-            logger.exception('Failed to retry stuck pending_activation', token_prefix=token[:5])
+            logger.exception('Failed to retry stuck pending_activation', token_length=len(token))
 
     return retried
 
@@ -1281,12 +1881,12 @@ async def _fail_exhausted_purchases_batch(
                     await update_purchase_status(fail_db, token, GuestPurchaseStatus.FAILED)
                     logger.error(
                         'Purchase exceeded max retries — marked FAILED',
-                        token_prefix=token[:5],
+                        purchase_id=purchase.id,
                         retry_count=retry_count,
                         phase=status.value,
                     )
         except Exception:
-            logger.exception('Failed to mark exhausted purchase as FAILED', token_prefix=token[:5])
+            logger.exception('Failed to mark exhausted purchase as FAILED', token_length=len(token))
 
         # Send alert OUTSIDE the session (no row lock held)
         if alert_data:
@@ -1408,7 +2008,7 @@ async def recover_stuck_pending_purchases(
                 if paid:
                     recovered += 1
         except Exception:
-            logger.exception('Failed to recover pending purchase', token_prefix=token[:5])
+            logger.exception('Failed to recover pending purchase', token_length=len(token))
 
     return recovered
 
@@ -1424,7 +2024,7 @@ async def _find_succeeded_provider_payment(
     ``amount_kopeks`` is ``None`` when the amount check should be skipped
     (e.g., CryptoBot where USD→RUB conversion introduces imprecision).
     """
-    from sqlalchemy import cast
+    from sqlalchemy import case, cast
     from sqlalchemy.types import JSON as SA_JSON
 
     from app.database.models import (
@@ -1444,11 +2044,23 @@ async def _find_succeeded_provider_payment(
 
     # --- CryptoBot: special case — payload field (text JSON), skip amount check ---
     if base_method == 'cryptobot':
+        # `CAST(payload AS json)` в WHERE небезопасен: Postgres не гарантирует
+        # порядок вычисления предикатов и может выполнить каст на не-JSON payload
+        # (например 'balance_2_10000' от пополнения баланса) ДО фильтра LIKE '{%',
+        # что роняет запрос с "invalid input syntax for type json" (Telegram-баг
+        # #607443). CASE гарантирует короткое замыкание — каст только для JSON-строк.
+        purchase_token_expr = case(
+            (
+                CryptoBotPayment.payload.like('{%'),
+                cast(CryptoBotPayment.payload, SA_JSON)['purchase_token'].as_string(),
+            ),
+            else_=None,
+        )
         result = await db.execute(
             select(CryptoBotPayment).where(
                 CryptoBotPayment.status == 'paid',
                 CryptoBotPayment.payload.like('{%'),
-                cast(CryptoBotPayment.payload, SA_JSON)['purchase_token'].as_string() == purchase_token,
+                purchase_token_expr == purchase_token,
             )
         )
         p = result.scalars().first()
@@ -1547,12 +2159,11 @@ async def _check_and_recover_pending_purchase(
 
     match = await _find_succeeded_provider_payment(db, base_method, purchase_token)
     if match is None:
-        if base_method:
-            logger.debug(
-                'No succeeded provider payment found for PENDING purchase',
-                token_prefix=purchase_token[:5],
-                payment_method=payment_method,
-            )
+        # Это нормальный путь — гость нажал «Оплатить», но ещё не завершил оплату
+        # у провайдера. Polling задача проверяет каждые N секунд для каждой PENDING
+        # покупки, поэтому раньше этот debug-лог спамил в LOG_LEVEL=DEBUG режиме
+        # без полезной diagnostic info. Реальные ошибки (amount mismatch и т.д.)
+        # логируются на уровне ERROR ниже.
         return False
 
     provider_payment_id, provider_amount_kopeks = match
@@ -1561,7 +2172,7 @@ async def _check_and_recover_pending_purchase(
     if provider_amount_kopeks is not None and provider_amount_kopeks != purchase.amount_kopeks:
         logger.error(
             'Amount mismatch during PENDING recovery — skipping',
-            token_prefix=purchase_token[:5],
+            purchase_id=purchase.id,
             provider_amount=provider_amount_kopeks,
             purchase_amount=purchase.amount_kopeks,
             payment_method=payment_method,
@@ -1583,7 +2194,7 @@ async def _check_and_recover_pending_purchase(
     )
     logger.info(
         'Recovered stuck PENDING purchase → PAID',
-        token_prefix=purchase_token[:5],
+        purchase_id=purchase.id,
         payment_method=payment_method,
         provider_payment_id=provider_payment_id,
     )

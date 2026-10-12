@@ -35,6 +35,16 @@ class SortByEnum(StrEnum):
     LAST_ACTIVITY = 'last_activity'
     TOTAL_SPENT = 'total_spent'
     PURCHASE_COUNT = 'purchase_count'
+    SUBSCRIPTION_END_DATE = 'subscription_end_date'
+    #: Конец временного доступа (грейса) — та дата, что в строке «временно до …».
+    GRACE_UNTIL = 'grace_until'
+
+
+class SortOrderEnum(StrEnum):
+    """Direction of the users list sort; omitted — the field's usual direction."""
+
+    ASC = 'asc'
+    DESC = 'desc'
 
 
 # === User Subscription Info ===
@@ -67,8 +77,15 @@ class UserSubscriptionInfo(BaseModel):
     autopay_enabled: bool = False
     is_active: bool = False
     days_remaining: int = 0
+    # Открыт временный доступ (грейс) до этого числа; None — обычная подписка.
+    grace_until: datetime | None = None
     purchased_traffic_gb: int = 0
     traffic_purchases: list[TrafficPurchaseItem] = []
+
+    # Platega SBP auto-renewal (admin view only — populated by the async
+    # builder; the sync builder leaves both at their None default).
+    sbp_recurring_status: str | None = None
+    sbp_recurring_id: int | None = None
 
 
 class UserPromoGroupInfo(BaseModel):
@@ -80,6 +97,23 @@ class UserPromoGroupInfo(BaseModel):
 
 
 # === User List ===
+
+
+class SubscriptionListItem(BaseModel):
+    """Compact subscription info for user list (multi-tariff mode)."""
+
+    id: int
+    tariff_id: int | None = None
+    tariff_name: str | None = None
+    status: str
+    is_trial: bool = False
+    end_date: datetime | None = None
+    days_remaining: int = 0
+    traffic_used_gb: float = 0
+    traffic_limit_gb: int = 0
+    device_limit: int = 0
+    # Открыт временный доступ (грейс) до этого числа; None — обычная подписка.
+    grace_until: datetime | None = None
 
 
 class UserListItem(BaseModel):
@@ -96,12 +130,28 @@ class UserListItem(BaseModel):
     balance_rubles: float
     created_at: datetime
     last_activity: datetime | None = None
+    # Подключён к VPN прямо сейчас (по панели); None — панель не ответила, неизвестно.
+    is_online: bool | None = None
+    # Отметка последнего подключения из панели — по ней кабинет сам гасит зелёную точку,
+    # не дожидаясь следующего ответа сервера. None — сейчас не подключён либо панель молчит.
+    online_at: datetime | None = None
 
     # Subscription summary
     has_subscription: bool = False
     subscription_status: str | None = None
     subscription_is_trial: bool = False
     subscription_end_date: datetime | None = None
+    tariff_id: int | None = None
+    tariff_name: str | None = None
+    traffic_used_gb: float = 0
+    traffic_limit_gb: int = 0
+    device_limit: int = 0
+    days_remaining: int = 0
+    # Временный доступ (грейс) у показанной подписки — до какого числа он открыт.
+    grace_until: datetime | None = None
+
+    # All subscriptions (multi-tariff)
+    subscriptions: list[SubscriptionListItem] = []
 
     # Promo group
     promo_group_id: int | None = None
@@ -124,6 +174,14 @@ class UsersListResponse(BaseModel):
     total: int
     offset: int = 0
     limit: int = 50
+
+
+class UserByRemnawaveResponse(BaseModel):
+    """Subscription-level owner resolved from an exact Remnawave user id."""
+
+    user_id: int
+    subscription_id: int
+    matched_remnawave_id: int | None = None
 
 
 # === User Detail ===
@@ -177,8 +235,11 @@ class UserDetailResponse(BaseModel):
     last_activity: datetime | None = None
     cabinet_last_login: datetime | None = None
 
-    # Subscription
+    # Subscription (legacy single, kept for backward compat)
     subscription: UserSubscriptionInfo | None = None
+
+    # All subscriptions (multi-tariff)
+    subscriptions: list[UserSubscriptionInfo] = []
 
     # Promo group
     promo_group: UserPromoGroupInfo | None = None
@@ -210,8 +271,12 @@ class UserDetailResponse(BaseModel):
     # Recent transactions
     recent_transactions: list[UserTransactionItem] = []
 
-    # Remnawave UUID
-    remnawave_uuid: str | None = None
+    # Remnawave panel user id
+    remnawave_id: int | None = None
+
+    # Режим продаж бота: плитки карточки в классике, тарифах и мультитарифе разные.
+    sales_mode: str = 'tariffs'
+    multi_tariff_enabled: bool = False
 
 
 # === Panel Info ===
@@ -282,8 +347,15 @@ class UpdateSubscriptionRequest(BaseModel):
     """Request to update user subscription."""
 
     action: str = Field(
-        ..., description='Action: extend, shorten, set_end_date, change_tariff, set_traffic, toggle_autopay, cancel'
+        ...,
+        description=(
+            'Action: extend, shorten, set_end_date, change_tariff, set_traffic, '
+            'toggle_autopay, cancel, reset (zero out the subscription, keep user+tickets)'
+        ),
     )
+
+    # Target subscription (required in multi-tariff mode for non-create actions)
+    subscription_id: int | None = Field(None, description='Subscription ID to target (multi-tariff)')
 
     # For extend action
     days: int | None = Field(None, ge=1, le=3650, description='Days to extend')
@@ -333,6 +405,21 @@ class UpdateUserStatusResponse(BaseModel):
     success: bool
     old_status: str
     new_status: str
+    message: str
+
+
+class SendUserMessageRequest(BaseModel):
+    """Request to send a direct Telegram message to a user (parity with the
+    bot's «Отправить сообщение» action in the admin user card)."""
+
+    # 4096 — лимит Telegram на текст сообщения
+    text: str = Field(..., min_length=1, max_length=4096, description='Message text (HTML)')
+
+
+class SendUserMessageResponse(BaseModel):
+    """Response after sending a direct message."""
+
+    success: bool
     message: str
 
 
@@ -402,6 +489,22 @@ class AssignReferrerResponse(BaseModel):
     message: str
 
 
+class RemoveReferrerResponse(BaseModel):
+    """Response after removing a user's referrer."""
+
+    success: bool
+    old_referrer_id: int | None = None
+    message: str
+
+
+class RemoveReferralResponse(BaseModel):
+    """Response after removing a specific referral from a user."""
+
+    success: bool
+    removed_user_id: int
+    message: str
+
+
 class DeviceInfo(BaseModel):
     """Individual device info."""
 
@@ -409,6 +512,9 @@ class DeviceInfo(BaseModel):
     platform: str = ''
     device_model: str = ''
     created_at: str | None = None
+    # User-set local alias (per `user_device_aliases`). None when the user
+    # hasn't renamed this device — clients fall back to platform/device_model.
+    local_name: str | None = None
 
 
 class UserDevicesResponse(BaseModel):
@@ -425,6 +531,19 @@ class DeleteDeviceResponse(BaseModel):
     success: bool
     message: str
     deleted_hwid: str | None = None
+
+
+class RenameDeviceRequest(BaseModel):
+    """Admin payload for `PATCH /admin/users/{user_id}/devices/{hwid}/name`."""
+
+    name: str | None = None
+
+
+class RenameDeviceResponse(BaseModel):
+    """Result of a device-rename operation. `local_name` is None when cleared."""
+
+    hwid: str
+    local_name: str | None = None
 
 
 class ResetDevicesResponse(BaseModel):
@@ -562,7 +681,7 @@ class UserAvailableTariffsResponse(BaseModel):
 class PanelUserInfo(BaseModel):
     """User info from panel."""
 
-    uuid: str | None = None
+    id: int
     short_uuid: str | None = None
     username: str | None = None
     status: str | None = None
@@ -610,7 +729,7 @@ class SyncToPanelResponse(BaseModel):
     success: bool
     message: str
     action: str = ''  # created, updated, no_changes
-    panel_uuid: str | None = None
+    panel_user_id: int | None = None
     changes: dict[str, Any] = {}
     errors: list[str] = []
 
@@ -620,8 +739,12 @@ class PanelSyncStatusResponse(BaseModel):
 
     user_id: int
     telegram_id: int | None = None
-    remnawave_uuid: str | None = None
+    remnawave_id: int | None = None
     last_sync: datetime | None = None
+
+    # Multi-tariff context
+    subscription_id: int | None = None
+    subscription_tariff_name: str | None = None
 
     # Bot data
     bot_subscription_status: str | None = None
@@ -639,6 +762,12 @@ class PanelSyncStatusResponse(BaseModel):
     panel_traffic_used_gb: float = 0
     panel_device_limit: int = 0
     panel_squads: list[str] = []
+
+    # Открытый временный доступ (грейс): пока он идёт, панель намеренно держит
+    # его настройки — дату, статус, лимит и сквад. Бот их не перенимает, поэтому
+    # расхождением это не считается.
+    grace_open: bool = False
+    grace_until: datetime | None = None
 
     # Differences
     has_differences: bool = False
@@ -678,6 +807,9 @@ class ResetTrialResponse(BaseModel):
     message: str
     subscription_deleted: bool = False
     has_used_trial_reset: bool = False
+    # Главный ответ на вопрос админа: сможет ли человек взять триал после нажатия.
+    # Без него кнопка сообщала «успешно» даже когда ничего не менялось.
+    trial_available: bool = False
 
 
 class ResetSubscriptionRequest(BaseModel):

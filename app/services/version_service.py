@@ -7,6 +7,7 @@ import structlog
 from packaging import version
 
 from app.config import settings
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -38,7 +39,7 @@ class VersionInfo:
 
     @property
     def formatted_date(self) -> str:
-        return self.published_at.strftime('%d.%m.%Y %H:%M')
+        return format_local_datetime(self.published_at, '%d.%m.%Y %H:%M')
 
     @property
     def short_description(self) -> str:
@@ -242,7 +243,7 @@ class VersionService:
             logger.info('Проверка версий отключена')
             return
 
-        logger.info('Запуск периодической проверки обновлений для', repo=self.repo)
+        logger.info('Запуск периодической проверки обновлений репозитория', repo=self.repo)
         logger.info('Текущая версия', current_version=self.current_version)
 
         while True:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import Awaitable, Callable
@@ -25,9 +26,16 @@ from app.services.admin_notification_service import AdminNotificationService
 from app.services.pricing_engine import RenewalPricing
 from app.services.remnawave_service import RemnaWaveConfigurationError
 from app.services.subscription_service import SubscriptionService
+from app.utils.pricing_utils import calculate_price_per_month
 
 
 logger = structlog.get_logger(__name__)
+
+# Cap the inline RemnaWave panel sync during renewal. The charge + extension are
+# committed before the sync, so a slow/unavailable panel must not hold the request
+# open (the cabinet pay button is bound to it and would spin after delivery). Past
+# this budget the sync is deferred to remnawave_retry_queue.
+REMNAWAVE_SYNC_TIMEOUT = 10.0
 
 
 class SubscriptionRenewalError(Exception):
@@ -100,8 +108,8 @@ class SubscriptionRenewalPricing:
 
         # per_month
         per_month = int(payload.get('per_month', 0) or 0)
-        if not per_month and months > 0:
-            per_month = final_total // months
+        if not per_month and period_days > 0:
+            per_month = calculate_price_per_month(final_total, period_days)
 
         # server_ids: legacy at top level, RenewalPricing in breakdown
         server_ids = list(payload.get('server_ids') or breakdown.get('server_ids') or [])
@@ -494,23 +502,30 @@ class SubscriptionRenewalService:
                 )
 
         reset_traffic = was_expired and settings.RESET_TRAFFIC_ON_PAYMENT
+        reset_devices = settings.RESET_DEVICES_ON_RENEWAL
         subscription_service = SubscriptionService()
         try:
             await db.refresh(user)
-            if getattr(user, 'remnawave_uuid', None):
-                await subscription_service.update_remnawave_user(
-                    db,
-                    subscription_after,
-                    reset_traffic=reset_traffic,
-                    reset_reason='subscription renewal',
-                )
+            if settings.is_multi_tariff_enabled():
+                _should_create = subscription_after.remnawave_id is None
             else:
-                await subscription_service.create_remnawave_user(
-                    db,
-                    subscription_after,
-                    reset_traffic=reset_traffic,
-                    reset_reason='subscription renewal',
-                )
+                _should_create = getattr(user, 'remnawave_id', None) is None
+
+            async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
+                if _should_create:
+                    await subscription_service.create_remnawave_user(
+                        db,
+                        subscription_after,
+                        reset_traffic=reset_traffic,
+                        reset_reason='subscription renewal',
+                    )
+                else:
+                    await subscription_service.update_remnawave_user(
+                        db,
+                        subscription_after,
+                        reset_traffic=reset_traffic,
+                        reset_reason='subscription renewal',
+                    )
         except RemnaWaveConfigurationError as error:  # pragma: no cover - configuration issues
             logger.warning('RemnaWave update skipped', error=error)
         except Exception as error:  # pragma: no cover - defensive logging
@@ -519,6 +534,47 @@ class SubscriptionRenewalService:
                 subscription_after_id=subscription_after.id,
                 error=error,
             )
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            remnawave_retry_queue.enqueue(
+                subscription_id=subscription_after.id,
+                user_id=subscription_after.user_id,
+                action='create' if getattr(subscription_after, 'remnawave_id', None) is None else 'update',
+            )
+
+        # Сброс привязанных устройств при продлении (если включено)
+        if reset_devices:
+            try:
+                from app.services.remnawave_service import RemnaWaveService
+
+                rw_service = RemnaWaveService()
+                _panel_user_id = (
+                    getattr(subscription_after, 'remnawave_id', None)
+                    if settings.is_multi_tariff_enabled()
+                    else getattr(user, 'remnawave_id', None)
+                )
+                if _panel_user_id is not None:
+                    async with rw_service.get_api_client() as api:
+                        # reset_user_devices не бросает при отказе панели — ловит
+                        # внутри и возвращает False. Это самый частый вызов сброса
+                        # (каждое автопродление), и безусловный success-лог тут
+                        # означал бы, что поддержка закроет тикет «не могу
+                        # добавить устройство» как ошибку пользователя.
+                        _devices_reset = await api.reset_user_devices(_panel_user_id)
+                    if _devices_reset:
+                        logger.info(
+                            'Devices reset on renewal',
+                            subscription_id=subscription_after.id,
+                            user_id=user.id,
+                        )
+                    else:
+                        logger.error(
+                            'Failed to reset devices on renewal',
+                            subscription_id=subscription_after.id,
+                            user_id=user.id,
+                        )
+            except Exception as error:
+                logger.warning('Failed to reset devices on renewal', error=error, exc_info=True)
 
         transaction: Transaction | None = None
         try:

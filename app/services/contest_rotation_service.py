@@ -241,7 +241,7 @@ class ContestRotationService:
         try:
             return ZoneInfo(tz_name)
         except Exception:
-            logger.warning('Не удалось загрузить TZ , используем UTC', tz_name=tz_name)
+            logger.warning('Не удалось загрузить часовой пояс — используем UTC', tz_name=tz_name)
             return ZoneInfo('UTC')
 
     def _build_payload_for_template(self, tpl: ContestTemplate) -> dict:
@@ -301,9 +301,24 @@ class ContestRotationService:
         if not channel_id:
             return
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text='🎲 Играть', callback_data='contests_menu')]]
-        )
+        # A channel post button can't open a user's private chat or show a
+        # personal menu via callback_data — use a deep link to the bot instead,
+        # which opens the contests menu in the user's private chat.
+        bot_username = settings.get_bot_username()
+        if not bot_username:
+            try:
+                me = await self.bot.get_me()
+                bot_username = me.username
+            except Exception:
+                bot_username = None
+
+        keyboard = None
+        if bot_username:
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text='🎲 Играть', url=f'https://t.me/{bot_username}?start=contests')]
+                ]
+            )
 
         try:
             await self.bot.send_message(
@@ -317,7 +332,7 @@ class ContestRotationService:
 
     async def _broadcast_to_users(self, text: str) -> None:
         """Отправляет анонс всем пользователям с активной/триальной подпиской."""
-        if not self.bot:
+        if not self.bot or not settings.is_notifications_enabled():
             return
 
         try:
@@ -344,6 +359,10 @@ class ContestRotationService:
                     # Skip email-only users (no telegram_id)
                     if not u.telegram_id:
                         return
+                    from app.utils.notification_prefs import is_promo_offers_enabled
+
+                    if not is_promo_offers_enabled(u):
+                        return
                     async with semaphore:
                         try:
                             await self.bot.send_message(
@@ -362,7 +381,7 @@ class ContestRotationService:
 
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            logger.info('Анонс игр: отправлено ошибок', sent=sent, failed=failed)
+            logger.info('Анонс игр разослан', sent=sent, failed=failed)
         except Exception as exc:
             logger.error('Ошибка рассылки анонса игр пользователям', exc=exc)
 

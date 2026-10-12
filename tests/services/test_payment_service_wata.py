@@ -14,7 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import app.services.payment_service as payment_service_module
+import app.database.crud.wata as wata_crud_module
 from app.config import settings
 from app.services.payment_service import PaymentService
 from app.services.wata_service import WataService
@@ -30,6 +30,9 @@ class DummySession:
         return None
 
     async def refresh(self, *_: Any) -> None:  # pragma: no cover - no logic required
+        return None
+
+    async def flush(self) -> None:  # pragma: no cover - no logic required
         return None
 
 
@@ -117,7 +120,7 @@ async def test_create_wata_payment_success(monkeypatch: pytest.MonkeyPatch) -> N
         captured_args.update(kwargs)
         return DummyLocalPayment(payment_id=777)
 
-    monkeypatch.setattr(payment_service_module, 'create_wata_payment', fake_create_wata_payment, raising=False)
+    monkeypatch.setattr('app.services.payment_service.create_wata_payment', fake_create_wata_payment, raising=False)
     monkeypatch.setattr(settings, 'WATA_MIN_AMOUNT_KOPEKS', 5000, raising=False)
     monkeypatch.setattr(settings, 'WATA_MAX_AMOUNT_KOPEKS', 500_000, raising=False)
 
@@ -219,21 +222,28 @@ async def test_process_wata_webhook_updates_status(monkeypatch: pytest.MonkeyPat
         return payment
 
     monkeypatch.setattr(
-        payment_service_module,
-        'get_wata_payment_by_order_id',
+        'app.services.payment_service.get_wata_payment_by_order_id',
         fake_get_by_order_id,
         raising=False,
     )
     monkeypatch.setattr(
-        payment_service_module,
-        'get_wata_payment_by_link_id',
+        'app.services.payment_service.get_wata_payment_by_link_id',
         fake_get_by_link_id,
         raising=False,
     )
     monkeypatch.setattr(
-        payment_service_module,
-        'update_wata_payment_status',
+        'app.services.payment_service.update_wata_payment_status',
         fake_update_status,
+        raising=False,
+    )
+
+    async def fake_lock(_db: Any, _payment_id: int) -> DummyWataPayment:
+        return payment
+
+    monkeypatch.setattr(
+        wata_crud_module,
+        'get_wata_payment_by_id_for_update',
+        fake_lock,
         raising=False,
     )
 
@@ -291,20 +301,17 @@ async def test_process_wata_webhook_finalizes_paid(monkeypatch: pytest.MonkeyPat
         return payment_arg
 
     monkeypatch.setattr(
-        payment_service_module,
-        'get_wata_payment_by_order_id',
+        'app.services.payment_service.get_wata_payment_by_order_id',
         fake_get_by_order_id,
         raising=False,
     )
     monkeypatch.setattr(
-        payment_service_module,
-        'get_wata_payment_by_link_id',
+        'app.services.payment_service.get_wata_payment_by_link_id',
         lambda *args, **kwargs: None,
         raising=False,
     )
     monkeypatch.setattr(
-        payment_service_module,
-        'update_wata_payment_status',
+        'app.services.payment_service.update_wata_payment_status',
         fake_update_status,
         raising=False,
     )
@@ -312,6 +319,16 @@ async def test_process_wata_webhook_finalizes_paid(monkeypatch: pytest.MonkeyPat
         service,
         '_finalize_wata_payment',
         fake_finalize,
+        raising=False,
+    )
+
+    async def fake_lock(_db: Any, _payment_id: int) -> DummyWataPayment:
+        return payment
+
+    monkeypatch.setattr(
+        wata_crud_module,
+        'get_wata_payment_by_id_for_update',
+        fake_lock,
         raising=False,
     )
 
@@ -346,20 +363,17 @@ async def test_process_wata_webhook_returns_false_when_payment_missing(
         pytest.fail('update_wata_payment_status should not be called')
 
     monkeypatch.setattr(
-        payment_service_module,
-        'get_wata_payment_by_order_id',
+        'app.services.payment_service.get_wata_payment_by_order_id',
         fake_get_by_order_id,
         raising=False,
     )
     monkeypatch.setattr(
-        payment_service_module,
-        'get_wata_payment_by_link_id',
+        'app.services.payment_service.get_wata_payment_by_link_id',
         fake_get_by_link_id,
         raising=False,
     )
     monkeypatch.setattr(
-        payment_service_module,
-        'update_wata_payment_status',
+        'app.services.payment_service.update_wata_payment_status',
         fail_update,
         raising=False,
     )

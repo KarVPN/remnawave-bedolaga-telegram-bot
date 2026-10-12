@@ -1,4 +1,3 @@
-import redis.asyncio as redis
 import structlog
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -13,6 +12,7 @@ from app.handlers import (
     polls as user_polls,
     promocode,
     referral,
+    referral_settings,
     server_status,
     simple_subscription,
     start,
@@ -28,12 +28,14 @@ from app.handlers.admin import (
     bulk_ban as admin_bulk_ban,
     campaigns as admin_campaigns,
     contests as admin_contests,
+    coupons as admin_coupons,
     daily_contests as admin_daily_contests,
     faq as admin_faq,
     main as admin_main,
     maintenance as admin_maintenance,
     messages as admin_messages,
     monitoring as admin_monitoring,
+    overpay_certificate as admin_overpay_certificate,
     payments as admin_payments,
     polls as admin_polls,
     pricing as admin_pricing,
@@ -42,6 +44,8 @@ from app.handlers.admin import (
     promo_offers as admin_promo_offers,
     promocodes as admin_promocodes,
     public_offer as admin_public_offer,
+    quick_amounts as admin_quick_amounts,
+    referral_levels as admin_referral_levels,
     referrals as admin_referrals,
     remnawave as admin_remnawave,
     reports as admin_reports,
@@ -62,11 +66,13 @@ from app.handlers.admin import (
 from app.handlers.channel_member import register_handlers as register_channel_member_handlers
 from app.handlers.gift_activation import register_handlers as register_gift_activation_handlers
 from app.handlers.stars_payments import register_stars_handlers
+from app.handlers.subscription import register_gift_handlers
 from app.middlewares.auth import AuthMiddleware
 from app.middlewares.blacklist import BlacklistMiddleware
 from app.middlewares.button_stats import ButtonStatsMiddleware
 from app.middlewares.chat_type_filter import ChatTypeFilterMiddleware
 from app.middlewares.context_binding import ContextVarsMiddleware
+from app.middlewares.display_name_restriction import DisplayNameRestrictionMiddleware
 from app.middlewares.global_error import GlobalErrorMiddleware
 from app.middlewares.logging import LoggingMiddleware
 from app.middlewares.maintenance import MaintenanceMiddleware
@@ -75,6 +81,8 @@ from app.middlewares.throttling import ThrottlingMiddleware
 from app.services.maintenance_service import maintenance_service
 from app.utils.cache import cache
 from app.utils.message_patch import patch_message_methods
+from app.utils.redis_client import create_redis
+from app.utils.rich_menu import forget_live_menu_on_callback
 
 
 patch_message_methods()
@@ -100,6 +108,11 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
 
     bot = create_bot()
 
+    # Token-authoritative username so gift/referral/deep links never point at a stale bot.
+    from app.utils.bot_identity import sync_bot_username
+
+    await sync_bot_username(bot)
+
     proxy_url = settings.get_proxy_url()
     nalogo_proxy_url = settings.get_nalogo_proxy_url()
 
@@ -116,7 +129,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     logger.info('Бот установлен в maintenance_service')
 
     try:
-        redis_client = redis.from_url(settings.REDIS_URL)
+        redis_client = create_redis()
         await redis_client.ping()
         storage = RedisStorage(redis_client)
         logger.info('Подключено к Redis для FSM storage')
@@ -129,6 +142,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
 
     dp.message.middleware(ContextVarsMiddleware())
     dp.callback_query.middleware(ContextVarsMiddleware())
+    dp.callback_query.middleware(forget_live_menu_on_callback)
     dp.pre_checkout_query.middleware(ContextVarsMiddleware())
     chat_type_filter = ChatTypeFilterMiddleware()
     dp.message.middleware(chat_type_filter)
@@ -148,10 +162,13 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.middleware(throttling_middleware)
     dp.callback_query.middleware(throttling_middleware)
 
-    # Middleware для автоматического логирования кликов по кнопкам
-    if settings.MENU_LAYOUT_ENABLED:
+    # Middleware для автоматического логирования кликов по кнопкам и команд:
+    # статистика конструктора меню (MENU_LAYOUT_ENABLED) и/или лог действий
+    # юзера для таймлайна активности (USER_ACTION_LOG_ENABLED).
+    if settings.MENU_LAYOUT_ENABLED or settings.USER_ACTION_LOG_ENABLED:
         button_stats_middleware = ButtonStatsMiddleware()
         dp.callback_query.middleware(button_stats_middleware)
+        dp.message.middleware(button_stats_middleware)
         logger.info('📊 ButtonStatsMiddleware активирован')
 
     from app.middlewares.channel_checker import ChannelCheckerMiddleware
@@ -162,14 +179,20 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     dp.message.middleware(AuthMiddleware())
     dp.callback_query.middleware(AuthMiddleware())
     dp.pre_checkout_query.middleware(AuthMiddleware())
+    display_name_restriction = DisplayNameRestrictionMiddleware()
+    dp.message.middleware(display_name_restriction)
+    dp.callback_query.middleware(display_name_restriction)
     dp.message.middleware(SubscriptionStatusMiddleware())
     dp.callback_query.middleware(SubscriptionStatusMiddleware())
+    dp.pre_checkout_query.middleware(SubscriptionStatusMiddleware())
     start.register_handlers(dp)
     menu.register_handlers(dp)
     subscription.register_handlers(dp)
+    register_gift_handlers(dp)
     balance.register_balance_handlers(dp)
     promocode.register_handlers(dp)
     referral.register_handlers(dp)
+    referral_settings.register_handlers(dp)
     support.register_handlers(dp)
     server_status.register_handlers(dp)
     tickets.register_handlers(dp)
@@ -181,12 +204,14 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     admin_messages.register_handlers(dp)
     admin_monitoring.register_handlers(dp)
     admin_referrals.register_handlers(dp)
+    admin_referral_levels.register_handlers(dp)
     admin_rules.register_handlers(dp)
     admin_remnawave.register_handlers(dp)
     admin_statistics.register_handlers(dp)
     admin_polls.register_handlers(dp)
     admin_promo_groups.register_handlers(dp)
     admin_campaigns.register_handlers(dp)
+    admin_coupons.register_handlers(dp)
     admin_contests.register_handlers(dp)
     admin_daily_contests.register_handlers(dp)
     admin_promo_offers.register_handlers(dp)
@@ -210,6 +235,8 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     admin_blacklist.register_blacklist_handlers(dp)
     admin_blocked_users.register_handlers(dp)
     admin_required_channels.register_handlers(dp)
+    admin_quick_amounts.register_handlers(dp)
+    admin_overpay_certificate.register_handlers(dp)
     register_channel_member_handlers(dp)
     register_gift_activation_handlers(dp)
     common.register_handlers(dp)
@@ -275,12 +302,28 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
         except Exception as e:
             logger.warning('Failed to load menu layout cache', error=e)
 
+    try:
+        from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+        await remnawave_retry_queue.start()
+        logger.info('RemnaWave retry queue запущен')
+    except Exception as e:
+        logger.error('Ошибка запуска RemnaWave retry queue', error=e)
+
     logger.info('Бот успешно настроен')
 
     return bot, dp
 
 
 async def shutdown_bot():
+    try:
+        from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+        await remnawave_retry_queue.stop()
+        logger.info('RemnaWave retry queue остановлен')
+    except Exception as e:
+        logger.error('Ошибка остановки RemnaWave retry queue', error=e)
+
     try:
         await maintenance_service.stop_monitoring()
         logger.info('Мониторинг техработ остановлен')

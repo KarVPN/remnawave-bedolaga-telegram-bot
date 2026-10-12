@@ -6,11 +6,16 @@ from aiogram import Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.models import User
+from app.handlers.admin.display_mode_button import cycle_display_mode_setting
 from app.localization.texts import get_texts
 from app.services.public_offer_service import PublicOfferService
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
+from app.utils.display_mode import display_mode_label
+from app.utils.telegram_html import stored_html_to_telegram_pages
+from app.utils.timezone import format_local_datetime
 from app.utils.validators import get_html_help_text, validate_html_tags
 
 
@@ -21,7 +26,7 @@ def _format_timestamp(value: datetime | None) -> str:
     if not value:
         return ''
     try:
-        return value.strftime('%d.%m.%Y %H:%M')
+        return format_local_datetime(value, '%d.%m.%Y %H:%M')
     except Exception:
         return ''
 
@@ -162,6 +167,18 @@ async def _build_overview(
         [
             types.InlineKeyboardButton(
                 text=texts.t(
+                    'ADMIN_PUBLIC_OFFER_DISPLAY_MODE_BUTTON',
+                    '👁 Отображение: {mode}',
+                ).format(mode=display_mode_label(settings.PUBLIC_OFFER_DISPLAY_MODE)),
+                callback_data='admin_public_offer_display_mode',
+            )
+        ]
+    )
+
+    buttons.append(
+        [
+            types.InlineKeyboardButton(
+                text=texts.t(
                     'ADMIN_PUBLIC_OFFER_HTML_HELP',
                     'ℹ️ HTML помощь',
                 ),
@@ -224,6 +241,31 @@ async def toggle_public_offer(
         reply_markup=markup,
     )
     await callback.answer(status_message)
+
+
+@admin_required
+@error_handler
+async def cycle_public_offer_display_mode(
+    callback: types.CallbackQuery,
+    db_user: User,
+    db: AsyncSession,
+):
+    texts = get_texts(db_user.language)
+    new_mode = await cycle_display_mode_setting(callback, db, 'PUBLIC_OFFER_DISPLAY_MODE')
+    if new_mode is None:
+        return
+
+    overview_text, markup, _ = await _build_overview(db_user, db)
+    await callback.message.edit_text(
+        overview_text,
+        reply_markup=markup,
+    )
+    await callback.answer(
+        texts.t(
+            'ADMIN_DISPLAY_MODE_CHANGED',
+            'Отображение: {mode}',
+        ).format(mode=display_mode_label(new_mode))
+    )
 
 
 @admin_required
@@ -399,12 +441,9 @@ async def view_public_offer(
         )
         return
 
-    content = offer.content.strip()
+    # Как и на пользовательском экране: сырой HTML с <p> Telegram не разберёт.
     max_length = 3800
-    pages = PublicOfferService.split_content_into_pages(
-        content,
-        max_length=max_length,
-    )
+    pages = stored_html_to_telegram_pages(offer.content, max_length=max_length)
 
     if not pages:
         await callback.answer(
@@ -516,6 +555,10 @@ def register_handlers(dp: Dispatcher) -> None:
     dp.callback_query.register(
         toggle_public_offer,
         F.data == 'admin_public_offer_toggle',
+    )
+    dp.callback_query.register(
+        cycle_public_offer_display_mode,
+        F.data == 'admin_public_offer_display_mode',
     )
     dp.callback_query.register(
         start_edit_public_offer,

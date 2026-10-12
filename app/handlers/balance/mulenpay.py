@@ -8,10 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import User
 from app.keyboards.inline import get_back_keyboard
+from app.keyboards.topup_amounts import get_topup_amount_keyboard
 from app.localization.texts import get_texts
 from app.services.payment_service import PaymentService
 from app.states import BalanceStates
 from app.utils.decorators import error_handler
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -65,7 +67,7 @@ async def start_mulenpay_payment(
         mulenpay_name_html=mulenpay_name_html,
     )
 
-    keyboard = get_back_keyboard(db_user.language)
+    keyboard = await get_topup_amount_keyboard('mulenpay', db_user.language, back_callback='back_to_menu')
 
     await callback.message.edit_text(
         message_text,
@@ -119,14 +121,16 @@ async def process_mulenpay_payment_amount(
 
     if amount_kopeks < settings.MULENPAY_MIN_AMOUNT_KOPEKS:
         await message.answer(
-            f'Минимальная сумма пополнения: {settings.format_price(settings.MULENPAY_MIN_AMOUNT_KOPEKS)}',
+            f'Минимальная сумма пополнения: {settings.format_price(settings.MULENPAY_MIN_AMOUNT_KOPEKS)}\n\n'
+            'Отправьте новую сумму пополнения числом в сообщении.',
             reply_markup=get_back_keyboard(db_user.language),
         )
         return
 
     if amount_kopeks > settings.MULENPAY_MAX_AMOUNT_KOPEKS:
         await message.answer(
-            f'Максимальная сумма пополнения: {settings.format_price(settings.MULENPAY_MAX_AMOUNT_KOPEKS)}',
+            f'Максимальная сумма пополнения: {settings.format_price(settings.MULENPAY_MAX_AMOUNT_KOPEKS)}\n\n'
+            'Отправьте новую сумму пополнения числом в сообщении.',
             reply_markup=get_back_keyboard(db_user.language),
         )
         return
@@ -250,7 +254,7 @@ async def process_mulenpay_payment_amount(
         await state.clear()
 
         logger.info(
-            'Создан платеж для пользователя : ₽, ID',
+            'Создан MulenPay платеж',
             mulenpay_name=mulenpay_name,
             telegram_id=db_user.telegram_id,
             amount_rubles=amount_rubles,
@@ -299,7 +303,7 @@ async def check_mulenpay_payment_status(callback: types.CallbackQuery, db: Async
             f'🆔 ID: {payment.mulen_payment_id or payment.id}\n',
             f'💰 Сумма: {settings.format_price(payment.amount_kopeks)}\n',
             f'📊 Статус: {emoji} {status_text}\n',
-            f'📅 Создан: {payment.created_at.strftime("%d.%m.%Y %H:%M")}\n',
+            f'📅 Создан: {format_local_datetime(payment.created_at, "%d.%m.%Y %H:%M")}\n',
         ]
 
         if payment.is_paid:

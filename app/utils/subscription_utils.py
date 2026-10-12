@@ -1,4 +1,3 @@
-from datetime import UTC, datetime
 from urllib.parse import quote, urlparse, urlunparse
 
 import structlog
@@ -12,77 +11,12 @@ from app.database.models import Subscription
 logger = structlog.get_logger(__name__)
 
 
-async def ensure_single_subscription(db: AsyncSession, user_id: int) -> Subscription | None:
-    result = await db.execute(
-        select(Subscription).where(Subscription.user_id == user_id).order_by(Subscription.created_at.desc())
-    )
-    subscriptions = result.scalars().all()
-
-    if len(subscriptions) <= 1:
-        return subscriptions[0] if subscriptions else None
-
-    latest_subscription = subscriptions[0]
-    old_subscriptions = subscriptions[1:]
-
-    logger.warning(
-        '🚨 Обнаружено подписок у пользователя . Удаляем старых.',
-        subscriptions_count=len(subscriptions),
-        user_id=user_id,
-        old_subscriptions_count=len(old_subscriptions),
-    )
-
-    for old_sub in old_subscriptions:
-        await db.delete(old_sub)
-        logger.info('🗑️ Удалена подписка ID от', old_sub_id=old_sub.id, created_at=old_sub.created_at)
-
-    await db.commit()
-    await db.refresh(latest_subscription)
-
-    logger.info(
-        '✅ Оставлена подписка ID от',
-        latest_subscription_id=latest_subscription.id,
-        created_at=latest_subscription.created_at,
-    )
-    return latest_subscription
-
-
-async def update_or_create_subscription(db: AsyncSession, user_id: int, **subscription_data) -> Subscription:
-    existing_subscription = await ensure_single_subscription(db, user_id)
-
-    if existing_subscription:
-        for key, value in subscription_data.items():
-            if hasattr(existing_subscription, key):
-                setattr(existing_subscription, key, value)
-
-        existing_subscription.updated_at = datetime.now(UTC)
-        await db.commit()
-        await db.refresh(existing_subscription)
-
-        logger.info('🔄 Обновлена существующая подписка ID', existing_subscription_id=existing_subscription.id)
-        return existing_subscription
-
-    subscription_defaults = dict(subscription_data)
-    autopay_enabled = subscription_defaults.pop('autopay_enabled', None)
-    autopay_days_before = subscription_defaults.pop('autopay_days_before', None)
-
-    new_subscription = Subscription(
-        user_id=user_id,
-        autopay_enabled=(settings.is_autopay_enabled_by_default() if autopay_enabled is None else autopay_enabled),
-        autopay_days_before=(
-            settings.DEFAULT_AUTOPAY_DAYS_BEFORE if autopay_days_before is None else autopay_days_before
-        ),
-        **subscription_defaults,
-    )
-
-    db.add(new_subscription)
-    await db.commit()
-    await db.refresh(new_subscription)
-
-    logger.info('🆕 Создана новая подписка ID', new_subscription_id=new_subscription.id)
-    return new_subscription
-
-
 async def cleanup_duplicate_subscriptions(db: AsyncSession) -> int:
+    # В multi-tariff режиме несколько подписок у пользователя — это нормально
+    if settings.is_multi_tariff_enabled():
+        logger.info('♻️ cleanup_duplicate_subscriptions пропущена: multi-tariff режим')
+        return 0
+
     result = await db.execute(
         select(Subscription.user_id).group_by(Subscription.user_id).having(func.count(Subscription.id) > 1)
     )
@@ -100,7 +34,7 @@ async def cleanup_duplicate_subscriptions(db: AsyncSession) -> int:
             await db.delete(old_subscription)
             total_deleted += 1
             logger.info(
-                '🗑️ Удалена дублирующаяся подписка ID пользователя',
+                '🗑️ Удалена дублирующаяся подписка',
                 old_subscription_id=old_subscription.id,
                 user_id=user_id,
             )
@@ -170,8 +104,63 @@ def convert_subscription_link_to_happ_scheme(subscription_link: str | None) -> s
     return urlunparse(parsed_link._replace(scheme='happ'))
 
 
+def device_limit_needs_heal(value: int | None) -> bool:
+    """Return True if a stored ``device_limit`` is structurally invalid.
+
+    ``0`` is a legitimate "unlimited devices" state synced from RemnaWave
+    (see :func:`coerce_panel_device_limit`) and must NOT be healed back to
+    ``1`` — that was the original sync bug (every heal pass reverted
+    unlimited-device subscriptions). Only ``None`` and negative values are
+    truly broken.
+    """
+    return value is None or value < 0
+
+
+def coerce_panel_device_limit(value: object, default: int = 1) -> int:
+    """Normalize ``hwidDeviceLimit`` from a RemnaWave panel response.
+
+    The panel returns ``0`` to signal HWID limit disabled (unlimited devices).
+    A naive ``value or default`` collapses that ``0`` into the fallback and
+    silently overwrites unlimited-device subscriptions on every sync.
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int) and value >= 0:
+        return value
+    return default
+
+
+def resolve_min_device_limit(tariff: object | None = None) -> int:
+    """Нижняя граница, до которой пользователь может уменьшить лимит устройств.
+
+    По умолчанию (``ALLOW_DEVICES_BELOW_TARIFF_LIMIT=False``) опустить лимит
+    ниже включённого в тариф нельзя: уменьшают почти всегда не ради
+    самоограничения, а чтобы платить меньше — либо промахиваются и потом
+    спрашивают в поддержке, почему устройств меньше, чем положено по тарифу.
+
+    Вне тарифного режима (тариф не передан / у него нет лимита) граница — 1,
+    как и раньше.
+    """
+    from app.config import settings
+
+    if settings.ALLOW_DEVICES_BELOW_TARIFF_LIMIT:
+        return 1
+
+    tariff_devices = getattr(tariff, 'device_limit', None) if tariff is not None else None
+    try:
+        return max(1, int(tariff_devices or 0))
+    except (TypeError, ValueError):
+        return 1
+
+
 def resolve_hwid_device_limit(subscription: Subscription | None) -> int | None:
-    """Return a device limit value for RemnaWave payloads when selection is enabled."""
+    """Return a device limit value for RemnaWave payloads when selection is enabled.
+
+    Ноль или пусто в ``device_limit`` — «без ограничения» (HWID выключен): это
+    штатное состояние подписки, а не ошибка, поэтому в панель поле не шлём и
+    пишем об этом только в debug. Полная синхронизация прогоняет через эту
+    функцию каждую подписку — warning здесь превращался в шум на всю базу.
+    """
     import structlog
 
     _logger = structlog.get_logger('resolve_hwid_device_limit')
@@ -194,8 +183,8 @@ def resolve_hwid_device_limit(subscription: Subscription | None) -> int | None:
 
     limit = getattr(subscription, 'device_limit', None)
     if limit is None or limit <= 0:
-        _logger.warning(
-            'device_limit is None or <= 0, returning None',
+        _logger.debug(
+            'device_limit не задан (без ограничения) — hwidDeviceLimit в панель не шлём',
             device_limit=limit,
             subscription_id=getattr(subscription, 'id', None),
         )
@@ -212,39 +201,22 @@ def resolve_hwid_device_limit_for_payload(
     When device selection is disabled and no explicit override is configured,
     RemnaWave should continue receiving the subscription's stored limit so the
     external panel stays aligned with the bot configuration.
+
+    Раньше здесь был «запасной» путь, читавший тот же ``device_limit`` ещё раз
+    и писавший второй warning на ту же подписку; значения он дать не мог.
     """
     import structlog
 
     _logger = structlog.get_logger('resolve_hwid_device_limit')
 
     resolved_limit = resolve_hwid_device_limit(subscription)
-
     if resolved_limit is not None:
         _logger.info(
             'hwid_device_limit resolved',
             resolved_limit=resolved_limit,
             subscription_id=getattr(subscription, 'id', None),
         )
-        return resolved_limit
-
-    if subscription is None:
-        return None
-
-    fallback_limit = getattr(subscription, 'device_limit', None)
-    if fallback_limit is None or fallback_limit <= 0:
-        _logger.warning(
-            'fallback device_limit is None or <= 0, NOT sending hwidDeviceLimit to RemnaWave',
-            fallback_limit=fallback_limit,
-            subscription_id=getattr(subscription, 'id', None),
-        )
-        return None
-
-    _logger.info(
-        'using fallback device_limit',
-        fallback_limit=fallback_limit,
-        subscription_id=getattr(subscription, 'id', None),
-    )
-    return fallback_limit
+    return resolved_limit
 
 
 def resolve_simple_subscription_device_limit() -> int:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -96,7 +97,7 @@ class Pal24Client:
                     payload = await response.json(content_type=None)
                 except aiohttp.ContentTypeError:
                     text_body = await response.text()
-                    logger.error('Pal24 API returned non-JSON response for', endpoint=endpoint, text_body=text_body)
+                    logger.error('Pal24 API returned non-JSON response', endpoint=endpoint, text_body=text_body)
                     raise Pal24APIError(f'Pal24 API returned non-JSON response: {text_body}') from None
 
                 result = Pal24Response.from_payload(payload, status)
@@ -107,10 +108,10 @@ class Pal24Client:
                 return result
 
         except TimeoutError as error:
-            logger.error('Pal24 API request timeout for', endpoint=endpoint, error=error)
+            logger.error('Pal24 API request timeout', endpoint=endpoint, error=error)
             raise Pal24APIError(f'Pal24 API request timeout for {endpoint}') from error
         except aiohttp.ClientError as error:
-            logger.error('Pal24 API client error for', endpoint=endpoint, error=error)
+            logger.error('Pal24 API client error', endpoint=endpoint, error=error)
             raise Pal24APIError(str(error)) from error
 
     # API methods -----------------------------------------------------------------
@@ -194,7 +195,7 @@ class Pal24Client:
         except Pal24APIError:
             logger.error('Pal24 signature verification failed: missing token')
             return False
-        return expected == signature.upper()
+        return hmac.compare_digest(expected, signature.upper())
 
     @staticmethod
     def normalize_amount(amount_kopeks: int) -> Decimal:

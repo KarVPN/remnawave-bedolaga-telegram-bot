@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.database.crud.server_squad import get_random_trial_squad_uuid
+from app.database.crud.server_squad import get_effective_tariff_squad_uuids
 from app.database.crud.subscription import (
     add_subscription_devices,
     add_subscription_squad,
@@ -36,6 +36,10 @@ from ..schemas.subscriptions import (
     SubscriptionSquadRequest,
     SubscriptionTariffResponse,
     SubscriptionTrafficRequest,
+)
+from ._subscription_state import (
+    restore_subscription_state as _restore_subscription_state,
+    snapshot_subscription_state as _snapshot_subscription_state,
 )
 
 
@@ -93,16 +97,16 @@ async def _choose_trial_squads(
         return fallback_squads
 
     try:
-        squad_uuid = await get_random_trial_squad_uuid(db)
+        default_squads = await get_effective_tariff_squad_uuids(db, None)
     except Exception as error:
-        logger.error('Failed to select trial squad', error=error)
-        squad_uuid = None
+        logger.error('Failed to resolve default trial squads', error=error)
+        default_squads = []
 
-    if not squad_uuid:
+    if not default_squads:
         return []
 
-    logger.debug('Selected trial squad for subscription replacement', squad_uuid=squad_uuid)
-    return [squad_uuid]
+    logger.debug('Selected default trial squads for subscription replacement', squad_uuids=default_squads)
+    return default_squads
 
 
 async def _get_subscription(db: AsyncSession, subscription_id: int) -> Subscription:
@@ -158,9 +162,31 @@ async def create_subscription(
     _: Any = Security(require_api_token),
     db: AsyncSession = Depends(get_db_session),
 ) -> SubscriptionResponse:
-    existing = await get_subscription_by_user_id(db, payload.user_id)
-    if existing and not payload.replace_existing:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'User already has a subscription')
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+        active_subs = await get_active_subscriptions_by_user_id(db, payload.user_id)
+        if payload.replace_existing and payload.subscription_id:
+            from app.database.crud.subscription import get_subscription_by_id
+
+            existing = await get_subscription_by_id(db, payload.subscription_id)
+            if existing and existing.user_id != payload.user_id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Subscription does not belong to this user')
+        elif payload.replace_existing and active_subs:
+            if len(active_subs) == 1:
+                existing = active_subs[0]
+            else:
+                _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+                _pool = _non_daily or active_subs
+                existing = max(_pool, key=lambda s: s.days_left)
+        else:
+            existing = None
+        if active_subs and not payload.replace_existing:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'User already has a subscription')
+    else:
+        existing = await get_subscription_by_user_id(db, payload.user_id)
+        if existing and not payload.replace_existing:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'User already has a subscription')
 
     forced_devices = None
     if not settings.is_devices_selection_enabled():
@@ -240,14 +266,17 @@ async def create_subscription(
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
+        logger.exception(
+            'Failed to sync subscription with Remnawave during create/replace',
+            user_id=payload.user_id,
+            subscription_id=getattr(subscription, 'id', None),
+        )
         try:
             await db.rollback()
         except Exception:
-            logger.exception('Rollback failed after error', e=e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f'Failed to sync with Remnawave: {e!s}'
-        )
+            logger.exception('Rollback failed after subscription sync error')
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail='Failed to sync with Remnawave')
 
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)
@@ -261,7 +290,36 @@ async def extend_subscription_endpoint(
     db: AsyncSession = Depends(get_db_session),
 ) -> SubscriptionResponse:
     subscription = await _get_subscription(db, subscription_id)
-    subscription = await extend_subscription(db, subscription, payload.days)
+    previous_state = _snapshot_subscription_state(subscription)
+
+    try:
+        subscription = await extend_subscription(db, subscription, payload.days)
+
+        subscription_service = SubscriptionService()
+        rem_user = await subscription_service.update_remnawave_user(db, subscription, reset_traffic=False)
+        if not rem_user:
+            rem_user = await subscription_service.create_remnawave_user(db, subscription, reset_traffic=False)
+        if not rem_user:
+            raise ValueError('Failed to update user in Remnawave')
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            'Failed to sync subscription with Remnawave during extend',
+            subscription_id=subscription_id,
+        )
+        try:
+            await _restore_subscription_state(db, subscription_id, previous_state)
+        except Exception:
+            logger.exception(
+                'Failed to rollback subscription %s after Remnawave sync error',
+                subscription_id,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to sync with Remnawave',
+        )
+
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)
 
@@ -284,8 +342,13 @@ async def add_subscription_traffic_endpoint(
     await service.update_remnawave_user(db, subscription)
 
     user = await get_user_by_id(db, subscription.user_id)
-    if user and user.remnawave_uuid and subscription.status == 'active':
-        await service.enable_remnawave_user(user.remnawave_uuid)
+    _enable_panel_user_id = (
+        subscription.remnawave_id
+        if settings.is_multi_tariff_enabled() and subscription.remnawave_id
+        else (user.remnawave_id if user else None)
+    )
+    if user and _enable_panel_user_id and subscription.status == 'active':
+        await service.enable_remnawave_user(_enable_panel_user_id)
 
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)
@@ -309,8 +372,13 @@ async def add_subscription_devices_endpoint(
     await service.update_remnawave_user(db, subscription)
 
     user = await get_user_by_id(db, subscription.user_id)
-    if user and user.remnawave_uuid and subscription.status == 'active':
-        await service.enable_remnawave_user(user.remnawave_uuid)
+    _enable_panel_user_id = (
+        subscription.remnawave_id
+        if settings.is_multi_tariff_enabled() and subscription.remnawave_id
+        else (user.remnawave_id if user else None)
+    )
+    if user and _enable_panel_user_id and subscription.status == 'active':
+        await service.enable_remnawave_user(_enable_panel_user_id)
 
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)
@@ -354,16 +422,23 @@ async def delete_subscription(
     """
     Деактивировать подписку.
     Подписка не удаляется физически, а помечается как DISABLED.
-    Также деактивируется пользователь в RemnaWave, если есть UUID.
+    Также деактивируется пользователь в RemnaWave, если есть панельная идентичность.
     """
     subscription = await _get_subscription(db, subscription_id)
 
     await deactivate_subscription(db, subscription)
 
-    # Деактивируем пользователя в RemnaWave, если есть UUID
-    if subscription.user and subscription.user.remnawave_uuid:
+    # Деактивируем пользователя в RemnaWave (per-subscription id панели в мульти-тарифе)
+    from app.config import settings
+
+    disable_panel_user_id = (
+        subscription.remnawave_id
+        if settings.is_multi_tariff_enabled() and subscription.remnawave_id
+        else (subscription.user.remnawave_id if subscription.user else None)
+    )
+    if disable_panel_user_id:
         subscription_service = SubscriptionService()
-        await subscription_service.disable_remnawave_user(subscription.user.remnawave_uuid)
+        await subscription_service.disable_remnawave_user(disable_panel_user_id)
 
     subscription = await _get_subscription(db, subscription.id)
     return _serialize_subscription(subscription)

@@ -1,16 +1,27 @@
 """FastAPI dependencies for cabinet module."""
 
+from datetime import UTC, datetime
+
 import structlog
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cabinet.auth.registration_access import evaluate_public_registration
 from app.config import settings
 from app.database.crud.user import get_user_by_id
 from app.database.database import AsyncSessionLocal
-from app.database.models import User
+from app.database.models import User, UserStatus
 from app.services.blacklist_service import blacklist_service
 from app.services.maintenance_service import maintenance_service
+from app.services.rbac_bootstrap_service import is_user_admin_by_env
+from app.services.registration_access_service import (
+    RegistrationAccessDecision,
+    RegistrationAccessReason,
+    RegistrationChannel,
+)
+from app.services.user_action_log_service import mark_user_seen, schedule_cabinet_action_log
+from app.services.user_revival_service import NotDeletedError, revive_deleted_user
 
 from .auth.jwt_handler import get_token_payload
 from .auth.telegram_auth import validate_telegram_init_data
@@ -89,51 +100,139 @@ async def get_current_cabinet_user(
             detail='User not found',
         )
 
-    if user.status != 'active':
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='User account is not active',
-        )
-
-    # Defense in depth: cross-validate Telegram identity.
-    # The frontend sends X-Telegram-Init-Data on every request.
-    # If the header is present and cryptographically valid, verify that
-    # the Telegram user ID matches the JWT user's telegram_id.
-    # This prevents cross-account token reuse when Telegram WebView
-    # shares localStorage across accounts on the same device.
+    # Validate Telegram initData first — we need its outcome both for the
+    # cross-account guard (existing) and for the DELETED auto-revival
+    # (new). Reading the header always; verification only when it's
+    # present.
     init_data_raw = request.headers.get('X-Telegram-Init-Data')
+    init_data_telegram_id: int | None = None
+    init_data_matches_user = False
     if init_data_raw and user.telegram_id is not None:
         # Use generous max_age: Telegram Desktop caches initData
+        # (https://github.com/telegramdesktop/tdesktop/issues/28303).
         tg_user = validate_telegram_init_data(init_data_raw, max_age_seconds=86400 * 30)
         if tg_user is None:
             logger.warning(
                 'Telegram initData validation failed but header was present',
                 jwt_user_id=user.id,
             )
-        elif tg_user.get('id') != user.telegram_id:
-            logger.warning(
-                'Telegram identity mismatch: JWT belongs to different user than current Telegram account',
-                jwt_user_id=user.id,
-                jwt_telegram_id=user.telegram_id,
-                init_data_telegram_id=tg_user.get('id'),
-            )
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail='Session belongs to a different Telegram account. Please restart the app.',
-                headers={'WWW-Authenticate': 'Bearer'},
-            )
+        else:
+            init_data_telegram_id = tg_user.get('id')
+            init_data_matches_user = init_data_telegram_id == user.telegram_id
+            if not init_data_matches_user:
+                # Defense in depth: cross-validate Telegram identity.
+                # The frontend sends X-Telegram-Init-Data on every request.
+                # This prevents cross-account token reuse when Telegram
+                # WebView shares localStorage across accounts on the
+                # same device.
+                logger.warning(
+                    'Telegram identity mismatch: JWT belongs to different user than current Telegram account',
+                    jwt_user_id=user.id,
+                    jwt_telegram_id=user.telegram_id,
+                    init_data_telegram_id=init_data_telegram_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail='Session belongs to a different Telegram account. Please restart the app.',
+                    headers={'WWW-Authenticate': 'Bearer'},
+                )
 
-    # Check blacklist
+    # Blacklist check happens BEFORE the status branching: a blacklisted
+    # account must show as blacklisted regardless of whether it's also
+    # DELETED. This prevents (1) auto-revival of banned users and (2)
+    # leaking the existence of a DELETED-but-banned row via the friendly
+    # `account_deleted` error code (security audit recommendation).
     if user.telegram_id is not None:
-        is_blacklisted, reason = await blacklist_service.is_user_blacklisted(user.telegram_id, user.username)
+        is_blacklisted, blacklist_reason = await blacklist_service.is_user_blacklisted(user.telegram_id, user.username)
         if is_blacklisted:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={
                     'code': 'blacklisted',
-                    'message': reason or 'Доступ запрещен',
+                    'message': blacklist_reason or 'Доступ запрещен',
                 },
             )
+
+    access_decision = None
+    if user.status != UserStatus.ACTIVE.value:
+        if is_user_admin_by_env(user).is_admin:
+            # Same precedence as RegistrationAccessService: the env config is the root
+            # of trust and outranks any status flag, whether or not invite-only is on.
+            # Blocking such an account is refused at every write site, so a non-ACTIVE
+            # admin here is a stale row — usually the broadcast auto-block after the
+            # owner muted the bot — and must not cost them the cabinet.
+            access_decision = RegistrationAccessDecision(True, RegistrationAccessReason.VERIFIED_ADMIN)
+        elif not settings.INVITE_ONLY_ENABLED:
+            access_decision = RegistrationAccessDecision(True, RegistrationAccessReason.INVITE_ONLY_DISABLED)
+        else:
+            access_decision = await evaluate_public_registration(
+                db,
+                channel=RegistrationChannel.CABINET_SESSION,
+                existing_user=user,
+                telegram_id=user.telegram_id,
+                email=user.email,
+                email_verified=bool(user.email_verified),
+                verified_admin=False,
+            )
+
+    if user.status != UserStatus.ACTIVE.value:
+        # DELETED users with a cryptographically-valid Telegram initData
+        # proving the same Telegram identity may be auto-revived: the
+        # signature on initData is the moral equivalent of a fresh login.
+        can_auto_revive = (
+            user.status == UserStatus.DELETED.value
+            and user.telegram_id is not None
+            and (
+                init_data_matches_user
+                or bool(access_decision and access_decision.reason is RegistrationAccessReason.VERIFIED_ADMIN)
+            )
+            and bool(access_decision and access_decision.allowed)
+        )
+        if can_auto_revive:
+            try:
+                await revive_deleted_user(db, user, source='cabinet_dependencies')
+                # revive_deleted_user no longer commits — caller owns
+                # the transaction. Persist before further checks (the
+                # downstream `cabinet_last_login` throttle will commit
+                # again on its own which is fine).
+                await db.commit()
+                await db.refresh(user)
+            except NotDeletedError:
+                # Raced — another request already revived. Treat as success.
+                logger.info('Auto-revival race: user already revived by concurrent request', user_id=user.id)
+        elif access_decision and access_decision.reason is RegistrationAccessReason.VERIFIED_ADMIN:
+            user.status = UserStatus.ACTIVE.value
+            user.updated_at = datetime.now(UTC)
+            await db.commit()
+            await db.refresh(user)
+        elif user.status == UserStatus.DELETED.value:
+            # DELETED but no proof of identity (no initData or token-only
+            # request) → structured friendly error so the frontend can
+            # show the "open bot" screen.
+            bot_username = settings.get_bot_username()
+            detail: dict[str, str | None] = {
+                'code': 'account_deleted',
+                'message': 'Account was deactivated for inactivity. Open the bot and press /start to restore access.',
+            }
+            if bot_username:
+                detail['bot_username'] = bot_username
+                detail['telegram_deep_link'] = f'https://t.me/{bot_username}?start=revive'
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=detail,
+            )
+        else:
+            # BLOCKED or any other non-ACTIVE status: keep the generic
+            # message — these are admin actions, not user-recoverable.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail='User account is not active',
+            )
+
+    # Blacklist check was hoisted ABOVE the status-branching block (see
+    # comment at the top of that section) so that DELETED-but-banned
+    # users see the blacklist message instead of the friendly revival
+    # screen. No duplicate check needed here.
 
     # Check maintenance mode (allow admins to pass)
     if maintenance_service.is_maintenance_active():
@@ -175,6 +274,24 @@ async def get_current_cabinet_user(
                             'channels': channels_with_status,
                         },
                     )
+
+    # Троттлинг меток (не чаще раза в пять минут): last_activity двигают все
+    # поверхности — по ней карточка показывает «последнюю активность», а сторож
+    # неактивных решает, кого удалять; cabinet_last_login — только кабинет.
+    now = datetime.now(UTC)
+    touched = mark_user_seen(user, now=now)
+    if not user.cabinet_last_login or (now - user.cabinet_last_login).total_seconds() > 300:
+        user.cabinet_last_login = now
+        touched = True
+    if touched:
+        try:
+            await db.commit()
+        except Exception:
+            pass
+
+    # Лог действий юзера в кабинете (мутации) для таймлайна «Активность».
+    # Fire-and-forget: гейты (флаг, метод, исключения путей) внутри хелпера.
+    schedule_cabinet_action_log(user.id, request.method, request.url.path)
 
     return user
 
@@ -246,12 +363,13 @@ async def get_current_admin_user(
     Raises:
         HTTPException: If user is not an admin by either mechanism
     """
-    # Legacy check: config-based admin list
-    is_legacy_admin = settings.is_admin(
-        telegram_id=user.telegram_id,
-        email=user.email if user.email_verified else None,
-    )
-    if is_legacy_admin:
+    # Legacy check: config-based admin list. Routed through is_user_admin_by_env so the
+    # ADMIN_EMAILS match honours the trusted email_verification_source guard — an email
+    # verified by an untrusted source (VK/Yandex OAuth, or a no-proof flow) must not grant
+    # admin even though email_verified is True.
+    from app.services.rbac_bootstrap_service import is_user_admin_by_env
+
+    if is_user_admin_by_env(user).is_admin:
         return user
 
     # RBAC check: user has any active role with level > 0

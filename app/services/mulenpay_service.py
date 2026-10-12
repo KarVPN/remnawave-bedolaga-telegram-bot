@@ -9,6 +9,11 @@ import structlog
 from app.config import settings
 
 
+# Документация MulenPay ограничений на client не задаёт — поле встречается там
+# только в примере тела запроса. Предел выбран нами защитно и совпадает с
+# длиной колонки users.email, чтобы обрезка была недостижима на реальных данных.
+MULENPAY_CLIENT_MAX_LENGTH = 255
+
 logger = structlog.get_logger(__name__)
 
 
@@ -74,9 +79,7 @@ class MulenPayService:
 
                     if data is None:
                         if raw_text:
-                            logger.warning(
-                                'MulenPay returned unexpected payload for', endpoint=endpoint, raw_text=raw_text
-                            )
+                            logger.warning('MulenPay returned unexpected payload', endpoint=endpoint, raw_text=raw_text)
                         return None
 
                     return data
@@ -86,7 +89,7 @@ class MulenPayService:
             except TimeoutError as error:
                 last_error = error
                 logger.warning(
-                    'MulenPay request timeout attempt /',
+                    'MulenPay request timeout, retrying',
                     method=method,
                     endpoint=endpoint,
                     attempt=attempt,
@@ -95,7 +98,7 @@ class MulenPayService:
             except aiohttp.ClientError as error:
                 last_error = error
                 logger.warning(
-                    'MulenPay client error attempt /',
+                    'MulenPay client error, retrying',
                     method=method,
                     endpoint=endpoint,
                     attempt=attempt,
@@ -111,14 +114,14 @@ class MulenPayService:
 
         if isinstance(last_error, asyncio.TimeoutError):
             logger.error(
-                'MulenPay request timed out after attempts',
+                'MulenPay request timed out after all retries',
                 max_retries=self._max_retries,
                 method=method,
                 endpoint=endpoint,
             )
         elif last_error is not None:
             logger.error(
-                'MulenPay request failed after attempts',
+                'MulenPay request failed after all retries',
                 max_retries=self._max_retries,
                 method=method,
                 endpoint=endpoint,
@@ -164,6 +167,7 @@ class MulenPayService:
         subscribe: str | None = None,
         hold_time: int | None = None,
         website_url: str | None = None,
+        client: str | None = None,
     ) -> dict[str, Any] | None:
         if not self.is_configured:
             logger.error('MulenPay service is not configured')
@@ -188,6 +192,10 @@ class MulenPayService:
             payload['holdTime'] = hold_time
         if website_url:
             payload['website_url'] = website_url
+        if client:
+            # Контакт плательщика, по которому MulenPay может с ним связаться.
+            # Значение уже нормализовано вызывающим слоем; срез — последний рубеж.
+            payload['client'] = client[:MULENPAY_CLIENT_MAX_LENGTH]
 
         response = await self._request('POST', '/v2/payments', json_data=payload)
         if not response or not response.get('success'):

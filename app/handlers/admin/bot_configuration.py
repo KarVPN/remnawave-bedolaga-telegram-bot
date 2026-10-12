@@ -31,6 +31,7 @@ from app.services.tribute_service import TributeService
 from app.states import BotConfigStates
 from app.utils.currency_converter import currency_converter
 from app.utils.decorators import admin_required, error_handler
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -63,7 +64,11 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
     },
     'payments': {
         'title': '💳 Платежные системы',
-        'description': 'YooKassa, CryptoBot, Heleket, CloudPayments, Freekassa, MulenPay, PAL24, Wata, Platega, Tribute, Kassa AI, RioPay, SeverPay и Telegram Stars.',
+        'description': (
+            'YooKassa, CryptoBot, Heleket, CloudPayments, Freekassa, MulenPay, PAL24, Wata, '
+            'Platega, Tribute, Kassa AI, RioPay, SeverPay, PayPear, RollyPay, Overpay, AuraPay, '
+            'Etoplatezhi, Antilopay, Jupiter, CisPay, TabPay, ParityPay, Donut, Lava, Cashera и Telegram Stars.'
+        ),
         'icon': '💳',
         'categories': (
             'PAYMENT',
@@ -76,6 +81,19 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
             'KASSA_AI',
             'RIOPAY',
             'SEVERPAY',
+            'PAYPEAR',
+            'ROLLYPAY',
+            'OVERPAY',
+            'AURAPAY',
+            'ETOPLATEZHI',
+            'ANTILOPAY',
+            'JUPITER',
+            'CISPAY',
+            'CASHERA',
+            'TABPAY',
+            'PARITYPAY',
+            'DONUT',
+            'LAVA',
             'MULENPAY',
             'PAL24',
             'WATA',
@@ -124,6 +142,7 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
             'INTERFACE',
             'INTERFACE_BRANDING',
             'INTERFACE_SUBSCRIPTION',
+            'INFO_PAGES',
             'CONNECT_BUTTON',
             'MINIAPP',
             'HAPP',
@@ -154,7 +173,6 @@ CATEGORY_GROUP_METADATA: dict[str, dict[str, object]] = {
             'LOG',
             'MODERATION',
             'DEBUG',
-            'EXTERNAL_ADMIN',
         ),
     },
 }
@@ -700,11 +718,11 @@ async def apply_preset(
             applied.append(setting_key)
         except ReadOnlySettingError:
             logger.info(
-                'Пропускаем настройку из пресета : только для чтения', setting_key=setting_key, preset_key=preset_key
+                'Пропускаем настройку из пресета: только для чтения', setting_key=setting_key, preset_key=preset_key
             )
         except Exception as error:
             logger.warning(
-                'Не удалось применить пресет для', preset_key=preset_key, setting_key=setting_key, error=error
+                'Не удалось применить настройку из пресета', preset_key=preset_key, setting_key=setting_key, error=error
             )
     await db.commit()
 
@@ -899,7 +917,7 @@ async def show_settings_history(
     if rows:
         for row in rows:
             timestamp = row.updated_at or row.created_at
-            ts_text = timestamp.strftime('%d.%m %H:%M') if timestamp else '—'
+            ts_text = format_local_datetime(timestamp, '%d.%m %H:%M') if timestamp else '—'
             try:
                 parsed_value = bot_configuration_service.deserialize_value(row.key, row.value)
                 formatted_value = bot_configuration_service.format_value_human(row.key, parsed_value)
@@ -1260,6 +1278,18 @@ def _build_settings_keyboard(
     elif category_key == 'SEVERPAY':
         label = texts.t('PAYMENT_SEVERPAY', f'💳 {settings.get_severpay_display_name()}')
         test_payment_buttons.append([_test_button(f'{label} · тест', 'severpay')])
+    elif category_key == 'PAYPEAR':
+        label = texts.t('PAYMENT_PAYPEAR', f'💳 {settings.get_paypear_display_name()}')
+        test_payment_buttons.append([_test_button(f'{label} · тест', 'paypear')])
+    elif category_key == 'ROLLYPAY':
+        label = texts.t('PAYMENT_ROLLYPAY', f'💳 {settings.get_rollypay_display_name()}')
+        test_payment_buttons.append([_test_button(f'{label} · тест', 'rollypay')])
+    elif category_key == 'OVERPAY':
+        label = texts.t('PAYMENT_OVERPAY', f'💳 {settings.get_overpay_display_name()}')
+        test_payment_buttons.append([_test_button(f'{label} · тест', 'overpay')])
+    elif category_key == 'AURAPAY':
+        label = texts.t('PAYMENT_AURAPAY', f'💳 {settings.get_aurapay_display_name()}')
+        test_payment_buttons.append([_test_button(f'{label} · тест', 'aurapay')])
 
     if test_payment_buttons:
         rows.extend(test_payment_buttons)
@@ -1335,7 +1365,13 @@ def _build_setting_keyboard(
             if choice_token is None:
                 continue
             button_text = option.label
-            if current_value == option.value and not button_text.startswith('✅'):
+            # Сравнение через as_choice_key: текущее значение приведено к типу
+            # настройки, а вариант описан строкой — у булевой галочка иначе не
+            # ставилась бы никогда.
+            same = bot_configuration_service.as_choice_key(current_value) == bot_configuration_service.as_choice_key(
+                option.value
+            )
+            if same and not button_text.startswith('✅'):
                 button_text = f'✅ {button_text}'
             choice_buttons.append(
                 types.InlineKeyboardButton(
@@ -2488,6 +2524,24 @@ async def start_edit_setting(
     await callback.answer()
 
 
+def _build_save_confirmation(key: str) -> str:
+    """Сообщение после сохранения настройки.
+
+    set_value всегда пишет значение в БД, но для ключей, заданных через
+    окружение, рантайм продолжает использовать значение из .env — «✅ обновлена»
+    в этом случае вводит в заблуждение: админ видит подтверждение, а поведение
+    бота не меняется (#2749, вся секция рефералки из .env.example). Говорим
+    честно, какая переменная блокирует применение и что с ней сделать.
+    """
+    if bot_configuration_service.is_env_overridden(key):
+        return (
+            '💾 Сохранено в БД, но <b>не применено</b>: значение задаётся переменной '
+            f'окружения <code>{html.escape(key)}</code> из .env.\n'
+            'Уберите её из .env и перезапустите бота, чтобы управлять этой настройкой отсюда.'
+        )
+    return '✅ Настройка обновлена'
+
+
 @admin_required
 @error_handler
 async def handle_edit_setting(
@@ -2528,7 +2582,7 @@ async def handle_edit_setting(
 
     text = _render_setting_text(key)
     keyboard = _build_setting_keyboard(key, group_key, category_page, settings_page)
-    await message.answer('✅ Настройка обновлена')
+    await message.answer(_build_save_confirmation(key))
     await message.answer(text, reply_markup=keyboard)
     await state.clear()
     await _store_setting_context(
@@ -2579,7 +2633,7 @@ async def handle_direct_setting_input(
 
     text = _render_setting_text(key)
     keyboard = _build_setting_keyboard(key, group_key, category_page, settings_page)
-    await message.answer('✅ Настройка обновлена')
+    await message.answer(_build_save_confirmation(key))
     await message.answer(text, reply_markup=keyboard)
 
     await state.clear()

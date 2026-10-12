@@ -15,7 +15,9 @@ from app.database.crud.server_squad import (
 )
 from app.database.crud.subscription import (
     add_subscription_servers,
+    apply_trial_conversion_defaults,
     create_paid_subscription,
+    should_carry_trial_remaining_days,
 )
 from app.database.crud.subscription_conversion import (
     create_subscription_conversion,
@@ -28,6 +30,7 @@ from app.services.subscription_service import SubscriptionService
 from app.utils.pricing_utils import (
     apply_percentage_discount,
     calculate_months_from_days,
+    calculate_price_per_month,
     format_period_description,
     validate_pricing_calculation,
 )
@@ -299,10 +302,28 @@ def _build_server_option(
 class MiniAppSubscriptionPurchaseService:
     """Builds configuration and pricing for subscription purchases in the mini app."""
 
-    async def build_options(self, db: AsyncSession, user: User) -> PurchaseOptionsContext:
+    async def build_options(
+        self, db: AsyncSession, user: User, subscription_id: int | None = None
+    ) -> PurchaseOptionsContext:
         from app.database.crud.subscription import get_subscription_by_user_id
 
-        subscription = await get_subscription_by_user_id(db, user.id)
+        if settings.is_multi_tariff_enabled():
+            if subscription_id:
+                from app.database.crud.subscription import get_subscription_by_id_for_user
+
+                subscription = await get_subscription_by_id_for_user(db, subscription_id, user.id)
+            else:
+                from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+                active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+                if active_subs:
+                    _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+                    _pool = _non_daily or active_subs
+                    subscription = max(_pool, key=lambda s: s.days_left)
+                else:
+                    subscription = None
+        else:
+            subscription = await get_subscription_by_user_id(db, user.id)
         balance_kopeks = int(getattr(user, 'balance_kopeks', 0) or 0)
         currency = (getattr(user, 'balance_currency', None) or 'RUB').upper()
         texts = get_texts(getattr(user, 'language', None))
@@ -313,8 +334,16 @@ class MiniAppSubscriptionPurchaseService:
         )
         server_catalog: dict[str, ServerSquad] = {server.squad_uuid: server for server in available_servers}
 
-        if subscription and subscription.connected_squads:
-            for uuid in subscription.connected_squads:
+        # Серверы подписки — без сквада грейса, осевшего в ней (v4.10–4.11): иначе
+        # по умолчанию человеку предлагалось «купить» сквад грейса.
+        own_squads: list[str] = []
+        if subscription is not None:
+            from app.services.grace_access_echo import terms_without_grace_echo
+
+            own_squads, _ = await terms_without_grace_echo(db, subscription)
+
+        if own_squads:
+            for uuid in own_squads:
                 if uuid in server_catalog:
                     continue
                 try:
@@ -332,7 +361,7 @@ class MiniAppSubscriptionPurchaseService:
             except (TypeError, ValueError):
                 continue
 
-        default_connected = list(getattr(subscription, 'connected_squads', []) or [])
+        default_connected = list(own_squads)
         if not default_connected:
             for server in available_servers:
                 if getattr(server, 'is_available', True) and not getattr(server, 'is_full', False):
@@ -373,7 +402,7 @@ class MiniAppSubscriptionPurchaseService:
                 else None
             )
 
-            per_month_price = base_price // months if months else base_price
+            per_month_price = calculate_price_per_month(base_price, period_days)
             per_month_price_label = texts.format_price(per_month_price)
 
             traffic_config = self._build_traffic_config(
@@ -916,7 +945,7 @@ class MiniAppSubscriptionPurchaseService:
                 'Not enough funds on balance',
             )
 
-        per_month_price = pricing.final_total // pricing.months if pricing.months else pricing.final_total
+        per_month_price = calculate_price_per_month(pricing.final_total, pricing.selection.period.days)
 
         return {
             'total_price_kopeks': pricing.final_total,
@@ -950,12 +979,14 @@ class MiniAppSubscriptionPurchaseService:
             'breakdown': [{'label': item['label'], 'value': item['value']} for item in breakdown],
             'balance_kopeks': context.balance_kopeks,
             'balanceKopeks': context.balance_kopeks,
-            'balance_label': texts.format_price(context.balance_kopeks),
-            'balanceLabel': texts.format_price(context.balance_kopeks),
+            # round_kopeks=False — без него при FX-rounding нехватке (<1₽) юзер видит
+            # "Баланс 150 ₽, не хватает 0 ₽" и не понимает что мешает покупке.
+            'balance_label': texts.format_price(context.balance_kopeks, round_kopeks=False),
+            'balanceLabel': texts.format_price(context.balance_kopeks, round_kopeks=False),
             'missing_amount_kopeks': missing,
             'missingAmountKopeks': missing,
-            'missing_amount_label': texts.format_price(missing) if missing else None,
-            'missingAmountLabel': texts.format_price(missing) if missing else None,
+            'missing_amount_label': texts.format_price(missing, round_kopeks=False) if missing else None,
+            'missingAmountLabel': texts.format_price(missing, round_kopeks=False) if missing else None,
             'can_purchase': missing == 0,
             'canPurchase': missing == 0,
             'status_message': status_message,
@@ -971,10 +1002,12 @@ class MiniAppSubscriptionPurchaseService:
         user = context.user
         texts = get_texts(getattr(user, 'language', None))
 
-        if pricing.final_total <= 0:
+        # Block only if pricing is genuinely invalid (no base price configured).
+        # final_total == 0 with base_original_total > 0 means a valid 100% discount.
+        if pricing.final_total <= 0 and pricing.base_original_total <= 0:
             raise PurchaseValidationError('Invalid total amount', code='calculation_error')
 
-        if user.balance_kopeks < pricing.final_total:
+        if pricing.final_total > 0 and user.balance_kopeks < pricing.final_total:
             raise PurchaseBalanceError(
                 texts.t(
                     'MINIAPP_PURCHASE_STATUS_INSUFFICIENT',
@@ -1003,16 +1036,46 @@ class MiniAppSubscriptionPurchaseService:
 
         subscription = context.subscription
         if subscription is not None and getattr(subscription, 'id', None):
-            try:
-                await db.refresh(subscription)
-            except Exception as refresh_error:  # pragma: no cover - defensive logging
+            # Lock subscription row to prevent concurrent extension race
+            result = await db.execute(
+                select(Subscription)
+                .where(Subscription.id == subscription.id, Subscription.user_id == user.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            locked_sub = result.scalar_one_or_none()
+            if locked_sub is not None:
+                subscription = locked_sub
+                context.subscription = locked_sub
+            else:
                 logger.warning(
-                    'Failed to refresh existing subscription',
-                    getattr=getattr(subscription, 'id', None),
-                    refresh_error=refresh_error,
+                    'Subscription from context not found after FOR UPDATE',
+                    subscription_id=getattr(subscription, 'id', None),
+                    user_id=user.id,
                 )
+                subscription = None
+                context.subscription = None
         else:
-            result = await db.execute(select(Subscription).where(Subscription.user_id == user.id))
+            context_subscription_id: int | None = context.payload.get('subscription_id')
+            if settings.is_multi_tariff_enabled() and context_subscription_id is not None:
+                result = await db.execute(
+                    select(Subscription)
+                    .where(
+                        Subscription.user_id == user.id,
+                        Subscription.id == context_subscription_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            else:
+                result = await db.execute(
+                    select(Subscription)
+                    .where(Subscription.user_id == user.id)
+                    .order_by(Subscription.created_at.desc())
+                    .limit(1)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
             subscription = result.scalar_one_or_none()
             if subscription is not None:
                 context.subscription = subscription
@@ -1021,11 +1084,15 @@ class MiniAppSubscriptionPurchaseService:
         now = datetime.now(UTC)
 
         if subscription:
+            # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+            from app.services.grace_access_echo import undo_grace_overlay_echo
+
+            await undo_grace_overlay_echo(db, subscription)
             bonus_period = timedelta()
             if subscription.is_trial:
                 was_trial_conversion = True
                 trial_duration = (now - subscription.start_date).days
-                if settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and subscription.end_date:
+                if should_carry_trial_remaining_days() and subscription.end_date:
                     remaining = subscription.end_date - now
                     if remaining.total_seconds() > 0:
                         bonus_period = remaining
@@ -1042,6 +1109,11 @@ class MiniAppSubscriptionPurchaseService:
                     logger.error('Failed to create subscription conversion record', conversion_error=conversion_error)
 
             subscription.is_trial = False
+            if was_trial_conversion:
+                # is_trial сбрасывается и для НЕ-триалов (обычное продление), поэтому
+                # дефолт автоплатежа вешаем на флаг конверсии, иначе продление платной
+                # подписки затирало бы выбор пользователя.
+                apply_trial_conversion_defaults(subscription)
             subscription.status = SubscriptionStatus.ACTIVE.value
             subscription.traffic_limit_gb = pricing.selection.traffic_value
             subscription.device_limit = pricing.selection.devices
@@ -1082,10 +1154,56 @@ class MiniAppSubscriptionPurchaseService:
             except Exception as error:  # pragma: no cover - defensive logging
                 logger.error('Failed to register subscription servers', error=error)
 
+        # Kill remaining trial subscriptions (trial = probe, dies on any paid purchase)
+        from app.database.crud.subscription import (
+            deactivate_user_trial_subscriptions,
+            decrement_subscription_server_counts,
+        )
+
+        killed_trials = await deactivate_user_trial_subscriptions(db, user.id, exclude_subscription_id=subscription.id)
+
+        # Add remaining trial time from OTHER killed trials (current trial already handled above)
+        if settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and killed_trials:
+            extra_seconds = 0
+            for _kt in killed_trials:
+                if _kt.end_date and _kt.end_date > now:
+                    extra_seconds += max(0, (_kt.end_date - now).total_seconds())
+            if extra_seconds > 0:
+                subscription.end_date = subscription.end_date + timedelta(seconds=extra_seconds)
+                await db.commit()
+                await db.refresh(subscription)
+
         subscription_service = SubscriptionService()
-        # При покупке подписки ВСЕГДА сбрасываем трафик в панели
+
+        # Disable killed trials on RemnaWave panel
+        for trial_sub in killed_trials:
+            try:
+                _trial_panel_id = trial_sub.remnawave_id
+                if _trial_panel_id is None and not settings.is_multi_tariff_enabled():
+                    _trial_panel_id = getattr(user, 'remnawave_id', None)
+                if _trial_panel_id is not None:
+                    await subscription_service.disable_remnawave_user(_trial_panel_id)
+                await decrement_subscription_server_counts(db, trial_sub)
+            except Exception as trial_err:
+                logger.warning('Failed to disable trial on RemnaWave', error=trial_err, trial_id=trial_sub.id)
+
         try:
-            if getattr(user, 'remnawave_uuid', None):
+            # In multi-tariff mode, each subscription has its own panel user.
+            # A new subscription has no remnawave_id yet, so always CREATE.
+            # In single-tariff mode, reuse the user-level panel id if available.
+            if settings.is_multi_tariff_enabled():
+                _should_create = subscription.remnawave_id is None
+            else:
+                _should_create = getattr(user, 'remnawave_id', None) is None
+
+            if _should_create:
+                await subscription_service.create_remnawave_user(
+                    db,
+                    subscription,
+                    reset_traffic=True,
+                    reset_reason='miniapp purchase',
+                )
+            else:
                 await subscription_service.update_remnawave_user(
                     db,
                     subscription,
@@ -1093,15 +1211,15 @@ class MiniAppSubscriptionPurchaseService:
                     reset_reason='miniapp purchase',
                     sync_squads=True,
                 )
-            else:
-                await subscription_service.create_remnawave_user(
-                    db,
-                    subscription,
-                    reset_traffic=True,
-                    reset_reason='miniapp purchase',
-                )
         except Exception as remnawave_error:  # pragma: no cover - defensive logging
             logger.error('Failed to sync subscription with RemnaWave', remnawave_error=remnawave_error)
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            remnawave_retry_queue.enqueue(
+                subscription_id=subscription.id,
+                user_id=user.id,
+                action='create' if getattr(subscription, 'remnawave_id', None) is None else 'update',
+            )
 
         transaction = await create_transaction(
             db=db,

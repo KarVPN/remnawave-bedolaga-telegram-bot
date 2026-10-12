@@ -258,9 +258,7 @@ class FreekassaPaymentMixin:
 
         # FOR UPDATE lock already acquired by caller — just check idempotency
         if payment.transaction_id:
-            logger.info(
-                'Freekassa платеж уже привязан к транзакции (trigger=)', order_id=payment.order_id, trigger=trigger
-            )
+            logger.info('Freekassa платеж уже привязан к транзакции', order_id=payment.order_id, trigger=trigger)
             return True
 
         # --- Guest purchase flow (landing page) ---
@@ -281,7 +279,7 @@ class FreekassaPaymentMixin:
         user = await payment_module.get_user_by_id(db, payment.user_id)
         if not user:
             logger.error(
-                'Пользователь не найден для Freekassa платежа (trigger=)',
+                'Пользователь не найден для Freekassa платежа',
                 user_id=payment.user_id,
                 order_id=payment.order_id,
                 trigger=trigger,
@@ -376,7 +374,7 @@ class FreekassaPaymentMixin:
                 logger.error('Ошибка отправки админ уведомления Freekassa', error=error)
 
         # Отправка уведомления пользователю
-        if getattr(self, 'bot', None) and user.telegram_id:
+        if getattr(self, 'bot', None) and user.telegram_id and settings.is_notifications_enabled():
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
 
@@ -423,7 +421,7 @@ class FreekassaPaymentMixin:
             )
 
         logger.info(
-            '✅ Обработан Freekassa платеж для пользователя (trigger=)',
+            '✅ Обработан Freekassa платеж для пользователя',
             order_id=payment.order_id,
             user_id=payment.user_id,
             trigger=trigger,

@@ -4,7 +4,7 @@ from typing import Any
 
 import structlog
 from aiogram import Bot, types
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -70,6 +70,8 @@ class DeleteUserResult:
     bot_deleted: bool = False
     panel_deleted: bool = False
     panel_error: str | None = None
+    # Удаление отклонено guard'ом открытого grace-доступа (HTTP-слой мапит в 409)
+    grace_blocked: bool = False
 
 
 class UserService:
@@ -96,12 +98,13 @@ class UserService:
                 f'💳 Текущий баланс: {settings.format_price(user.balance_kopeks)}\n\n'
                 f'Спасибо за использование нашего сервиса! 🎉'
             )
+            extend_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
             keyboard = types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         types.InlineKeyboardButton(
                             text=texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
-                            callback_data='subscription_extend',
+                            callback_data=extend_callback,
                         )
                     ]
                 ]
@@ -117,10 +120,11 @@ class UserService:
                 f'Пополнение баланса НЕ активирует подписку автоматически!\n\n'
                 f'👇 <b>Выберите действие:</b>'
             )
+            extend_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
             keyboard = types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [types.InlineKeyboardButton(text='🚀 АКТИВИРОВАТЬ ПОДПИСКУ', callback_data='subscription_buy')],
-                    [types.InlineKeyboardButton(text='💎 ПРОДЛИТЬ ПОДПИСКУ', callback_data='subscription_extend')],
+                    [types.InlineKeyboardButton(text='💎 ПРОДЛИТЬ ПОДПИСКУ', callback_data=extend_callback)],
                     [
                         types.InlineKeyboardButton(
                             text='📱 ДОБАВИТЬ УСТРОЙСТВА', callback_data='subscription_add_devices'
@@ -166,16 +170,15 @@ class UserService:
             )
 
         keyboard_rows = []
-        if getattr(user, 'subscription', None) and user.subscription.status in {
-            'active',
-            'expired',
-            'trial',
-        }:
+        subs = getattr(user, 'subscriptions', None) or []
+        has_extendable = any(sub.status in {'active', 'expired', 'trial'} for sub in subs)
+        if has_extendable:
+            extend_callback = 'menu_subscription' if settings.is_multi_tariff_enabled() else 'subscription_extend'
             keyboard_rows.append(
                 [
                     types.InlineKeyboardButton(
                         text=get_texts(user.language).t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
-                        callback_data='subscription_extend',
+                        callback_data=extend_callback,
                     )
                 ]
             )
@@ -208,7 +211,18 @@ class UserService:
             if not user:
                 return None
 
-            subscription = await get_subscription_by_user_id(db, user_id)
+            if settings.is_multi_tariff_enabled():
+                from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+                active_subs = await get_active_subscriptions_by_user_id(db, user_id)
+                if active_subs:
+                    _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+                    _pool = _non_daily or active_subs
+                    subscription = max(_pool, key=lambda s: s.days_left)
+                else:
+                    subscription = None
+            else:
+                subscription = await get_subscription_by_user_id(db, user_id)
             transactions_count = await get_user_transactions_count(db, user_id)
 
             return {
@@ -322,7 +336,7 @@ class UserService:
 
             query = (
                 select(User)
-                .options(selectinload(User.subscription))
+                .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
                 .join(Subscription, Subscription.user_id == User.id)
                 .where(*base_filters)
                 .order_by(User.balance_kopeks.desc(), Subscription.end_date.asc())
@@ -370,17 +384,19 @@ class UserService:
                 User.balance_kopeks >= min_balance_kopeks,
             ]
 
-            # Основной запрос с LEFT JOIN для поддержки пользователей без подписки
+            # Subquery: user has at least one active/trial subscription
+            active_sub_exists = exists().where(
+                Subscription.user_id == User.id,
+                Subscription.status.in_(['active', 'trial']),
+            )
+
+            # Основной запрос: пользователи БЕЗ активных подписок
             query = (
                 select(User)
-                .options(selectinload(User.subscription))
-                .outerjoin(Subscription, Subscription.user_id == User.id)
+                .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
                 .where(
                     *base_filters,
-                    or_(
-                        User.subscription == None,
-                        ~Subscription.status.in_(['active', 'trial']),
-                    ),
+                    ~active_sub_exists,
                 )
                 .order_by(User.balance_kopeks.desc(), User.created_at.desc())
                 .offset(offset)
@@ -390,16 +406,9 @@ class UserService:
             users = result.scalars().unique().all()
 
             # Запрос для подсчета общего количества
-            count_query = (
-                select(func.count(User.id))
-                .outerjoin(Subscription, Subscription.user_id == User.id)
-                .where(
-                    *base_filters,
-                    or_(
-                        User.subscription == None,
-                        ~Subscription.status.in_(['active', 'trial']),
-                    ),
-                )
+            count_query = select(func.count(User.id)).where(
+                *base_filters,
+                ~active_sub_exists,
             )
             total_count = (await db.execute(count_query)).scalar() or 0
             total_pages = (total_count + limit - 1) // limit if total_count else 0
@@ -464,7 +473,7 @@ class UserService:
                     AdvertisingCampaign,
                     AdvertisingCampaign.id == latest_campaign.c.campaign_id,
                 )
-                .options(selectinload(User.subscription))
+                .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
                 .order_by(
                     AdvertisingCampaign.name.asc(),
                     latest_campaign.c.created_at.desc(),
@@ -598,7 +607,7 @@ class UserService:
             await db.refresh(user)
 
             logger.info(
-                "👥 Промогруппа пользователя обновлена на ''",
+                '👥 Промогруппа пользователя обновлена',
                 telegram_id=user.telegram_id,
                 promo_group_name=promo_group.name,
             )
@@ -645,7 +654,7 @@ class UserService:
             await db.commit()
 
             logger.info(
-                'Админ обновил рефералов пользователя : добавлено , удалено , всего',
+                'Админ обновил рефералов пользователя',
                 admin_id=admin_id,
                 user_id=user_id,
                 to_add_count=len(to_add),
@@ -672,30 +681,63 @@ class UserService:
             if not user:
                 return False
 
+            from app.services.rbac_bootstrap_service import is_protected_from_blocking
+
+            if is_protected_from_blocking(user):
+                logger.warning(
+                    'Отказ в блокировке: аккаунт прописан в ADMIN_IDS/ADMIN_EMAILS',
+                    admin_id=admin_id,
+                    user_id=user_id,
+                )
+                return False
+
             from app.database.crud.subscription import deactivate_subscription, is_active_paid_subscription
 
-            if is_active_paid_subscription(user.subscription):
+            subs = getattr(user, 'subscriptions', None) or []
+            has_active_paid = any(is_active_paid_subscription(sub) for sub in subs)
+
+            if has_active_paid:
                 logger.info(
                     '⏭️ Пропуск отключения RemnaWave и подписки: у пользователя активная оплаченная подписка',
                     user_id=user_id,
-                    remnawave_uuid=user.remnawave_uuid,
+                    remnawave_id=user.remnawave_id,
                 )
             else:
-                if user.remnawave_uuid:
-                    try:
-                        from app.services.subscription_service import SubscriptionService
+                from app.services.subscription_service import SubscriptionService
 
-                        subscription_service = SubscriptionService()
-                        await subscription_service.disable_remnawave_user(user.remnawave_uuid)
+                subscription_service = SubscriptionService()
+
+                if settings.is_multi_tariff_enabled():
+                    # In multi-tariff mode, disable each subscription's panel user individually
+                    for sub in subs:
+                        panel_user_id = sub.remnawave_id
+                        if panel_user_id:
+                            try:
+                                await subscription_service.disable_remnawave_user(panel_user_id)
+                                logger.info(
+                                    '✅ RemnaWave пользователь деактивирован при блокировке',
+                                    remnawave_id=panel_user_id,
+                                    subscription_id=sub.id,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    '❌ Ошибка деактивации RemnaWave при блокировке',
+                                    error=e,
+                                    subscription_id=sub.id,
+                                )
+                elif user.remnawave_id:
+                    try:
+                        await subscription_service.disable_remnawave_user(user.remnawave_id)
                         logger.info(
                             '✅ RemnaWave пользователь деактивирован при блокировке',
-                            remnawave_uuid=user.remnawave_uuid,
+                            remnawave_id=user.remnawave_id,
                         )
                     except Exception as e:
                         logger.error('❌ Ошибка деактивации RemnaWave пользователя при блокировке', error=e)
 
-                if user.subscription:
-                    await deactivate_subscription(db, user.subscription)
+                for sub in subs:
+                    if sub.status in ['active', 'trial']:
+                        await deactivate_subscription(db, sub)
 
             await update_user(db, user, status=UserStatus.BLOCKED.value)
 
@@ -714,29 +756,37 @@ class UserService:
 
             await update_user(db, user, status=UserStatus.ACTIVE.value)
 
-            if user.subscription:
-                from app.database.models import SubscriptionStatus
+            from app.database.models import SubscriptionStatus
 
-                if user.subscription.end_date > datetime.now(UTC):
-                    user.subscription.status = SubscriptionStatus.ACTIVE.value
-                    await db.commit()
-                    await db.refresh(user.subscription)
-                    logger.info('🔄 Подписка пользователя восстановлена', user_id=user_id)
+            now = datetime.now(UTC)
+            for sub in getattr(user, 'subscriptions', None) or []:
+                if sub.end_date and sub.end_date > now and sub.status != SubscriptionStatus.ACTIVE.value:
+                    sub.status = SubscriptionStatus.ACTIVE.value
+                    try:
+                        from app.services.subscription_service import SubscriptionService
 
-                    if user.remnawave_uuid:
-                        try:
-                            from app.services.subscription_service import SubscriptionService
+                        subscription_service = SubscriptionService()
+                        await subscription_service.update_remnawave_user(db, sub)
+                        logger.info(
+                            '✅ RemnaWave подписка восстановлена при разблокировке',
+                            subscription_id=sub.id,
+                            remnawave_id=sub.remnawave_id if settings.is_multi_tariff_enabled() else user.remnawave_id,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            '❌ Ошибка восстановления RemnaWave подписки при разблокировке',
+                            subscription_id=sub.id,
+                            error=e,
+                        )
+                        from app.services.remnawave_retry_queue import remnawave_retry_queue
 
-                            subscription_service = SubscriptionService()
-                            await subscription_service.update_remnawave_user(db, user.subscription)
-                            logger.info(
-                                '✅ RemnaWave пользователь восстановлен при разблокировке',
-                                remnawave_uuid=user.remnawave_uuid,
+                        if hasattr(sub, 'id') and hasattr(sub, 'user_id'):
+                            remnawave_retry_queue.enqueue(
+                                subscription_id=sub.id,
+                                user_id=sub.user_id,
+                                action='update',
                             )
-                        except Exception as e:
-                            logger.error('❌ Ошибка восстановления RemnaWave пользователя при разблокировке', error=e)
-                else:
-                    logger.info('⏰ Подписка пользователя истекла, восстановление невозможно', user_id=user_id)
+            await db.commit()
 
             logger.info('Админ разблокировал пользователя', admin_id=admin_id, user_id=user_id)
             return True
@@ -762,93 +812,162 @@ class UserService:
                 return result
 
             user_id_display = user.telegram_id or user.email or f'#{user.id}'
-            logger.info(
-                '🗑️ Начинаем полное удаление пользователя (ID: )', user_id=user_id, user_id_display=user_id_display
+            logger.info('🗑️ Начинаем полное удаление пользователя', user_id=user_id, user_id_display=user_id_display)
+
+            from app.config import settings
+            from app.database.crud.subscription import is_active_paid_subscription
+
+            # Collect all panel user ids to process
+            subs = getattr(user, 'subscriptions', None) or []
+            from app.services.grace_access_runtime import (
+                GraceAccessDeletionBlocked,
+                ensure_no_open_grace_for_subscriptions,
             )
 
-            if user.remnawave_uuid:
-                from app.config import settings
-                from app.database.crud.subscription import is_active_paid_subscription
+            try:
+                await ensure_no_open_grace_for_subscriptions(db, tuple(sub.id for sub in subs))
+            except GraceAccessDeletionBlocked as error:
+                result.panel_error = str(error)
+                result.grace_blocked = True
+                logger.warning(
+                    'User deletion blocked until grace access is restored',
+                    user_id=user_id,
+                    subscription_ids=error.subscription_ids,
+                )
+                return result
 
-                if not force_panel_delete and is_active_paid_subscription(user.subscription):
+            # Best-effort: stop Platega SBP autopay for every subscription of
+            # this user before the row disappears — the platega_subscriptions
+            # record CASCADE-deletes with its subscription, so cancelling
+            # after the delete would find nothing to cancel on Platega's side
+            # and the user keeps getting charged for a deleted account.
+            # NOTE: each cancellation commits its own transaction internally,
+            # which releases the grace-guard's Postgres advisory lock
+            # acquired just above. It therefore runs BEFORE the panel
+            # deletion/deactivation below (the first irreversible step in
+            # this flow), and the guard is re-acquired immediately after —
+            # closing that window before anything that can't be undone
+            # happens.
+            from app.services.cashera_recurring_cancel import cancel_cashera_recurring_for_subscription_safe
+            from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+            from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+            for sub in subs:
+                await cancel_platega_recurring_for_subscription_safe(db, sub.id)
+
+                await cancel_lava_recurring_for_subscription_safe(db, sub.id)
+                await cancel_cashera_recurring_for_subscription_safe(db, sub.id)
+            try:
+                await ensure_no_open_grace_for_subscriptions(db, tuple(sub.id for sub in subs))
+            except GraceAccessDeletionBlocked as error:
+                result.panel_error = str(error)
+                result.grace_blocked = True
+                logger.warning(
+                    'User deletion blocked until grace access is restored',
+                    user_id=user_id,
+                    subscription_ids=error.subscription_ids,
+                )
+                return result
+
+            if settings.is_multi_tariff_enabled():
+                panel_user_ids = [sub.remnawave_id for sub in subs if sub.remnawave_id]
+            else:
+                panel_user_ids = [user.remnawave_id] if user.remnawave_id else []
+
+            if panel_user_ids:
+                if not force_panel_delete and any(is_active_paid_subscription(sub) for sub in subs):
                     logger.info(
                         '⏭️ Пропуск отключения RemnaWave при удалении: у пользователя активная оплаченная подписка',
                         user_id=user_id,
-                        remnawave_uuid=user.remnawave_uuid,
                     )
                 else:
                     delete_mode = 'delete' if force_panel_delete else settings.get_remnawave_user_delete_mode()
 
-                    try:
-                        from app.services.remnawave_service import RemnaWaveService
+                    # Помечаем ВСЕ панельные id до цикла, чтобы webhook от первого
+                    # удаления не пришёл раньше чем помечены остальные
+                    if delete_mode == 'delete':
+                        from app.services.remnawave_webhook_service import RemnaWaveWebhookService
 
-                        remnawave_service = RemnaWaveService()
+                        RemnaWaveWebhookService.mark_intentional_panel_deletion(
+                            panel_user_ids=panel_user_ids,
+                            telegram_id=int(user.telegram_id) if user.telegram_id else None,
+                        )
 
-                        if delete_mode == 'delete':
-                            # Удаляем пользователя из панели Remnawave
-                            async with remnawave_service.get_api_client() as api:
-                                delete_success = await api.delete_user(user.remnawave_uuid)
-                                if delete_success:
+                    for panel_user_id in panel_user_ids:
+                        try:
+                            from app.services.remnawave_service import RemnaWaveService
+
+                            remnawave_service = RemnaWaveService()
+
+                            if delete_mode == 'delete':
+                                async with remnawave_service.get_api_client() as api:
+                                    # 3.0.0: DELETE отвечает 204/202 без тела, поля isDeleted
+                                    # больше нет — успех это отсутствие исключения.
+                                    await api.delete_user(panel_user_id)
                                     result.panel_deleted = True
                                     logger.info(
                                         '✅ RemnaWave пользователь удален из панели',
-                                        remnawave_uuid=user.remnawave_uuid,
+                                        remnawave_id=panel_user_id,
                                     )
-                                else:
-                                    result.panel_error = 'Remnawave API вернул ошибку удаления'
-                                    logger.warning(
-                                        '⚠️ Не удалось удалить пользователя из панели Remnawave',
-                                        remnawave_uuid=user.remnawave_uuid,
-                                    )
-                        else:
-                            # Деактивируем пользователя в панели Remnawave
-                            from app.services.subscription_service import SubscriptionService
-
-                            subscription_service = SubscriptionService()
-                            disabled = await subscription_service.disable_remnawave_user(user.remnawave_uuid)
-                            result.panel_deleted = disabled
-                            if disabled:
-                                logger.info(
-                                    '✅ RemnaWave пользователь деактивирован',
-                                    remnawave_uuid=user.remnawave_uuid,
-                                    delete_mode=delete_mode,
-                                )
                             else:
-                                result.panel_error = 'disable_remnawave_user вернул False'
-                                logger.warning(
-                                    '⚠️ Не удалось деактивировать пользователя в RemnaWave',
-                                    remnawave_uuid=user.remnawave_uuid,
-                                    delete_mode=delete_mode,
-                                )
-
-                    except Exception as e:
-                        result.panel_error = 'Ошибка обработки пользователя в Remnawave'
-                        logger.warning(
-                            '⚠️ Ошибка обработки пользователя в Remnawave (режим: )',
-                            delete_mode=delete_mode,
-                            error=e,
-                        )
-                        # Если основное действие не удалось, попытаемся хотя бы деактивировать
-                        if delete_mode == 'delete':
-                            try:
                                 from app.services.subscription_service import SubscriptionService
 
                                 subscription_service = SubscriptionService()
-                                disabled = await subscription_service.disable_remnawave_user(user.remnawave_uuid)
+                                disabled = await subscription_service.disable_remnawave_user(panel_user_id, db=db)
+                                result.panel_deleted = disabled
                                 if disabled:
-                                    result.panel_deleted = True
-                                    result.panel_error = 'Удаление не удалось, пользователь деактивирован'
                                     logger.info(
-                                        '✅ RemnaWave пользователь деактивирован как fallback',
-                                        remnawave_uuid=user.remnawave_uuid,
+                                        '✅ RemnaWave пользователь деактивирован',
+                                        remnawave_id=panel_user_id,
+                                        delete_mode=delete_mode,
                                     )
                                 else:
+                                    result.panel_error = 'disable_remnawave_user вернул False'
                                     logger.warning(
-                                        '⚠️ Fallback деактивация RemnaWave тоже не удалась',
-                                        remnawave_uuid=user.remnawave_uuid,
+                                        '⚠️ Не удалось деактивировать пользователя в RemnaWave',
+                                        remnawave_id=panel_user_id,
+                                        delete_mode=delete_mode,
                                     )
-                            except Exception as fallback_e:
-                                logger.error('❌ Ошибка деактивации RemnaWave как fallback', fallback_e=fallback_e)
+
+                        except Exception as e:
+                            from app.external.remnawave_api import RemnaWaveAPIError, is_user_not_found_error
+
+                            # Панель уже не знает такого пользователя — цель достигнута.
+                            # Fallback-деактивация по несуществующему id гарантированно
+                            # провалится и покажет админу ошибку на успешном удалении.
+                            # RemnaWaveInvalidUserIdError сюда НЕ попадает (битая ссылка
+                            # в БД бота — не «пользователя нет»), уходит в общую ветку.
+                            if isinstance(e, RemnaWaveAPIError) and is_user_not_found_error(e):
+                                result.panel_deleted = True
+                                logger.info(
+                                    'ℹ️ RemnaWave пользователь уже отсутствует в панели',
+                                    remnawave_id=panel_user_id,
+                                    delete_mode=delete_mode,
+                                )
+                                continue
+
+                            result.panel_error = 'Ошибка обработки пользователя в Remnawave'
+                            logger.warning(
+                                '⚠️ Ошибка обработки пользователя в Remnawave',
+                                delete_mode=delete_mode,
+                                remnawave_id=panel_user_id,
+                                error=e,
+                            )
+                            if delete_mode == 'delete':
+                                try:
+                                    from app.services.subscription_service import SubscriptionService
+
+                                    subscription_service = SubscriptionService()
+                                    disabled = await subscription_service.disable_remnawave_user(panel_user_id, db=db)
+                                    if disabled:
+                                        result.panel_deleted = True
+                                        result.panel_error = 'Удаление не удалось, пользователь деактивирован'
+                                        logger.info(
+                                            '✅ RemnaWave пользователь деактивирован как fallback',
+                                            remnawave_id=panel_user_id,
+                                        )
+                                except Exception as fallback_e:
+                                    logger.error('❌ Ошибка деактивации RemnaWave как fallback', fallback_e=fallback_e)
 
             try:
                 async with db.begin_nested():
@@ -1104,6 +1223,75 @@ class UserService:
             except Exception as e:
                 logger.error('❌ Ошибка удаления KassaAi платежей', error=e)
 
+            # Платёжные провайдеры, которые ссылаются на transactions через FK без ON DELETE,
+            # но раньше не очищались в этом блоке. Без них DELETE FROM transactions падал с
+            # ForeignKeyViolationError (например, rollypay_payments_transaction_id_fkey).
+            from app.database.models import (
+                AntilopayPayment,
+                AppleTransaction,
+                AuraPayPayment,
+                CasheraPayment,
+                CisPayPayment,
+                DonutPayment,
+                EtoplatezhiPayment,
+                JupiterPayment,
+                LavaPayment,
+                OverpayPayment,
+                ParityPayPayment,
+                PayPearPayment,
+                RioPayPayment,
+                RollyPayPayment,
+                SeverPayPayment,
+                TabPayPayment,
+            )
+
+            extra_payment_models = (
+                RioPayPayment,
+                RollyPayPayment,
+                SeverPayPayment,
+                PayPearPayment,
+                OverpayPayment,
+                AuraPayPayment,
+                EtoplatezhiPayment,
+                AntilopayPayment,
+                JupiterPayment,
+                DonutPayment,
+                LavaPayment,
+                CisPayPayment,
+                TabPayPayment,
+                ParityPayPayment,
+                CasheraPayment,
+            )
+            for model in extra_payment_models:
+                try:
+                    async with db.begin_nested():
+                        await db.execute(update(model).where(model.user_id == user_id).values(transaction_id=None))
+                        await db.flush()
+                        await db.execute(delete(model).where(model.user_id == user_id))
+                        await db.flush()
+                except Exception as error:
+                    logger.error(
+                        '❌ Ошибка удаления платежей провайдера',
+                        provider=model.__tablename__,
+                        error=str(error),
+                    )
+
+            # Apple IAP: FK поле называется transaction_id_fk (не transaction_id),
+            # поэтому отдельным блоком. user_id имеет CASCADE на users, но это сработает
+            # позже при DELETE User — а DELETE Transaction раньше падал бы из-за FK на apple_transactions.
+            try:
+                async with db.begin_nested():
+                    await db.execute(
+                        update(AppleTransaction)
+                        .where(AppleTransaction.user_id == user_id)
+                        .values(transaction_id_fk=None)
+                    )
+                    await db.flush()
+                    await db.execute(delete(AppleTransaction).where(AppleTransaction.user_id == user_id))
+                    await db.flush()
+            except Exception as error:
+                logger.error('❌ Ошибка удаления Apple IAP платежей', error=str(error))
+
             try:
                 async with db.begin_nested():
                     transactions_result = await db.execute(select(Transaction).where(Transaction.user_id == user_id))
@@ -1210,50 +1398,51 @@ class UserService:
 
             try:
                 async with db.begin_nested():
-                    if user.subscription:
-                        logger.info('🔄 Удаляем подписку', subscription_id=user.subscription.id)
+                    subs = getattr(user, 'subscriptions', None) or []
+                    if subs:
+                        all_squad_ids: set[str] = set()
+                        for sub in subs:
+                            logger.info('🔄 Удаляем подписку', subscription_id=sub.id)
+                            if sub.connected_squads:
+                                all_squad_ids.update(sub.connected_squads)
+                            await db.execute(
+                                delete(SubscriptionServer).where(SubscriptionServer.subscription_id == sub.id)
+                            )
 
-                        # Save squad info before deleting subscription
-                        squad_ids = user.subscription.connected_squads
-
-                        # Delete subscription_servers and subscription FIRST
-                        # Lock order: subscriptions → server_squads (matches webhook order)
-                        await db.execute(
-                            delete(SubscriptionServer).where(SubscriptionServer.subscription_id == user.subscription.id)
-                        )
+                        # Delete all subscriptions for this user
+                        # Lock order: subscriptions -> server_squads (matches webhook order)
                         await db.execute(delete(Subscription).where(Subscription.user_id == user_id))
                         await db.flush()
 
                         # Decrement server_squads.current_users AFTER subscription delete
                         # to match lock ordering with webhook and avoid deadlocks
-                        if squad_ids:
+                        if all_squad_ids:
                             try:
                                 from app.database.crud.server_squad import (
                                     get_server_ids_by_uuids,
                                     remove_user_from_servers,
                                 )
 
-                                int_squad_ids = await get_server_ids_by_uuids(db, list(squad_ids))
+                                int_squad_ids = await get_server_ids_by_uuids(db, list(all_squad_ids))
                                 if int_squad_ids:
                                     await remove_user_from_servers(db, int_squad_ids)
                             except Exception as sq_err:
                                 logger.warning('⚠️ Не удалось уменьшить счётчик серверов', error=sq_err)
             except Exception as e:
-                logger.error('❌ Ошибка удаления подписки', error=e)
+                logger.error('❌ Ошибка удаления подписок', error=e)
 
             try:
                 from app.database.models import (
                     AccessPolicy,
                     AdminAuditLog,
                     AdminRole,
-                    RioPayPayment,
                     SavedPaymentMethod,
                     UserRole,
                     WithdrawalRequest,
                 )
 
                 await db.execute(delete(SavedPaymentMethod).where(SavedPaymentMethod.user_id == user_id))
-                await db.execute(delete(RioPayPayment).where(RioPayPayment.user_id == user_id))
+                # RioPayPayment удаляется выше в extra_payment_models — здесь дубликат не нужен.
                 await db.execute(delete(AdminAuditLog).where(AdminAuditLog.user_id == user_id))
                 await db.execute(delete(WithdrawalRequest).where(WithdrawalRequest.user_id == user_id))
                 await db.execute(
@@ -1272,7 +1461,7 @@ class UserService:
 
             result.bot_deleted = True
             logger.info(
-                '✅ Пользователь (ID: ) полностью удален администратором',
+                '✅ Пользователь полностью удалён администратором',
                 user_id_display=user_id_display,
                 user_id=user_id,
                 admin_id=admin_id,
@@ -1316,7 +1505,7 @@ class UserService:
 
             for user in inactive_users:
                 # Skip users with active paid subscriptions
-                if user.subscription and user.subscription.is_active:
+                if any(sub.is_active for sub in (getattr(user, 'subscriptions', None) or [])):
                     skipped_active_sub += 1
                     continue
 
@@ -1341,7 +1530,18 @@ class UserService:
             if not user:
                 return {}
 
-            subscription = await get_subscription_by_user_id(db, user_id)
+            if settings.is_multi_tariff_enabled():
+                from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+                active_subs = await get_active_subscriptions_by_user_id(db, user_id)
+                if active_subs:
+                    _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+                    _pool = _non_daily or active_subs
+                    subscription = max(_pool, key=lambda s: s.days_left)
+                else:
+                    subscription = None
+            else:
+                subscription = await get_subscription_by_user_id(db, user_id)
             transactions_count = await get_user_transactions_count(db, user_id)
 
             days_since_registration = (datetime.now(UTC) - user.created_at).days

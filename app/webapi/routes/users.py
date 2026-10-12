@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Security, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.database.constants import POSTGRES_INT4_MAX, POSTGRES_INT4_MIN
 from app.database.crud.promo_group import get_promo_group_by_id
 from app.database.crud.subscription import (
     create_paid_subscription,
@@ -26,22 +28,39 @@ from app.database.crud.user import (
     update_user,
 )
 from app.database.models import PaymentMethod, PromoGroup, Subscription, User, UserStatus
+from app.services.manual_topup_service import ManualTopupKeyConflict, credit_manual_topup
 from app.services.subscription_service import SubscriptionService
+from app.services.user_activity_service import (
+    UnknownActivityTypes,
+    UserActivityResponse,
+    collect_user_activity,
+)
+from app.utils.text_search import contains_conditions
 
 from ..dependencies import get_db_session, require_api_token
 from ..schemas.users import (
+    BalanceDepositRequest,
+    BalanceDepositResponse,
     BalanceUpdateRequest,
     PromoGroupSummary,
     SubscriptionSummary,
     UserCreateRequest,
     UserListResponse,
+    UserNotifyChannelResult,
+    UserNotifyRequest,
+    UserNotifyResponse,
     UserResponse,
     UserSubscriptionCreateRequest,
     UserUpdateRequest,
 )
+from ._subscription_state import (
+    restore_subscription_state as _restore_subscription_state,
+    snapshot_subscription_state as _snapshot_subscription_state,
+)
 
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 
 def _serialize_promo_group(group: PromoGroup | None) -> PromoGroupSummary | None:
@@ -61,6 +80,7 @@ def _serialize_subscription(subscription: Subscription | None) -> SubscriptionSu
     if not subscription:
         return None
 
+    tariff = getattr(subscription, 'tariff', None)
     return SubscriptionSummary(
         id=subscription.id,
         status=subscription.status,
@@ -76,16 +96,20 @@ def _serialize_subscription(subscription: Subscription | None) -> SubscriptionSu
         subscription_url=subscription.subscription_url,
         subscription_crypto_link=subscription.subscription_crypto_link,
         connected_squads=list(subscription.connected_squads or []),
+        tariff_id=subscription.tariff_id,
+        tariff_name=tariff.name if tariff is not None else None,
     )
 
 
 def _serialize_user(user: User) -> UserResponse:
     subscription = getattr(user, 'subscription', None)
     promo_group = getattr(user, 'promo_group', None)
+    all_subscriptions = getattr(user, 'subscriptions', None) or []
 
     return UserResponse(
         id=user.id,
         telegram_id=user.telegram_id,
+        email=user.email,
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
@@ -102,21 +126,24 @@ def _serialize_user(user: User) -> UserResponse:
         last_activity=user.last_activity,
         promo_group=_serialize_promo_group(promo_group),
         subscription=_serialize_subscription(subscription),
+        subscriptions=[_serialize_subscription(s) for s in all_subscriptions if s is not None],
     )
 
 
 def _apply_search_filter(query, search: str):
-    search_lower = f'%{search.lower()}%'
-    conditions = [
-        func.lower(User.username).like(search_lower),
-        func.lower(User.first_name).like(search_lower),
-        func.lower(User.last_name).like(search_lower),
-        func.lower(User.referral_code).like(search_lower),
-    ]
+    # lower() в SQL сворачивает регистр по локали базы: под `C` (наш docker-compose)
+    # кириллица не сворачивается, и «поз» не находил «Позитив».
+    # См. app/utils/text_search.py.
+    conditions = contains_conditions(
+        (User.username, User.first_name, User.last_name, User.referral_code),
+        search,
+    )
 
     if search.isdigit():
-        conditions.append(User.telegram_id == int(search))
-        conditions.append(User.id == int(search))
+        numeric_search = int(search)
+        conditions.append(User.telegram_id == numeric_search)
+        if POSTGRES_INT4_MIN <= numeric_search <= POSTGRES_INT4_MAX:
+            conditions.append(User.id == numeric_search)
 
     return query.where(or_(*conditions))
 
@@ -132,7 +159,7 @@ async def list_users(
     search: str | None = Query(default=None),
 ) -> UserListResponse:
     base_query = select(User).options(
-        selectinload(User.subscription),
+        selectinload(User.subscriptions).selectinload(Subscription.tariff),
         selectinload(User.promo_group),
     )
 
@@ -145,7 +172,10 @@ async def list_users(
     if search:
         base_query = _apply_search_filter(base_query, search)
 
-    total_query = base_query.with_only_columns(func.count()).order_by(None)
+    # Считаем по колонке: with_only_columns пересобирает FROM по новым колонкам, и
+    # у безаргументного func.count() таблицы взяться неоткуда — без фильтров запрос
+    # вырождался в `SELECT count(*)` и отдавал 1 вместо числа пользователей.
+    total_query = base_query.with_only_columns(func.count(User.id)).order_by(None)
     total = await db.scalar(total_query) or 0
 
     result = await db.execute(base_query.order_by(User.created_at.desc()).offset(offset).limit(limit))
@@ -291,6 +321,118 @@ async def update_user_endpoint(
     return _serialize_user(found_user)
 
 
+@router.post('/{user_id}/notify', response_model=UserNotifyResponse)
+async def notify_user(
+    user_id: int,
+    payload: UserNotifyRequest,
+    _: Any = Security(require_api_token),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Send a service message to the user over Telegram and email.
+
+    The bot already talks to the customer everywhere else, so integrations
+    should not have to hold a bot token and an SMTP account of their own —
+    they hand over the text and the bot delivers it from the same sender the
+    customer is used to. Parity with the cabinet action «Отправить сообщение»,
+    but for API clients: same checks, plus email.
+
+    Each channel reports separately: the call succeeds when at least one
+    delivery went through, so a customer who blocked the bot still gets the
+    email instead of the whole request failing.
+    """
+    import asyncio
+    import html
+
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+    from app.bot_factory import create_bot
+    from app.cabinet.services.email_service import email_service
+
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User not found')
+
+    requested = {c.strip().lower() for c in (payload.channels or ['telegram', 'email'])}
+    unknown = requested - {'telegram', 'email'}
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f'Unknown channels: {", ".join(sorted(unknown))}',
+        )
+
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail='Message text is empty')
+
+    telegram = UserNotifyChannelResult(sent=False, reason='not_requested')
+    email = UserNotifyChannelResult(sent=False, reason='not_requested')
+
+    if 'telegram' in requested:
+        if not user.telegram_id:
+            telegram = UserNotifyChannelResult(sent=False, reason='no_telegram_id')
+        elif not settings.BOT_TOKEN:
+            telegram = UserNotifyChannelResult(sent=False, reason='bot_not_configured')
+        else:
+            bot = create_bot()
+            try:
+                await bot.send_message(user.telegram_id, text, parse_mode=payload.parse_mode)
+                telegram = UserNotifyChannelResult(sent=True)
+            except TelegramForbiddenError:
+                telegram = UserNotifyChannelResult(sent=False, reason='blocked_by_user')
+            except TelegramBadRequest as error:
+                logger.warning(
+                    'Web API: Telegram rejected the notification',
+                    user_id=user_id,
+                    error=str(error),
+                )
+                telegram = UserNotifyChannelResult(sent=False, reason='rejected_by_telegram')
+            except Exception as error:  # доставка не должна ронять запрос
+                logger.error('Web API: notification to Telegram failed', user_id=user_id, error=str(error))
+                telegram = UserNotifyChannelResult(sent=False, reason='send_failed')
+            finally:
+                await bot.session.close()
+
+    if 'email' in requested:
+        if not user.email:
+            email = UserNotifyChannelResult(sent=False, reason='no_email')
+        elif not user.email_verified:
+            # Как и остальные уведомления бота: неподтверждённый адрес мог
+            # оказаться чужим, письмо о нарушении туда уходить не должно.
+            email = UserNotifyChannelResult(sent=False, reason='email_not_verified')
+        elif not email_service.is_configured():
+            email = UserNotifyChannelResult(sent=False, reason='smtp_not_configured')
+        else:
+            try:
+                sent = await asyncio.to_thread(
+                    email_service.send_email,
+                    to_email=user.email,
+                    subject=payload.email_subject or 'Уведомление',
+                    body_html=payload.email_html or f'<p>{text if payload.parse_mode else html.escape(text)}</p>',
+                    body_text=text,
+                )
+                email = UserNotifyChannelResult(sent=bool(sent), reason=None if sent else 'send_failed')
+            except Exception as error:
+                logger.error('Web API: notification by email failed', user_id=user_id, error=str(error))
+                email = UserNotifyChannelResult(sent=False, reason='send_failed')
+
+    if not telegram.sent and not email.sent:
+        logger.info(
+            'Web API: notification delivered to nobody',
+            user_id=user_id,
+            telegram_reason=telegram.reason,
+            email_reason=email.reason,
+        )
+    else:
+        logger.info(
+            'Web API: notification delivered',
+            user_id=user_id,
+            telegram=telegram.sent,
+            email=email.sent,
+        )
+
+    return UserNotifyResponse(user_id=user_id, telegram=telegram, email=email)
+
+
 @router.post('/{user_id}/balance', response_model=UserResponse)
 async def update_balance(
     user_id: int,
@@ -343,6 +485,106 @@ async def update_balance(
     return _serialize_user(found_user)
 
 
+def _open_bot() -> Any | None:
+    """Бот для уведомлений. None — уведомления пропускаем, деньги всё равно зачисляем."""
+    try:
+        from app.bot_factory import create_bot
+
+        return create_bot()
+    except Exception as error:
+        logger.error('Не удалось создать бота для уведомлений о пополнении', error=error)
+        return None
+
+
+@router.post('/{user_id}/deposit', response_model=BalanceDepositResponse)
+async def deposit_balance(
+    user_id: int,
+    payload: BalanceDepositRequest,
+    token: Any = Security(require_api_token),
+    db: AsyncSession = Depends(get_db_session),
+) -> BalanceDepositResponse:
+    """Ручное пополнение баланса — как настоящий платёж, но инициированное поддержкой.
+
+    В отличие от `POST /users/{id}/balance` (низкоуровневая корректировка числа) здесь:
+
+    * только зачисление, списать нельзя;
+    * `idempotency_key` — повтор запроса не начислит деньги дважды;
+    * запускается весь конвейер настоящего пополнения: реферальная комиссия,
+      уведомление пользователю, возобновление приостановленной суточной подписки,
+      автопокупка сохранённой корзины. Без этого «поддержка начислила вручную»
+      оставляло аккаунт в состоянии «деньги есть, подписка не работает»;
+    * сумма ограничена `WEB_API_MANUAL_DEPOSIT_MAX_KOPEKS`.
+
+    `user_id` — внутренний ID либо Telegram ID (как и в остальных `/users` эндпоинтах).
+    Кого именно пополнили, видно в ответе (`user_id` + `telegram_id`).
+    """
+    max_kopeks = settings.WEB_API_MANUAL_DEPOSIT_MAX_KOPEKS
+    if max_kopeks and payload.amount_kopeks > max_kopeks:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f'Amount {payload.amount_kopeks} exceeds the manual deposit limit of {max_kopeks} kopeks '
+            f'(raise WEB_API_MANUAL_DEPOSIT_MAX_KOPEKS or use POST /users/{{id}}/balance)',
+        )
+
+    found_user = await _get_user_by_id_or_telegram_id(db, user_id)
+    # Снимаем идентификаторы ДО начисления: в ветке гонки по ключу идемпотентности
+    # внутри делается rollback, а он экспирирует ORM-объект — обращение к атрибуту
+    # после этого ушло бы в ленивую подгрузку и упало бы MissingGreenlet.
+    resolved_id = found_user.id
+    resolved_telegram_id = found_user.telegram_id
+
+    bot = _open_bot()
+    try:
+        result = await credit_manual_topup(
+            db,
+            found_user,
+            amount_kopeks=payload.amount_kopeks,
+            description=payload.description or 'Ручное пополнение',
+            idempotency_key=payload.idempotency_key,
+            bot=bot,
+            notify_user=payload.notify_user,
+            apply_topup_bonuses=payload.apply_topup_bonuses,
+        )
+    except ManualTopupKeyConflict as conflict:
+        # Тот же ключ, но другая сумма или другой пользователь — ошибка вызывающего.
+        # Молчаливое «duplicate, ничего не начислено» агент прочитал бы как успех.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f'Idempotency key already used by transaction {conflict.transaction.id} '
+            f'(user {conflict.transaction.user_id}, {conflict.transaction.amount_kopeks} kopeks)',
+        ) from conflict
+    finally:
+        if bot is not None:
+            try:
+                await bot.session.close()
+            except Exception as error:
+                logger.warning('Не удалось закрыть сессию бота после пополнения', error=error)
+
+    logger.info(
+        'Ручное пополнение через API',
+        token_id=getattr(token, 'id', None),
+        token_name=getattr(token, 'name', None),
+        user_id=resolved_id,
+        telegram_id=resolved_telegram_id,
+        amount_kopeks=payload.amount_kopeks,
+        idempotency_key=payload.idempotency_key,
+        duplicate=result.duplicate,
+        transaction_id=result.transaction.id,
+    )
+
+    return BalanceDepositResponse(
+        success=True,
+        duplicate=result.duplicate,
+        user_id=resolved_id,
+        telegram_id=resolved_telegram_id,
+        transaction_id=result.transaction.id,
+        amount_kopeks=result.transaction.amount_kopeks,
+        old_balance_kopeks=result.old_balance_kopeks,
+        new_balance_kopeks=result.new_balance_kopeks,
+        new_balance_rubles=round(result.new_balance_kopeks / 100, 2),
+    )
+
+
 async def _get_user_by_id_or_telegram_id(db: AsyncSession, user_id: int) -> User:
     """Helper function to get user by ID or telegram_id"""
     user = await get_user_by_telegram_id(db, user_id)
@@ -353,6 +595,15 @@ async def _get_user_by_id_or_telegram_id(db: AsyncSession, user_id: int) -> User
     if not user:
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'User not found')
     return user
+
+
+async def _delete_subscription_if_exists(db: AsyncSession, subscription_id: int) -> None:
+    result = await db.execute(select(Subscription).where(Subscription.id == subscription_id))
+    subscription = result.scalar_one_or_none()
+    if not subscription:
+        return
+    await db.delete(subscription)
+    await db.commit()
 
 
 @router.post('/{user_id}/subscription', response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -368,114 +619,232 @@ async def create_user_subscription(
     """
     user = await _get_user_by_id_or_telegram_id(db, user_id)
 
-    existing = await get_subscription_by_user_id(db, user.id)
-    if existing and not payload.replace_existing:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, 'User already has a subscription. Use replace_existing=true to replace it'
-        )
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+        active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+        if payload.replace_existing and payload.subscription_id:
+            from app.database.crud.subscription import get_subscription_by_id
+
+            existing = await get_subscription_by_id(db, payload.subscription_id)
+            if existing and existing.user_id != user.id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Subscription does not belong to this user')
+        elif payload.replace_existing and active_subs:
+            if len(active_subs) == 1:
+                existing = active_subs[0]
+            else:
+                _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+                _pool = _non_daily or active_subs
+                existing = max(_pool, key=lambda s: s.days_left)
+        else:
+            existing = None
+        if active_subs and not payload.replace_existing:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                'User already has a subscription. Use replace_existing=true to replace it',
+            )
+    else:
+        existing = await get_subscription_by_user_id(db, user.id)
+        if existing and not payload.replace_existing:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                'User already has a subscription. Use replace_existing=true to replace it',
+            )
+    previous_state = _snapshot_subscription_state(existing) if existing else None
 
     forced_devices = None
     if not settings.is_devices_selection_enabled():
         forced_devices = settings.get_disabled_mode_device_limit()
 
-    if payload.is_trial:
-        trial_device_limit = payload.device_limit
-        if trial_device_limit is None:
-            trial_device_limit = forced_devices
-        duration_days = payload.duration_days or settings.TRIAL_DURATION_DAYS
-        traffic_limit_gb = payload.traffic_limit_gb or settings.TRIAL_TRAFFIC_LIMIT_GB
+    subscription = None
+    try:
+        if payload.is_trial:
+            trial_device_limit = payload.device_limit
+            if trial_device_limit is None:
+                trial_device_limit = forced_devices
+            duration_days = payload.duration_days or settings.TRIAL_DURATION_DAYS
+            traffic_limit_gb = payload.traffic_limit_gb or settings.TRIAL_TRAFFIC_LIMIT_GB
 
-        if existing:
-            # Сохраняем существующие сквады при замене
-            connected_squads = list(existing.connected_squads or [])
-            if payload.squad_uuid:
-                connected_squads = [payload.squad_uuid]
-            elif payload.connected_squads:
-                connected_squads = payload.connected_squads
+            if existing:
+                # Сохраняем существующие сквады при замене
+                connected_squads = list(existing.connected_squads or [])
+                if payload.squad_uuid:
+                    connected_squads = [payload.squad_uuid]
+                elif payload.connected_squads:
+                    connected_squads = payload.connected_squads
 
-            subscription = await replace_subscription(
-                db,
-                existing,
-                duration_days=duration_days,
-                traffic_limit_gb=traffic_limit_gb,
-                device_limit=(trial_device_limit if trial_device_limit is not None else settings.TRIAL_DEVICE_LIMIT),
-                connected_squads=connected_squads,
-                is_trial=True,
-                update_server_counters=True,
-            )
-        else:
-            subscription = await create_trial_subscription(
-                db,
-                user_id=user.id,
-                duration_days=duration_days,
-                traffic_limit_gb=traffic_limit_gb,
-                device_limit=trial_device_limit,
-                squad_uuid=payload.squad_uuid,
-            )
-    else:
-        if payload.duration_days is None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'duration_days is required for paid subscriptions')
-        device_limit = payload.device_limit
-        if device_limit is None:
-            if forced_devices is not None:
-                device_limit = forced_devices
+                subscription = await replace_subscription(
+                    db,
+                    existing,
+                    duration_days=duration_days,
+                    traffic_limit_gb=traffic_limit_gb,
+                    device_limit=(
+                        trial_device_limit if trial_device_limit is not None else settings.TRIAL_DEVICE_LIMIT
+                    ),
+                    connected_squads=connected_squads,
+                    is_trial=True,
+                    update_server_counters=True,
+                )
             else:
-                device_limit = settings.DEFAULT_DEVICE_LIMIT
-
-        if existing:
-            subscription = await replace_subscription(
-                db,
-                existing,
-                duration_days=payload.duration_days,
-                traffic_limit_gb=payload.traffic_limit_gb or settings.DEFAULT_TRAFFIC_LIMIT_GB,
-                device_limit=device_limit,
-                connected_squads=payload.connected_squads or [],
-                is_trial=False,
-                update_server_counters=True,
-            )
+                subscription = await create_trial_subscription(
+                    db,
+                    user_id=user.id,
+                    duration_days=duration_days,
+                    traffic_limit_gb=traffic_limit_gb,
+                    device_limit=trial_device_limit,
+                    squad_uuid=payload.squad_uuid,
+                )
         else:
-            subscription = await create_paid_subscription(
-                db,
-                user_id=user.id,
-                duration_days=payload.duration_days,
-                traffic_limit_gb=payload.traffic_limit_gb or settings.DEFAULT_TRAFFIC_LIMIT_GB,
-                device_limit=device_limit,
-                connected_squads=payload.connected_squads or [],
-                update_server_counters=True,
-            )
+            if payload.duration_days is None:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, 'duration_days is required for paid subscriptions')
+            device_limit = payload.device_limit
+            if device_limit is None:
+                if forced_devices is not None:
+                    device_limit = forced_devices
+                else:
+                    device_limit = settings.DEFAULT_DEVICE_LIMIT
 
-        # Создаем пользователя в RemnaWave для платных подписок
+            if existing:
+                subscription = await replace_subscription(
+                    db,
+                    existing,
+                    duration_days=payload.duration_days,
+                    traffic_limit_gb=payload.traffic_limit_gb or settings.DEFAULT_TRAFFIC_LIMIT_GB,
+                    device_limit=device_limit,
+                    connected_squads=payload.connected_squads or [],
+                    is_trial=False,
+                    update_server_counters=True,
+                )
+            else:
+                subscription = await create_paid_subscription(
+                    db,
+                    user_id=user.id,
+                    duration_days=payload.duration_days,
+                    traffic_limit_gb=payload.traffic_limit_gb or settings.DEFAULT_TRAFFIC_LIMIT_GB,
+                    device_limit=device_limit,
+                    connected_squads=payload.connected_squads or [],
+                    update_server_counters=True,
+                )
+
         subscription_service = SubscriptionService()
-        await subscription_service.create_remnawave_user(db, subscription)
+        rem_user = await subscription_service.update_remnawave_user(db, subscription, reset_traffic=False)
+        if not rem_user:
+            rem_user = await subscription_service.create_remnawave_user(db, subscription, reset_traffic=False)
+        if not rem_user:
+            raise ValueError('Failed to create/update user in Remnawave')
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception('Failed to sync user subscription with Remnawave', user_id=user.id)
+        try:
+            if existing and previous_state is not None:
+                await _restore_subscription_state(db, existing.id, previous_state)
+            elif subscription is not None:
+                await _delete_subscription_if_exists(db, subscription.id)
+        except Exception:
+            logger.exception('Failed to rollback user subscription mutation', user_id=user.id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to sync with Remnawave',
+        )
 
     # Перезагружаем пользователя с подпиской
     user = await get_user_by_id(db, user.id)
     return _serialize_user(user)
 
 
+@router.patch('/{user_id}/subscription', response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def patch_user_subscription(
+    user_id: int,
+    payload: UserSubscriptionCreateRequest,
+    _: Any = Security(require_api_token),
+    db: AsyncSession = Depends(get_db_session),
+) -> UserResponse:
+    return await create_user_subscription(user_id, payload, _, db)
+
+
 @router.delete('/{user_id}/subscription', response_model=UserResponse)
 async def delete_user_subscription(
     user_id: int,
+    subscription_id: int | None = None,
     _: Any = Security(require_api_token),
     db: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
     """
     Деактивировать подписку пользователя.
     Подписка не удаляется физически, а помечается как DISABLED.
+    In multi-tariff mode, subscription_id query param specifies which subscription to deactivate.
     """
     user = await _get_user_by_id_or_telegram_id(db, user_id)
 
-    subscription = await get_subscription_by_user_id(db, user.id)
+    if settings.is_multi_tariff_enabled():
+        if subscription_id:
+            from app.database.crud.subscription import get_subscription_by_id
+
+            subscription = await get_subscription_by_id(db, subscription_id)
+            if subscription and subscription.user_id != user.id:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Subscription does not belong to this user')
+        else:
+            from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+            active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+            if not active_subs:
+                subscription = None
+            elif len(active_subs) == 1:
+                subscription = active_subs[0]
+            else:
+                _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+                _pool = _non_daily or active_subs
+                subscription = max(_pool, key=lambda s: s.days_left)
+    else:
+        subscription = await get_subscription_by_user_id(db, user.id)
     if not subscription:
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'User has no subscription')
 
+    # Подписка деактивируется — СБП-автопродление Platega обязано быть отменено,
+    # иначе следующий push-коллбек продлит и заново включит её, а банк продолжит списывать.
+    from app.services.cashera_recurring_cancel import cancel_cashera_recurring_for_subscription_safe
+    from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+    from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+    await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+
+    await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+    await cancel_cashera_recurring_for_subscription_safe(db, subscription.id)
     await deactivate_subscription(db, subscription)
 
-    # Деактивируем пользователя в RemnaWave, если есть UUID
-    if user.remnawave_uuid:
+    # Деактивируем пользователя в RemnaWave, если есть панельная идентичность
+    panel_user_id = subscription.remnawave_id if settings.is_multi_tariff_enabled() else user.remnawave_id
+    if panel_user_id:
         subscription_service = SubscriptionService()
-        await subscription_service.disable_remnawave_user(user.remnawave_uuid)
+        await subscription_service.disable_remnawave_user(panel_user_id)
 
     # Перезагружаем пользователя
     user = await get_user_by_id(db, user.id)
     return _serialize_user(user)
+
+
+@router.get('/{user_id}/activity', response_model=UserActivityResponse)
+async def get_user_activity(
+    user_id: int,
+    _: Any = Security(require_api_token),
+    db: AsyncSession = Depends(get_db_session),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    types: str | None = Query(None, description='CSV filter by record type, see UserActivityItem.type'),
+) -> UserActivityResponse:
+    """Таймлайн активности пользователя: бот, кабинет и мини-апп одной лентой.
+
+    Та же лента, что показывает админка кабинета: транзакции, события подписки,
+    промокоды, купоны, обращения, колесо, опросы, подарки, реферальные
+    начисления, выводы, входы в кабинет и клики по кнопкам. ``user_id``
+    принимает и telegram_id, и внутренний id — как остальные ручки раздела.
+    """
+    user = await get_user_by_telegram_id(db, user_id) or await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'User not found')
+
+    try:
+        return await collect_user_activity(db, user.id, offset=offset, limit=limit, types=types)
+    except UnknownActivityTypes as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error

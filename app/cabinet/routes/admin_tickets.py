@@ -10,6 +10,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.cabinet.routes.media import make_media_token
 from app.cabinet.routes.websocket import notify_user_ticket_reply
 from app.config import settings
 from app.database.crud.ticket import TicketCRUD
@@ -17,7 +18,8 @@ from app.database.crud.ticket_notification import TicketNotificationCRUD
 from app.database.models import Ticket, TicketMessage, User
 
 from ..dependencies import get_cabinet_db, require_permission
-from ..schemas.tickets import TicketMessageResponse
+from ..schemas.tickets import TicketMediaItem, TicketMessageResponse, _validate_media_bundle
+from .settings_form import env_locked_fields, form_updates, save_settings_form
 
 
 logger = structlog.get_logger(__name__)
@@ -89,19 +91,19 @@ class AdminTicketListResponse(BaseModel):
 class AdminReplyRequest(BaseModel):
     """Admin reply to ticket."""
 
-    message: str = Field(..., min_length=1, max_length=4000, description='Reply message')
+    message: str = Field(default='', max_length=4000, description='Reply message')
     media_type: str | None = Field(None, description='Media type: photo, video, or document')
     media_file_id: str | None = Field(None, max_length=255, description='Telegram file_id from media upload')
     media_caption: str | None = Field(None, max_length=1000, description='Caption for media')
+    media_items: list[TicketMediaItem] | None = Field(None, description='Multi-media gallery attachments')
 
     @model_validator(mode='after')
     def validate_media_fields(self) -> 'AdminReplyRequest':
-        if self.media_file_id and not self.media_type:
-            raise ValueError('media_type is required when media_file_id is provided')
-        if self.media_type and not self.media_file_id:
-            raise ValueError('media_file_id is required when media_type is provided')
-        if self.media_type and self.media_type not in {'photo', 'video', 'document'}:
-            raise ValueError('media_type must be one of: photo, video, document')
+        _validate_media_bundle(self.media_type, self.media_file_id, self.media_items)
+        has_text = bool(self.message.strip())
+        has_media = bool(self.media_file_id) or bool(self.media_items)
+        if not has_text and not has_media:
+            raise ValueError('message or media is required')
         return self
 
 
@@ -138,6 +140,17 @@ class TicketSettingsResponse(BaseModel):
     # Cabinet notifications settings
     cabinet_user_notifications_enabled: bool = True
     cabinet_admin_notifications_enabled: bool = True
+    # Поля, закреплённые в .env: из кабинета их не изменить, база их не перекрывает.
+    env_locked: list[str] = []
+
+
+# Поле формы → ключ Settings. Хранение и применение — через system_settings (settings_form).
+TICKET_SETTING_KEYS: dict[str, str] = {
+    'sla_enabled': 'SUPPORT_TICKET_SLA_ENABLED',
+    'sla_minutes': 'SUPPORT_TICKET_SLA_MINUTES',
+    'sla_check_interval_seconds': 'SUPPORT_TICKET_SLA_CHECK_INTERVAL_SECONDS',
+    'sla_reminder_cooldown_minutes': 'SUPPORT_TICKET_SLA_REMINDER_COOLDOWN_MINUTES',
+}
 
 
 class TicketSettingsUpdateRequest(BaseModel):
@@ -157,14 +170,26 @@ class TicketSettingsUpdateRequest(BaseModel):
 
 def _message_to_response(message: TicketMessage) -> TicketMessageResponse:
     """Convert TicketMessage to response."""
+    raw_items = getattr(message, 'media_items', None) or None
+    items = None
+    if raw_items:
+        try:
+            items = [TicketMediaItem(**it) for it in raw_items]
+            for it in items:
+                it.token = make_media_token(it.file_id)
+        except (TypeError, KeyError, ValueError) as exc:
+            logger.warning('Failed to parse media_items', message_id=message.id, error=str(exc))
+            items = None
     return TicketMessageResponse(
         id=message.id,
         message_text=message.message_text or '',
         is_from_admin=message.is_from_admin,
-        has_media=bool(message.media_file_id),
+        has_media=bool(message.media_file_id) or bool(items),
         media_type=message.media_type,
         media_file_id=message.media_file_id,
+        media_token=make_media_token(message.media_file_id) if message.media_file_id else None,
         media_caption=message.media_caption,
+        media_items=items,
         created_at=message.created_at,
     )
 
@@ -246,9 +271,10 @@ async def get_ticket_settings(
         sla_minutes=settings.SUPPORT_TICKET_SLA_MINUTES,
         sla_check_interval_seconds=settings.SUPPORT_TICKET_SLA_CHECK_INTERVAL_SECONDS,
         sla_reminder_cooldown_minutes=settings.SUPPORT_TICKET_SLA_REMINDER_COOLDOWN_MINUTES,
-        support_system_mode=settings.get_support_system_mode(),
+        support_system_mode=SupportSettingsService.get_system_mode(),
         cabinet_user_notifications_enabled=SupportSettingsService.get_cabinet_user_notifications_enabled(),
         cabinet_admin_notifications_enabled=SupportSettingsService.get_cabinet_admin_notifications_enabled(),
+        env_locked=env_locked_fields(TICKET_SETTING_KEYS),
     )
 
 
@@ -258,10 +284,7 @@ async def update_ticket_settings(
     admin: User = Depends(require_permission('tickets:settings')),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Update ticket system settings."""
-    import asyncio
-    from pathlib import Path
-
+    """Update ticket system settings — всё в system_settings: SLA формой, режим и уведомления через сервис."""
     from app.services.support_settings_service import SupportSettingsService
 
     # Validate support_system_mode
@@ -273,74 +296,31 @@ async def update_ticket_settings(
                 detail='Invalid support_system_mode. Must be: tickets, contact, or both',
             )
 
-    # Update in-memory settings
-    if request.sla_enabled is not None:
-        settings.SUPPORT_TICKET_SLA_ENABLED = request.sla_enabled
-    if request.sla_minutes is not None:
-        settings.SUPPORT_TICKET_SLA_MINUTES = request.sla_minutes
-    if request.sla_check_interval_seconds is not None:
-        settings.SUPPORT_TICKET_SLA_CHECK_INTERVAL_SECONDS = request.sla_check_interval_seconds
-    if request.sla_reminder_cooldown_minutes is not None:
-        settings.SUPPORT_TICKET_SLA_REMINDER_COOLDOWN_MINUTES = request.sla_reminder_cooldown_minutes
+    updates = form_updates(TICKET_SETTING_KEYS, request.model_dump(exclude_none=True))
+    await save_settings_form(db, updates)
+
     if request.support_system_mode is not None:
-        SupportSettingsService.set_system_mode(request.support_system_mode.strip().lower())
-
-    # Update cabinet notification settings
+        await SupportSettingsService.set_system_mode(db, request.support_system_mode.strip().lower())
     if request.cabinet_user_notifications_enabled is not None:
-        SupportSettingsService.set_cabinet_user_notifications_enabled(request.cabinet_user_notifications_enabled)
+        await SupportSettingsService.set_cabinet_user_notifications_enabled(
+            db, request.cabinet_user_notifications_enabled
+        )
     if request.cabinet_admin_notifications_enabled is not None:
-        SupportSettingsService.set_cabinet_admin_notifications_enabled(request.cabinet_admin_notifications_enabled)
+        await SupportSettingsService.set_cabinet_admin_notifications_enabled(
+            db, request.cabinet_admin_notifications_enabled
+        )
 
-    # Try to persist to .env file
-    try:
-        env_file = Path('.env')
-        if await asyncio.to_thread(env_file.exists):
-            lines = (await asyncio.to_thread(env_file.read_text)).splitlines()
-            updates = {}
-
-            if request.sla_enabled is not None:
-                updates['SUPPORT_TICKET_SLA_ENABLED'] = str(request.sla_enabled).lower()
-            if request.sla_minutes is not None:
-                updates['SUPPORT_TICKET_SLA_MINUTES'] = str(request.sla_minutes)
-            if request.sla_check_interval_seconds is not None:
-                updates['SUPPORT_TICKET_SLA_CHECK_INTERVAL_SECONDS'] = str(request.sla_check_interval_seconds)
-            if request.sla_reminder_cooldown_minutes is not None:
-                updates['SUPPORT_TICKET_SLA_REMINDER_COOLDOWN_MINUTES'] = str(request.sla_reminder_cooldown_minutes)
-            if request.support_system_mode is not None:
-                updates['SUPPORT_SYSTEM_MODE'] = request.support_system_mode.strip().lower()
-
-            new_lines = []
-            updated_keys = set()
-
-            for line in lines:
-                updated = False
-                for key, value in updates.items():
-                    if line.startswith(f'{key}='):
-                        new_lines.append(f'{key}={value}')
-                        updated_keys.add(key)
-                        updated = True
-                        break
-                if not updated:
-                    new_lines.append(line)
-
-            # Add any keys that weren't found
-            for key, value in updates.items():
-                if key not in updated_keys:
-                    new_lines.append(f'{key}={value}')
-
-            await asyncio.to_thread(env_file.write_text, '\n'.join(new_lines) + '\n')
-            logger.info('Updated ticket settings in .env file')
-    except Exception as e:
-        logger.warning('Failed to update .env file', error=e)
+    logger.info('Admin updated ticket settings', admin_id=admin.id, keys=sorted(updates))
 
     return TicketSettingsResponse(
         sla_enabled=settings.SUPPORT_TICKET_SLA_ENABLED,
         sla_minutes=settings.SUPPORT_TICKET_SLA_MINUTES,
         sla_check_interval_seconds=settings.SUPPORT_TICKET_SLA_CHECK_INTERVAL_SECONDS,
         sla_reminder_cooldown_minutes=settings.SUPPORT_TICKET_SLA_REMINDER_COOLDOWN_MINUTES,
-        support_system_mode=settings.get_support_system_mode(),
+        support_system_mode=SupportSettingsService.get_system_mode(),
         cabinet_user_notifications_enabled=SupportSettingsService.get_cabinet_user_notifications_enabled(),
         cabinet_admin_notifications_enabled=SupportSettingsService.get_cabinet_admin_notifications_enabled(),
+        env_locked=env_locked_fields(TICKET_SETTING_KEYS),
     )
 
 
@@ -455,17 +435,34 @@ async def reply_to_ticket(
             detail='Ticket not found',
         )
 
-    # Create admin message
-    has_media = bool(request.media_file_id)
+    # Resolve media payload: prefer media_items, fall back to legacy single-media fields
+    items_payload = None
+    primary_type = request.media_type
+    primary_file_id = request.media_file_id
+    primary_caption = request.media_caption
+    if request.media_items:
+        items_payload = [it.model_dump() for it in request.media_items]
+        first = request.media_items[0]
+        primary_type = first.type
+        primary_file_id = first.file_id
+        primary_caption = primary_caption or first.caption
+    has_media = bool(primary_file_id)
+
     message = TicketMessage(
         ticket_id=ticket.id,
-        user_id=ticket.user_id,
+        # Автор сообщения — реально ответивший админ, а не владелец тикета:
+        # иначе при нескольких сотрудниках поддержки невозможно установить,
+        # кто отвечал (#3029). Бот-путь (handlers/admin/tickets.py) пишет id
+        # админа с самого начала — выравниваем семантику. Отображение стороны
+        # сообщения везде идёт по is_from_admin, а не по user_id.
+        user_id=admin.id,
         message_text=request.message,
         is_from_admin=True,
         has_media=has_media,
-        media_type=request.media_type if has_media else None,
-        media_file_id=request.media_file_id if has_media else None,
-        media_caption=request.media_caption if has_media else None,
+        media_type=primary_type if has_media else None,
+        media_file_id=primary_file_id if has_media else None,
+        media_caption=primary_caption if has_media else None,
+        media_items=items_payload,
         created_at=datetime.now(UTC),
     )
     db.add(message)
@@ -476,6 +473,26 @@ async def reply_to_ticket(
 
     await db.commit()
     await db.refresh(message)
+
+    # Feed the mobile support socket bridge (event_emitter -> support_ws).
+    try:
+        from app.services.event_emitter import event_emitter
+
+        await event_emitter.emit(
+            'ticket.message_added',
+            {
+                'ticket_id': ticket.id,
+                'message_id': message.id,
+                'user_id': admin.id,
+                'is_from_admin': True,
+                'message_text': (request.message or '')[:200],
+                'has_media': has_media,
+                'status': ticket.status,
+            },
+            db=db,
+        )
+    except Exception as error:
+        logger.warning('Failed to emit ticket.message_added (admin) from cabinet', error=error)
 
     # Try to notify user via Telegram
     try:

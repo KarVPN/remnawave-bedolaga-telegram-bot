@@ -1,17 +1,29 @@
 import structlog
 from aiogram import Dispatcher, F, types
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.crud.subscription import (
     get_all_subscriptions,
     get_expired_subscriptions,
     get_expiring_subscriptions,
     get_subscriptions_statistics,
 )
-from app.database.models import User
+from app.database.models import (
+    ServerSquad,
+    Subscription,
+    SubscriptionServer,
+    SubscriptionStatus,
+    User,
+)
+from app.localization.texts import Texts
 from app.utils.decorators import admin_required, error_handler
 from app.utils.formatters import format_datetime
+from app.utils.subscription_time import local_days_until
+
+
+logger = structlog.get_logger(__name__)
 
 
 def get_country_flag(country_name: str) -> str:
@@ -43,25 +55,34 @@ def get_country_flag(country_name: str) -> str:
 
 
 async def get_users_by_countries(db: AsyncSession) -> dict:
+    """Распределение активных пользователей по странам подключённых серверов.
+
+    Один user может быть посчитан в нескольких странах, если у активной подписки
+    подключены squad'ы из разных регионов — это ожидаемое поведение для географии.
+    """
     try:
         result = await db.execute(
-            select(User.preferred_location, func.count(User.id))
-            .where(User.preferred_location.isnot(None))
-            .group_by(User.preferred_location)
+            select(
+                ServerSquad.country_code,
+                func.count(distinct(Subscription.user_id)),
+            )
+            .select_from(Subscription)
+            .join(SubscriptionServer, SubscriptionServer.subscription_id == Subscription.id)
+            .join(ServerSquad, SubscriptionServer.server_squad_id == ServerSquad.id)
+            .where(Subscription.status == SubscriptionStatus.ACTIVE.value)
+            .where(ServerSquad.country_code.isnot(None))
+            .group_by(ServerSquad.country_code)
         )
 
         stats = {}
-        for location, count in result.fetchall():
-            if location:
-                stats[location] = count
+        for country_code, count in result.fetchall():
+            if country_code:
+                stats[country_code] = count
 
         return stats
-    except Exception as e:
-        logger.error('Ошибка получения статистики по странам', error=e)
+    except Exception as error:
+        logger.error('Ошибка получения статистики по странам', error=str(error), exc_info=True)
         return {}
-
-
-logger = structlog.get_logger(__name__)
 
 
 @admin_required
@@ -125,8 +146,8 @@ async def show_subscriptions_list(callback: types.CallbackQuery, db_user: User, 
 
             text += f'{i}. {sub_type} {user_info}\n'
             text += f'   {status} | До: {format_datetime(sub.end_date)}\n'
-            if sub.device_limit > 0:
-                text += f'   📱 Устройств: {sub.device_limit}\n'
+            if sub.device_limit is not None:
+                text += f'   📱 Устройств: {Texts.format_device_limit(sub.device_limit)}\n'
             text += '\n'
 
     keyboard = []
@@ -362,12 +383,21 @@ async def send_expiry_reminders(callback: types.CallbackQuery, db_user: User, db
                     logger.debug('Пропуск email-пользователя при отправке напоминания', user_id=user.id)
                     continue
 
-                days_left = max(1, subscription.days_left)
+                from app.utils.notification_prefs import is_subscription_expiry_enabled
 
+                if not settings.is_notifications_enabled() or not is_subscription_expiry_enabled(user):
+                    continue
+
+                days_left = local_days_until(subscription.end_date)
+                expires_when = 'сегодня' if days_left == 0 else f'через {days_left} день(а)'
+
+                tariff_label = ''
+                if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
+                    tariff_label = f' «{subscription.tariff.name}»'
                 reminder_text = f"""
-⚠️ <b>Подписка истекает!</b>
+⚠️ <b>Подписка{tariff_label} истекает!</b>
 
-Ваша подписка истекает через {days_left} день(а).
+Ваша подписка истекает {expires_when}.
 
 Не забудьте продлить подписку, чтобы не потерять доступ к серверам.
 

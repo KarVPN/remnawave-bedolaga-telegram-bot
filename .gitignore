@@ -38,8 +38,12 @@
 !app/**
 !tests/
 !tests/**
+!docker/
+!docker/**
 !migrations/
 !migrations/**
+!scripts/
+!scripts/**
 !docs/
 !docs/**
 !assets/

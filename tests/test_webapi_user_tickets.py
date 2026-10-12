@@ -210,6 +210,7 @@ def store(monkeypatch) -> _Store:
         media_type=None,
         media_file_id=None,
         media_caption=None,
+        media_items=None,
     ):
         store._ticket_seq += 1
         author = person(user_id)
@@ -217,6 +218,8 @@ def store(monkeypatch) -> _Store:
         message = store.new_message(user=author, ticket_id=ticket.id, text=message_text, media_file_id=media_file_id)
         message.media_type = media_type
         message.media_caption = media_caption
+        message.media_items = media_items
+        message.has_media = bool(media_file_id or media_items)
         ticket.messages = [message]
         store.created_messages.append(message)
         return ticket
@@ -230,11 +233,14 @@ def store(monkeypatch) -> _Store:
         media_type=None,
         media_file_id=None,
         media_caption=None,
+        media_items=None,
     ):
         author = person(user_id)
         message = store.new_message(user=author, ticket_id=ticket_id, text=message_text, media_file_id=media_file_id)
         message.media_type = media_type
         message.media_caption = media_caption
+        message.media_items = media_items
+        message.has_media = bool(media_file_id or media_items)
         store.created_messages.append(message)
 
         ticket = store.tickets[ticket_id]
@@ -627,7 +633,7 @@ class TestAddingMessages:
 
 
 class TestFieldBounds:
-    """Границы полей — как у кабинетных роутов: title 3..255, message 10..4000."""
+    """Границы полей — как у кабинетных роутов: title 3..255, message up to 4000 or media."""
 
     def _bounds(self, model, field: str) -> tuple[int | None, int | None]:
         minimum = maximum = None
@@ -651,7 +657,7 @@ class TestFieldBounds:
         [
             ({'title': 'ab', 'message': 'Подключение не устанавливается'}, 'title is too short'),
             ({'title': 'a' * 256, 'message': 'Подключение не устанавливается'}, 'title is too long'),
-            ({'title': 'Не работает VPN', 'message': 'a' * 9}, 'message is too short'),
+            ({'title': 'Не работает VPN', 'message': ''}, 'message or media is required'),
             ({'title': 'Не работает VPN', 'message': 'a' * 4001}, 'message is too long'),
         ],
     )
@@ -719,3 +725,25 @@ class TestContract:
         assert set(UserTicketSummaryResponse.model_fields) == set(CabinetTicketResponse.model_fields)
         assert set(UserTicketMessageResponse.model_fields) == set(CabinetTicketMessageResponse.model_fields)
         assert set(CabinetTicketDetailResponse.model_fields) <= set(UserTicketDetailResponse.model_fields)
+
+
+@pytest.mark.asyncio
+async def test_machine_ticket_accepts_media_only_bundle_and_signs_tokens(machine_app, store):
+    store.add_user(TELEGRAM_ID, INTERNAL_USER_ID)
+    response = await _call(
+        machine_app,
+        'POST',
+        BASE,
+        body={
+            'title': 'Attachments',
+            'media_items': [
+                {'type': 'photo', 'file_id': 'photo-a', 'token': 'untrusted'},
+                {'type': 'document', 'file_id': 'document-b'},
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+    media = response.json()['messages'][0]['media_items']
+    assert [item['file_id'] for item in media] == ['photo-a', 'document-b']
+    assert all(item['token'] and item['token'] != 'untrusted' for item in media)
+    assert all('token' not in item for item in store.created_messages[0].media_items)

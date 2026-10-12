@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import User
 from app.services.backup_service import backup_service
 from app.utils.decorators import admin_required, error_handler
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -48,7 +49,7 @@ def get_backup_list_keyboard(backups: list, page: int = 1, per_page: int = 5):
         try:
             if backup.get('timestamp'):
                 dt = datetime.fromisoformat(backup['timestamp'].replace('Z', '+00:00'))
-                date_str = dt.strftime('%d.%m %H:%M')
+                date_str = format_local_datetime(dt, '%d.%m %H:%M')
             else:
                 date_str = '?'
         except:
@@ -210,7 +211,7 @@ async def manage_backup_file(callback: types.CallbackQuery, db_user: User, db: A
     try:
         if backup_info.get('timestamp'):
             dt = datetime.fromisoformat(backup_info['timestamp'].replace('Z', '+00:00'))
-            date_str = dt.strftime('%d.%m.%Y %H:%M:%S')
+            date_str = format_local_datetime(dt, '%d.%m.%Y %H:%M:%S')
         else:
             date_str = 'Неизвестно'
     except:
@@ -313,7 +314,7 @@ async def restore_backup_start(callback: types.CallbackQuery, db_user: User, db:
     else:
         text = """📥 <b>Восстановление из бекапа</b>
 
-📎 Отправьте файл бекапа (.json или .json.gz)
+📎 Отправьте файл бекапа (.json, .json.gz или .tar.gz)
 
 ⚠️ <b>ВАЖНО:</b>
 • Файл должен быть создан этой системой бекапов
@@ -383,7 +384,7 @@ async def restore_backup_execute(callback: types.CallbackQuery, db_user: User, d
 async def handle_backup_file_upload(message: types.Message, db_user: User, db: AsyncSession, state: FSMContext):
     if not message.document:
         await message.answer(
-            '❌ Пожалуйста, отправьте файл бекапа (.json или .json.gz)',
+            '❌ Пожалуйста, отправьте файл бекапа (.json, .json.gz или .tar.gz)',
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text='◀️ Отмена', callback_data='backup_panel')]]
             ),
@@ -391,10 +392,11 @@ async def handle_backup_file_upload(message: types.Message, db_user: User, db: A
         return
 
     document = message.document
+    allowed_extensions = ('.json', '.json.gz', '.tar.gz', '.tar')
 
-    if not (document.file_name.endswith('.json') or document.file_name.endswith('.json.gz')):
+    if not document.file_name or not any(document.file_name.endswith(ext) for ext in allowed_extensions):
         await message.answer(
-            '❌ Неподдерживаемый формат файла. Загрузите .json или .json.gz файл',
+            '❌ Неподдерживаемый формат файла. Загрузите .json, .json.gz или .tar.gz файл',
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text='◀️ Отмена', callback_data='backup_panel')]]
             ),

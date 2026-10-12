@@ -15,6 +15,15 @@ class TelegramAuthRequest(BaseModel):
     referral_code: str | None = Field(
         None, max_length=32, pattern=r'^[a-zA-Z0-9_-]+$', description='Referral code of inviter'
     )
+    accepted_legal_documents: list[str] | None = Field(
+        None,
+        max_length=8,
+        description=(
+            'Ключи документов, с которыми пользователь согласился на экране первой авторизации '
+            '(см. GET /cabinet/info/legal-consent). Нужны только при создании НОВОГО аккаунта; '
+            'для существующего игнорируются.'
+        ),
+    )
 
 
 class TelegramWidgetAuthRequest(BaseModel):
@@ -33,6 +42,15 @@ class TelegramWidgetAuthRequest(BaseModel):
     referral_code: str | None = Field(
         None, max_length=32, pattern=r'^[a-zA-Z0-9_-]+$', description='Referral code of inviter'
     )
+    accepted_legal_documents: list[str] | None = Field(
+        None,
+        max_length=8,
+        description=(
+            'Ключи документов, с которыми пользователь согласился на экране первой авторизации '
+            '(см. GET /cabinet/info/legal-consent). Нужны только при создании НОВОГО аккаунта; '
+            'для существующего игнорируются.'
+        ),
+    )
 
 
 class TelegramOIDCAuthRequest(BaseModel):
@@ -44,6 +62,15 @@ class TelegramOIDCAuthRequest(BaseModel):
     )
     referral_code: str | None = Field(
         None, max_length=32, pattern=r'^[a-zA-Z0-9_-]+$', description='Referral code of inviter'
+    )
+    accepted_legal_documents: list[str] | None = Field(
+        None,
+        max_length=8,
+        description=(
+            'Ключи документов, с которыми пользователь согласился на экране первой авторизации '
+            '(см. GET /cabinet/info/legal-consent). Нужны только при создании НОВОГО аккаунта; '
+            'для существующего игнорируются.'
+        ),
     )
 
 
@@ -77,6 +104,12 @@ class RefreshTokenRequest(BaseModel):
     """Request to refresh access token."""
 
     refresh_token: str = Field(..., max_length=2048, description='Refresh token')
+
+
+class VerificationResendRequest(BaseModel):
+    """Request to resend the verification email from the «check your inbox» screen."""
+
+    email: EmailStr = Field(..., description='Email address awaiting verification')
 
 
 class PasswordForgotRequest(BaseModel):
@@ -128,6 +161,12 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 
+class UserAvatarResponse(BaseModel):
+    """Фото профиля Telegram для шапки кабинета: подписанная ссылка на прокси медиа или null."""
+
+    photo_url: str | None = None
+
+
 class EmailRegisterStandaloneRequest(BaseModel):
     """Request to register new account with email (no Telegram required)."""
 
@@ -137,6 +176,17 @@ class EmailRegisterStandaloneRequest(BaseModel):
     language: str = Field('ru', max_length=5, pattern=r'^[a-z]{2}$', description='Preferred language (ISO 639-1)')
     referral_code: str | None = Field(
         None, max_length=32, pattern=r'^[a-zA-Z0-9_-]+$', description='Referral code of inviter'
+    )
+    campaign_slug: str | None = Field(
+        None, min_length=1, max_length=64, pattern=r'^[a-zA-Z0-9_-]+$', description='Campaign slug from web link'
+    )
+    accepted_legal_documents: list[str] | None = Field(
+        None,
+        max_length=8,
+        description=(
+            'Ключи документов, с которыми пользователь согласился на экране первой авторизации '
+            '(см. GET /cabinet/info/legal-consent).'
+        ),
     )
 
 
@@ -179,6 +229,12 @@ class EmailChangeVerifyRequest(BaseModel):
     """Request to verify email change with code."""
 
     code: str = Field(..., min_length=6, max_length=6, pattern=r'^\d{6}$', description='6-digit verification code')
+
+
+class EmailMergeVerifyRequest(BaseModel):
+    """Request to confirm an email account merge with the emailed code."""
+
+    code: str = Field(..., min_length=6, max_length=6, pattern=r'^\d{6}$', description='6-digit confirmation code')
 
 
 class EmailChangeResponse(BaseModel):

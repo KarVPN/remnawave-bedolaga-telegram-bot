@@ -15,6 +15,11 @@ from app.database.crud.server_squad import (
     get_server_squad_by_uuid,
 )
 from app.database.models import User
+from app.external.remnawave_api import (
+    INTERNAL_SQUAD_NAME_MAX_LENGTH,
+    INTERNAL_SQUAD_NAME_MIN_LENGTH,
+    is_valid_internal_squad_name,
+)
 from app.keyboards.admin import (
     get_admin_remnawave_keyboard,
     get_node_management_keyboard,
@@ -24,7 +29,10 @@ from app.keyboards.admin import (
 from app.localization.texts import get_texts
 from app.services.remnawave_service import RemnaWaveConfigurationError, RemnaWaveService
 from app.services.remnawave_sync_service import (
+    FullSyncAlreadyRunning,
     RemnaWaveAutoSyncStatus,
+    is_full_sync_running,
+    perform_full_sync,
     remnawave_sync_service,
 )
 from app.services.system_settings_service import bot_configuration_service
@@ -995,9 +1003,9 @@ async def show_system_stats(callback: types.CallbackQuery, db_user: User, db: As
 📊 <b>Детальная статистика Remnawave</b>
 
 🖥️ <b>Сервер:</b>
-- CPU: {server_info.get('cpu_cores', 0)} ядер ({server_info.get('cpu_physical_cores', 0)} физ.)
+- CPU: {server_info.get('cpu_cores', 0)} ядер
 - RAM: {format_bytes(server_info.get('memory_used', 0))} / {format_bytes(memory_total)} ({memory_used_percent:.1f}%)
-- Свободно: {format_bytes(server_info.get('memory_available', 0))}
+- Свободно: {format_bytes(server_info.get('memory_free', 0))}
 - Uptime: {uptime_str}
 
 👥 <b>Пользователи ({system.get('total_users', 0)} всего):</b>
@@ -1088,8 +1096,7 @@ async def show_traffic_stats(callback: types.CallbackQuery, db_user: User, db: A
     total_realtime_upload = sum(node.get('uploadBytes', 0) for node in realtime_usage)
     total_realtime = total_realtime_download + total_realtime_upload
 
-    total_download_speed = sum(node.get('downloadSpeedBps', 0) for node in realtime_usage)
-    total_upload_speed = sum(node.get('uploadSpeedBps', 0) for node in realtime_usage)
+    total_users_online = sum(node.get('usersOnline', 0) for node in realtime_usage)
 
     periods = {
         'last_2_days': bandwidth_stats.get('bandwidthLastTwoDays', {}),
@@ -1109,15 +1116,11 @@ async def show_traffic_stats(callback: types.CallbackQuery, db_user: User, db: A
     text = f"""
 📊 <b>Статистика трафика Remnawave</b>
 
-⚡ <b>Реалтайм данные:</b>
+⚡ <b>Трафик по inbounds:</b>
 - Скачивание: {format_bytes(total_realtime_download)}
 - Загрузка: {format_bytes(total_realtime_upload)}
 - Общий трафик: {format_bytes(total_realtime)}
-
-🚀 <b>Текущие скорости:</b>
-- Скорость скачивания: {format_bytes(total_download_speed)}/с
-- Скорость загрузки: {format_bytes(total_upload_speed)}/с
-- Общая скорость: {format_bytes(total_download_speed + total_upload_speed)}/с
+- Пользователи онлайн: {total_users_online}
 
 📈 <b>Статистика по периодам:</b>
 
@@ -1244,12 +1247,26 @@ async def show_node_details(callback: types.CallbackQuery, db_user: User, db: As
     created_at = format_datetime(node['created_at']) if node.get('created_at') else '—'
     updated_at = format_datetime(node['updated_at']) if node.get('updated_at') else '—'
     notify_percent = f'{node["notify_percent"]}%' if node.get('notify_percent') is not None else '—'
-    cpu_info = node.get('cpu_model') or '—'
-    if node.get('cpu_count'):
-        cpu_info = f'{node["cpu_count"]}x {cpu_info}'
+    sys_info = (node.get('system') or {}).get('info', {})
+    cpu_model = html.escape(str(sys_info.get('cpuModel') or '—'))
+    cpu_count = sys_info.get('cpus', 0)
+    cpu_info = f'{cpu_count}x {cpu_model}' if cpu_count else cpu_model
+    memory_total = sys_info.get('memoryTotal', 0)
+    total_ram = format_bytes(memory_total) if memory_total else '—'
+    versions = node.get('versions') or {}
+    xray_ver = html.escape(str(versions.get('xray') or '—'))
+    node_ver = html.escape(str(versions.get('node') or '—'))
+    xray_uptime_sec = node.get('xray_uptime', 0)
+    if xray_uptime_sec:
+        days, rem = divmod(int(xray_uptime_sec), 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        xray_uptime_str = f'{days}d {hours}h {mins}m' if days else (f'{hours}h {mins}m' if hours else f'{mins}m')
+    else:
+        xray_uptime_str = '—'
 
     text = f"""
-🖥️ <b>Нода: {node['name']}</b>
+🖥️ <b>Нода: {html.escape(node['name'])}</b>
 
 <b>Статус:</b>
 - Онлайн: {status_emoji} {'Да' if node['is_node_online'] else 'Нет'}
@@ -1257,16 +1274,20 @@ async def show_node_details(callback: types.CallbackQuery, db_user: User, db: As
 - Подключена: {'📡 Да' if node['is_connected'] else '📵 Нет'}
 - Отключена: {'❌ Да' if node['is_disabled'] else '✅ Нет'}
 - Изменение статуса: {status_change}
-- Сообщение: {node.get('last_status_message') or '—'}
-- Uptime Xray: {node.get('xray_uptime') or '—'}
+- Сообщение: {html.escape(str(node.get('last_status_message') or '—'))}
+- Uptime Xray: {xray_uptime_str}
+
+<b>Версии:</b>
+- Xray: {xray_ver}
+- Node: {node_ver}
 
 <b>Информация:</b>
-- Адрес: {node['address']}
-- Страна: {node['country_code']}
+- Адрес: {html.escape(node['address'])}
+- Страна: {html.escape(node['country_code'])}
 - Пользователей онлайн: {node['users_online']}
 - CPU: {cpu_info}
-- RAM: {node.get('total_ram') or '—'}
-- Провайдер: {node.get('provider_uuid') or '—'}
+- RAM: {total_ram}
+- Провайдер: {html.escape(str(node.get('provider_uuid') or '—'))}
 
 <b>Трафик:</b>
 - Использовано: {format_bytes(node['traffic_used_bytes'])}
@@ -1315,6 +1336,17 @@ async def show_node_statistics(callback: types.CallbackQuery, db_user: User, db:
         await callback.answer('❌ Нода не найдена', show_alert=True)
         return
 
+    status_emoji = '🟢' if node['is_node_online'] else '🔴'
+    xray_emoji = '✅' if node['is_xray_running'] else '❌'
+    xray_uptime_sec = node.get('xray_uptime', 0)
+    if xray_uptime_sec:
+        days, rem = divmod(int(xray_uptime_sec), 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        xray_uptime_str = f'{days}d {hours}h {mins}m' if days else (f'{hours}h {mins}m' if hours else f'{mins}m')
+    else:
+        xray_uptime_str = '—'
+
     try:
         end_date = datetime.now(UTC)
         start_date = end_date - timedelta(days=7)
@@ -1333,28 +1365,36 @@ async def show_node_statistics(callback: types.CallbackQuery, db_user: User, db:
         created_at = format_datetime(node['created_at']) if node.get('created_at') else '—'
         updated_at = format_datetime(node['updated_at']) if node.get('updated_at') else '—'
         notify_percent = f'{node["notify_percent"]}%' if node.get('notify_percent') is not None else '—'
-        cpu_info = node.get('cpu_model') or '—'
-        if node.get('cpu_count'):
-            cpu_info = f'{node["cpu_count"]}x {cpu_info}'
-
-        status_emoji = '🟢' if node['is_node_online'] else '🔴'
-        xray_emoji = '✅' if node['is_xray_running'] else '❌'
+        sys_info = (node.get('system') or {}).get('info', {})
+        cpu_model = html.escape(str(sys_info.get('cpuModel') or '—'))
+        cpu_count = sys_info.get('cpus', 0)
+        cpu_info = f'{cpu_count}x {cpu_model}' if cpu_count else cpu_model
+        memory_total = sys_info.get('memoryTotal', 0)
+        total_ram = format_bytes(memory_total) if memory_total else '—'
+        sys_stats = (node.get('system') or {}).get('stats', {})
+        load_avg = sys_stats.get('loadAvg', [])
+        load_str = ' / '.join(f'{v:.2f}' for v in load_avg[:3]) if load_avg else '—'
+        versions = node.get('versions') or {}
+        xray_ver = html.escape(str(versions.get('xray') or '—'))
+        node_ver = html.escape(str(versions.get('node') or '—'))
 
         text = f"""
-📊 <b>Статистика ноды: {node['name']}</b>
+📊 <b>Статистика ноды: {html.escape(node['name'])}</b>
 
 <b>Статус:</b>
 - Онлайн: {status_emoji} {'Да' if node['is_node_online'] else 'Нет'}
-- Xray: {xray_emoji} {'Запущен' if node['is_xray_running'] else 'Остановлен'}
-- Пользователей онлайн: {node['users_online'] or 0}
+- Xray: {xray_emoji} {'Запущен' if node['is_xray_running'] else 'Остановлен'} (v{xray_ver})
+- Node: v{node_ver}
+- Пользователей онлайн: {node['users_online']}
 - Изменение статуса: {status_change}
-- Сообщение: {node.get('last_status_message') or '—'}
-- Uptime Xray: {node.get('xray_uptime') or '—'}
+- Сообщение: {html.escape(str(node.get('last_status_message') or '—'))}
+- Uptime Xray: {xray_uptime_str}
 
 <b>Ресурсы:</b>
 - CPU: {cpu_info}
-- RAM: {node.get('total_ram') or '—'}
-- Провайдер: {node.get('provider_uuid') or '—'}
+- RAM: {total_ram}
+- Load: {load_str}
+- Провайдер: {html.escape(str(node.get('provider_uuid') or '—'))}
 
 <b>Трафик:</b>
 - Использовано: {format_bytes(node['traffic_used_bytes'] or 0)}
@@ -1371,21 +1411,30 @@ async def show_node_statistics(callback: types.CallbackQuery, db_user: User, db:
 
         if node_realtime:
             text += f"""
-<b>Реалтайм статистика:</b>
+<b>Трафик по inbounds:</b>
 - Скачано: {format_bytes(node_realtime.get('downloadBytes', 0))}
 - Загружено: {format_bytes(node_realtime.get('uploadBytes', 0))}
 - Общий трафик: {format_bytes(node_realtime.get('totalBytes', 0))}
-- Скорость скачивания: {format_bytes(node_realtime.get('downloadSpeedBps', 0))}/с
-- Скорость загрузки: {format_bytes(node_realtime.get('uploadSpeedBps', 0))}/с
+- Онлайн: {node_realtime.get('usersOnline', 0)}
 """
 
         if node_usage:
-            text += '\n<b>Статистика за 7 дней:</b>\n'
-            total_usage = 0
-            for usage in node_usage[-5:]:
-                daily_usage = usage.get('total', 0)
-                total_usage += daily_usage
-                text += f'- {usage.get("date", "N/A")}: {format_bytes(daily_usage)}\n'
+            # Remnawave 3.0.0 удалил суточную разбивку по ноде: POST
+            # /api/bandwidth-stats/nodes/usage отдаёт строку НА ПОЛЬЗОВАТЕЛЯ
+            # ({id, totalBytes}) за весь период, без дат. Поэтому показываем
+            # топ потребителей, а не «по дням», и суммируем ВЕСЬ список —
+            # срез для показа не должен влиять на итог.
+            total_usage = sum(entry.get('total', 0) or 0 for entry in node_usage)
+            top_consumers = sorted(node_usage, key=lambda e: e.get('total', 0) or 0, reverse=True)[:5]
+
+            text += '\n<b>Топ потребителей за 7 дней:</b>\n'
+            for usage in top_consumers:
+                panel_user_id = usage.get('userId')
+                label = f'ID {panel_user_id}' if panel_user_id is not None else 'неизвестный'
+                text += f'- {label}: {format_bytes(usage.get("total", 0) or 0)}\n'
+
+            if len(node_usage) > len(top_consumers):
+                text += f'- …и ещё {len(node_usage) - len(top_consumers)}\n'
 
             text += f'\n<b>Общий трафик за 7 дней:</b> {format_bytes(total_usage)}'
         else:
@@ -1405,15 +1454,15 @@ async def show_node_statistics(callback: types.CallbackQuery, db_user: User, db:
         logger.error('Ошибка получения статистики ноды', node_uuid=node_uuid, error=e)
 
         text = f"""
-📊 <b>Статистика ноды: {node['name']}</b>
+📊 <b>Статистика ноды: {html.escape(node['name'])}</b>
 
 <b>Статус:</b>
 - Онлайн: {status_emoji} {'Да' if node['is_node_online'] else 'Нет'}
 - Xray: {xray_emoji} {'Запущен' if node['is_xray_running'] else 'Остановлен'}
-- Пользователей онлайн: {node['users_online'] or 0}
+- Пользователей онлайн: {node['users_online']}
 - Изменение статуса: {format_datetime(node.get('last_status_change')) if node.get('last_status_change') else '—'}
-- Сообщение: {node.get('last_status_message') or '—'}
-- Uptime Xray: {node.get('xray_uptime') or '—'}
+- Сообщение: {html.escape(str(node.get('last_status_message') or '—'))}
+- Uptime Xray: {xray_uptime_str}
 
 <b>Трафик:</b>
 - Использовано: {format_bytes(node['traffic_used_bytes'] or 0)}
@@ -1671,15 +1720,11 @@ async def process_squad_new_name(message: types.Message, db_user: User, db: Asyn
         await message.answer('❌ Название не может быть пустым. Попробуйте еще раз:')
         return
 
-    if len(new_name) < 2 or len(new_name) > 20:
-        await message.answer('❌ Название должно быть от 2 до 20 символов. Попробуйте еще раз:')
-        return
-
-    import re
-
-    if not re.match(r'^[A-Za-z0-9_-]+$', new_name):
+    # Правила панели (POST/PATCH /api/internal-squads): иначе она ответит 400.
+    if not is_valid_internal_squad_name(new_name):
         await message.answer(
-            '❌ Название может содержать только буквы, цифры, дефисы и подчеркивания. Попробуйте еще раз:'
+            f'❌ Название: от {INTERNAL_SQUAD_NAME_MIN_LENGTH} до {INTERNAL_SQUAD_NAME_MAX_LENGTH} символов, '
+            'только латиница, цифры, пробел, дефис и подчёркивание. Попробуйте еще раз:'
         )
         return
 
@@ -1903,15 +1948,11 @@ async def process_squad_name(message: types.Message, db_user: User, db: AsyncSes
         await message.answer('❌ Название не может быть пустым. Попробуйте еще раз:')
         return
 
-    if len(squad_name) < 2 or len(squad_name) > 20:
-        await message.answer('❌ Название должно быть от 2 до 20 символов. Попробуйте еще раз:')
-        return
-
-    import re
-
-    if not re.match(r'^[A-Za-z0-9_-]+$', squad_name):
+    # Правила панели (POST/PATCH /api/internal-squads): иначе она ответит 400.
+    if not is_valid_internal_squad_name(squad_name):
         await message.answer(
-            '❌ Название может содержать только буквы, цифры, дефисы и подчеркивания. Попробуйте еще раз:'
+            f'❌ Название: от {INTERNAL_SQUAD_NAME_MIN_LENGTH} до {INTERNAL_SQUAD_NAME_MAX_LENGTH} символов, '
+            'только латиница, цифры, пробел, дефис и подчёркивание. Попробуйте еще раз:'
         )
         return
 
@@ -2438,15 +2479,20 @@ async def save_auto_sync_schedule(
 async def sync_all_users(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
     """Выполняет полную синхронизацию всех пользователей"""
 
+    # Проход идёт десятки минут; повторное нажатие не должно запускать второй
+    # проход параллельно первому (двойная нагрузка на панель и её лимит частоты).
+    if is_full_sync_running():
+        await callback.answer('⏳ Полная синхронизация уже выполняется — дождитесь её окончания', show_alert=True)
+        return
+
     progress_text = """
 🔄 <b>Выполняется полная синхронизация...</b>
 
 📋 Этапы:
-• Загрузка ВСЕХ пользователей из панели Remnawave
-• Создание новых пользователей в боте
-• Обновление существующих пользователей
-• Деактивация подписок отсутствующих пользователей
-• Сохранение балансов
+• Из панели в бота: загрузка ВСЕХ пользователей панели, создание и обновление,
+  деактивация подписок отсутствующих (балансы сохраняются)
+• Из бота в панель: статусы, даты, сквады и теги тарифов всех подписок
+• Серверы: сквады панели → серверы бота
 
 ⏳ Пожалуйста, подождите...
 """
@@ -2454,14 +2500,25 @@ async def sync_all_users(callback: types.CallbackQuery, db_user: User, db: Async
     await callback.message.edit_text(progress_text, reply_markup=None)
 
     remnawave_service = RemnaWaveService()
-    stats = await remnawave_service.sync_users_from_panel(db, 'all')
-
+    # Одна функция на бота, кабинет и расписание: из панели в бота → серверы.
+    try:
+        stats, server_stats = await perform_full_sync(db, remnawave_service)
+    except FullSyncAlreadyRunning:
+        await callback.message.edit_text(
+            '⏳ <b>Полная синхронизация уже выполняется</b>\n\nДождитесь её окончания и запустите снова.',
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[[types.InlineKeyboardButton(text='⬅️ Назад', callback_data='admin_remnawave')]]
+            ),
+        )
+        await callback.answer()
+        return
+    errors_total = stats['errors']
     total_operations = stats['created'] + stats['updated'] + stats.get('deleted', 0)
 
-    if stats['errors'] == 0:
+    if errors_total == 0:
         status_emoji = '✅'
         status_text = 'успешно завершена'
-    elif stats['errors'] < total_operations:
+    elif errors_total < total_operations:
         status_emoji = '⚠️'
         status_text = 'завершена с предупреждениями'
     else:
@@ -2471,11 +2528,14 @@ async def sync_all_users(callback: types.CallbackQuery, db_user: User, db: Async
     text = f"""
 {status_emoji} <b>Полная синхронизация {status_text}</b>
 
-📊 <b>Результат:</b>
+⬇️ <b>Из панели в бота:</b>
 • 🆕 Создано: {stats['created']}
 • 🔄 Обновлено: {stats['updated']}
 • 🗑️ Деактивировано: {stats.get('deleted', 0)}
 • ❌ Ошибок: {stats['errors']}
+
+🌐 <b>Серверы:</b> создано {server_stats.get('created', 0)}, обновлено {server_stats.get('updated', 0)}, \
+удалено {server_stats.get('removed', 0)} из {server_stats.get('total', 0)}
 """
 
     if stats.get('deleted', 0) > 0:
@@ -2487,7 +2547,7 @@ async def sync_all_users(callback: types.CallbackQuery, db_user: User, db: Async
 💰 Балансы пользователей сохранены.
 """
 
-    if stats['errors'] > 0:
+    if errors_total > 0:
         text += """
 
 ⚠️ <b>Внимание:</b>
@@ -2497,15 +2557,15 @@ async def sync_all_users(callback: types.CallbackQuery, db_user: User, db: Async
 
     text += """
 
-💡 <b>Рекомендации:</b>
-• Полная синхронизация выполнена
-• Рекомендуется запускать раз в день
-• Все пользователи из панели синхронизированы
+💡 <b>Как это работает:</b>
+• Панель — источник истины: бот забрал из неё сроки, статусы и лимиты
+• В панель бот пишет только при покупке, продлении и действиях админа
+• По расписанию выполняется эта же синхронизация
 """
 
     keyboard = []
 
-    if stats['errors'] > 0:
+    if errors_total > 0:
         keyboard.append([types.InlineKeyboardButton(text='🔄 Повторить синхронизацию', callback_data='sync_all_users')])
 
     keyboard.extend(

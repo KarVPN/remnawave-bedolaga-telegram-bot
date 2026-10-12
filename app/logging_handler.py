@@ -37,6 +37,54 @@ from aiogram import Bot
 RECENT_HASHES_MAX_SIZE: Final[int] = 256
 RECENT_HASH_TTL_SECONDS: Final[float] = 300.0  # 5 min — matches cooldown in global_error
 
+# Статусы доставки события об ошибке (см. system_error_log_service)
+STATUS_PENDING: Final[str] = 'pending'
+STATUS_SENT: Final[str] = 'sent'
+STATUS_FAILED: Final[str] = 'failed'
+STATUS_SUPPRESSED: Final[str] = 'suppressed'
+STATUS_SKIPPED: Final[str] = 'skipped'
+
+# Исход send_error_to_admin_chat -> статус записи в system_error_events
+_OUTCOME_TO_STATUS: Final[dict[str, str]] = {
+    'sent': STATUS_SENT,
+    'throttled': STATUS_SUPPRESSED,
+    'skipped': STATUS_SKIPPED,
+    'failed': STATUS_FAILED,
+}
+
+
+def _record_error_event(event_dict: dict[str, Any], dedup_hash: str | None, status: str) -> str | None:
+    """Записать событие об ошибке в БД.
+
+    Никогда не бросает и никогда не логирует на уровне error — иначе вызов
+    вернётся в этот же процессор и получится бесконечная рекурсия.
+    """
+    try:
+        from app.services.system_error_log_service import system_error_log_service
+
+        event_uid = system_error_log_service.record(event_dict, dedup_hash)
+        if event_uid and status != STATUS_PENDING:
+            system_error_log_service.mark(event_uid, status)
+        return event_uid
+    except Exception:
+        return None
+
+
+def _mark_error_event(event_uid: str | None, status: str, error: Any = None) -> None:
+    """Уточнить статус доставки. Тоже молча проглатывает любые сбои."""
+    if not event_uid:
+        return
+    try:
+        from app.services.system_error_log_service import system_error_log_service
+
+        system_error_log_service.mark(event_uid, status, error)
+    except Exception:
+        # Намеренно молча: это уточнение статуса внутри самого конвейера логов.
+        # Любая жалоба отсюда (logger.error) вернулась бы в этот же процессор и
+        # ушла бы в рекурсию, а потеря статуса доставки того не стоит.
+        pass
+
+
 # Logger name prefixes we never want notifications from
 # (noisy transport-level loggers).
 IGNORED_LOGGER_PREFIXES: Final[tuple[str, ...]] = (
@@ -48,6 +96,11 @@ IGNORED_LOGGER_PREFIXES: Final[tuple[str, ...]] = (
     'uvicorn.protocols',
     'websockets',
     'asyncio',
+    # Сам сервис админ-уведомлений: если он логирует error при ошибке отправки
+    # в админ-чат, нельзя пересылать эту ошибку обратно в тот же чат — иначе
+    # на каждом флуд-контроле получаем петлю усиления. Сервис уже использует
+    # logger.warning для транзиентных ошибок, этот фильтр — belt-and-suspenders.
+    'app.services.admin_notification_service',
     # Payment modules — isolated to payments.log, must not leak to Telegram
     'app.payments',
     'app.services.payment',
@@ -70,6 +123,69 @@ IGNORED_LOGGER_PREFIXES: Final[tuple[str, ...]] = (
     'app.external.telegram_stars',
     'app.webserver.payments',
 )
+
+
+def _event_exception(event_dict: dict[str, Any]) -> BaseException | None:
+    """Исключение записи лога: из exc_info, из kwargs error/exc/exception или из
+    позиционных аргументов stdlib-записи.
+
+    Последнее — ради aiogram: обрыв getUpdates он пишет без exc_info, исключение
+    уходит аргументом ``%s`` (``"Failed to fetch updates - %s: %s"``). К моменту
+    процессора PositionalArgumentsFormatter уже вклеил его в текст, но сама запись
+    (``_record.args``) аргументы хранит.
+    """
+    exc_info = event_dict.get('exc_info')
+    if isinstance(exc_info, tuple) and len(exc_info) > 1 and isinstance(exc_info[1], BaseException):
+        return exc_info[1]
+    for key in ('error', 'exc', 'exception', 'e', 'err'):
+        candidate = event_dict.get(key)
+        if isinstance(candidate, BaseException):
+            return candidate
+    record = event_dict.get('_record')
+    args = getattr(record, 'args', None) or event_dict.get('positional_args') or ()
+    # stdlib допускает и словарь аргументов (``%(name)s``).
+    candidates = args.values() if isinstance(args, dict) else args if isinstance(args, (tuple, list)) else ()
+    return next((candidate for candidate in candidates if isinstance(candidate, BaseException)), None)
+
+
+def _exception_chain(exc: BaseException | None):
+    seen = 0
+    while exc is not None and seen < 6:
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+
+
+def _is_transient_remnawave_error(event_dict: dict[str, Any]) -> bool:
+    """True when the log's exception is a RemnaWaveTransientError (slow / briefly
+    unreachable panel). Checked by class name + cause chain so we don't import the
+    RemnaWave client here (avoids a circular import). Such per-request transient
+    failures must NOT be forwarded to the admin chat — a persistent panel outage
+    is surfaced by the monitoring service instead.
+    """
+    return any(
+        type(exc).__name__ == 'RemnaWaveTransientError' for exc in _exception_chain(_event_exception(event_dict))
+    )
+
+
+def _is_transient_telegram_error(event_dict: dict[str, Any]) -> bool:
+    """True when the log's exception is a Telegram transport hiccup — a dropped
+    long-poll getUpdates. aiogram retries on its own and the user never notices,
+    so such events must NOT be forwarded to the admin chat (they are still
+    persisted, with status ``suppressed``). A real outage shows up as the bot
+    going silent, which the monitoring service surfaces instead.
+
+    ``TelegramNetworkError`` is aiogram's own wrapper and is transient wherever
+    it is raised. A bare aiohttp ``ClientOSError`` is the same drop without the
+    wrapper — but any aiohttp client raises it (payment providers, the panel),
+    so it only counts when logged by aiogram itself.
+    """
+    from_aiogram = str(event_dict.get('logger') or '').startswith('aiogram')
+    for exc in _exception_chain(_event_exception(event_dict)):
+        name = type(exc).__name__
+        if name == 'TelegramNetworkError' or (from_aiogram and name == 'ClientOSError'):
+            return True
+    return False
 
 
 class TelegramNotifierProcessor:
@@ -120,40 +236,77 @@ class TelegramNotifierProcessor:
         if level not in ('error', 'critical', 'exception'):
             return event_dict
 
-        # 2. Already sent via GlobalErrorMiddleware / @error_handler
-        if event_dict.get('_admin_notified'):
-            return event_dict
-
-        # 3. Filter noisy loggers
+        # 2. Filter noisy loggers
         logger_name = event_dict.get('logger', '')
         if any(logger_name.startswith(prefix) for prefix in IGNORED_LOGGER_PREFIXES):
             return event_dict
 
-        # 4. Resolve exc_info=True to actual tuple while still in except block.
+        # 3. Already sent via GlobalErrorMiddleware / @error_handler.
+        # Запись всё равно делаем: сюда же попадает сам провал доставки
+        # (`logger.error(..., _admin_notified=True)`), который раньше не
+        # всплывал нигде, кроме docker-логов.
+        if event_dict.get('_admin_notified'):
+            _record_error_event(event_dict, None, STATUS_SKIPPED)
+            return event_dict
+
+        # 4. Resolve exc_info into actual tuple while still in except block.
         # logger.exception() sets exc_info=True (bool); we need the tuple for
         # traceback extraction. sys.exc_info() works because the processor runs
         # synchronously inside the except clause.
+        #
+        # If exc_info is not passed at all, auto-capture traceback from:
+        #   (a) sys.exc_info() — works when logger.error is called inside except
+        #   (b) error/exc/exception kwargs if they carry __traceback__
+        # This avoids having to pass exc_info=True at every logger.error site.
         exc_info = event_dict.get('exc_info')
         if exc_info is True:
             event_dict['exc_info'] = sys.exc_info()
+        elif not exc_info:
+            current = sys.exc_info()
+            if current[1] is not None:
+                event_dict['exc_info'] = current
+            else:
+                for key in ('error', 'exc', 'exception', 'e', 'err'):
+                    candidate = event_dict.get(key)
+                    if isinstance(candidate, BaseException) and candidate.__traceback__ is not None:
+                        event_dict['exc_info'] = (type(candidate), candidate, candidate.__traceback__)
+                        break
+
+        # 4c. Персистим событие ДО любых отсечек и до попытки отправки.
+        # Дальше статус уточняется: подавлено / пропущено / отправлено / провал.
+        msg_hash = self._compute_hash(event_dict)
+        event_uid = _record_error_event(event_dict, msg_hash, STATUS_PENDING)
+
+        # 4b. Skip transient RemnaWave panel failures (slow / briefly unreachable)
+        # — forwarding them would spam the admin chat on every slow-panel request.
+        # Same for Telegram transport drops: aiogram re-polls by itself.
+        if _is_transient_remnawave_error(event_dict) or _is_transient_telegram_error(event_dict):
+            _mark_error_event(event_uid, STATUS_SUPPRESSED)
+            return event_dict
 
         # 5. Bot not initialized yet — skip
         bot = self._bot
         if bot is None:
+            _mark_error_event(event_uid, STATUS_SKIPPED)
             return event_dict
 
         # 6. Deduplication via hash
-        msg_hash = self._compute_hash(event_dict)
         now = time.monotonic()
 
         with self._lock:
             self._evict_stale(now)
             if msg_hash in self._recent_hashes:
+                # Дубликат в окне TTL: в чат не шлём, но запись уже есть —
+                # на странице в админке видно реальное число повторов.
+                _mark_error_event(event_uid, STATUS_SUPPRESSED)
                 return event_dict
             self._recent_hashes[msg_hash] = now
 
-        # 7. Schedule async send
-        self._schedule_send(bot, event_dict)
+        # 7. Schedule async send — со снимком словаря. Для stdlib-записи
+        # ProcessorFormatter после нас рендерит этот же dict, и ConsoleRenderer
+        # вынимает из него event/level/exc_info раньше, чем стартует задача
+        # отправки: в чат уехал бы пустой «LogError (no traceback available)».
+        self._schedule_send(bot, dict(event_dict), event_uid)
 
         return event_dict
 
@@ -192,7 +345,7 @@ class TelegramNotifierProcessor:
             for k in sorted_keys[: len(self._recent_hashes) - RECENT_HASHES_MAX_SIZE]:
                 self._recent_hashes.pop(k, None)
 
-    def _schedule_send(self, bot: Bot, event_dict: dict[str, Any]) -> None:
+    def _schedule_send(self, bot: Bot, event_dict: dict[str, Any], event_uid: str | None = None) -> None:
         """Schedule async delivery via event loop.
 
         Works from any thread:
@@ -205,26 +358,34 @@ class TelegramNotifierProcessor:
             # No running loop — silently skip.
             # The structlog processor runs in sync context; if there's no loop,
             # we can't send anything.
+            _mark_error_event(event_uid, STATUS_SKIPPED, 'no running event loop')
             return
         else:
             # We're in async context — create task directly
-            self._create_send_task(bot, event_dict, loop)
+            self._create_send_task(bot, event_dict, loop, event_uid)
 
     def _create_send_task(
         self,
         bot: Bot,
         event_dict: dict[str, Any],
         loop: asyncio.AbstractEventLoop,
+        event_uid: str | None = None,
     ) -> None:
         """Create an asyncio.Task for sending the notification."""
-        loop.create_task(self._send(bot, event_dict))
+        loop.create_task(self._send(bot, event_dict, event_uid))
 
     @staticmethod
-    async def _send(bot: Bot, event_dict: dict[str, Any]) -> None:
+    async def _send(bot: Bot, event_dict: dict[str, Any], event_uid: str | None = None) -> None:
         """Send the log event to the admin chat via existing infrastructure."""
         try:
             # Lazy import to avoid circular dependencies at startup
             from app.middlewares.global_error import send_error_to_admin_chat
+
+            # Defense-in-depth: на случай, если когда-то aiogram/httpx
+            # начнёт включать URL `https://api.telegram.org/bot<TOKEN>/...`
+            # в str(exc) (сейчас 3.x не включает), redact на финальной точке
+            # перед отправкой в админ-чат.
+            from app.services.admin_notification_service import _redact_telegram_secrets
 
             # Build a pseudo-Exception from the event_dict
             error = _make_event_dict_error(event_dict)
@@ -241,21 +402,41 @@ class TelegramNotifierProcessor:
                 if username:
                     user_str += f' (@{username})'
                 context_parts.append(user_str)
+            # Кому не удалось написать: сайты доставки логируют telegram_id/chat_id.
+            telegram_id = event_dict.get('telegram_id') or event_dict.get('chat_id')
+            if telegram_id and str(telegram_id) != str(user_id):
+                tg_str = f'Telegram ID: {telegram_id}'
+                if username and not user_id:
+                    tg_str += f' (@{username})'
+                context_parts.append(tg_str)
 
-            context = '\n'.join(context_parts)
+            context = _redact_telegram_secrets('\n'.join(context_parts))
 
             # Extract traceback from exc_info if present
             tb_override: str | None = None
             exc_info = event_dict.get('exc_info')
             if exc_info and isinstance(exc_info, tuple) and exc_info[2] is not None:
-                tb_override = ''.join(traceback.format_exception(*exc_info))
+                tb_override = _redact_telegram_secrets(''.join(traceback.format_exception(*exc_info)))
 
-            await send_error_to_admin_chat(bot, error, context, tb_override=tb_override)
+            # Ожидаемый отказ доставки (бот заблокирован, диалога не было, аккаунт
+            # удалён) — это не ошибка бота: вместо traceback пишем причину.
+            from app.utils.telegram_delivery import describe_unreachable, is_user_unreachable
 
-        except Exception:
+            exc = _event_exception(event_dict)
+            if exc is not None and is_user_unreachable(exc):
+                tb_override = f'Не смогли отправить сообщение пользователю: {describe_unreachable(exc)}.'
+
+            # Также redact в самом сообщении ошибки (event string).
+            if error.args:
+                error.args = tuple(_redact_telegram_secrets(arg) if isinstance(arg, str) else arg for arg in error.args)
+
+            outcome = await send_error_to_admin_chat(bot, error, context, tb_override=tb_override)
+            _mark_error_event(event_uid, _OUTCOME_TO_STATUS.get(outcome, STATUS_FAILED))
+
+        except Exception as send_error:
             # Never let an exception leak — this is a logging processor,
             # recursion would kill the application.
-            pass
+            _mark_error_event(event_uid, STATUS_FAILED, send_error)
 
 
 def _make_event_dict_error(event_dict: dict[str, Any]) -> Exception:

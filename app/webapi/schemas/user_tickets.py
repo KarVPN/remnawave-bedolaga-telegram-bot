@@ -4,7 +4,7 @@ The surface speaks for one concrete person identified by `telegram_id`, so it
 carries no admin fields (no status/priority/reply-block controls). The field
 bounds are the same as in the cabinet user routes
 (`app/cabinet/schemas/tickets.py`) — the app must keep one contract when the BFF
-stops using the cabinet: `title` 3..255, `message` 10..4000 characters,
+stops using the cabinet: `title` 3..255, `message` up to 4000 characters (or a media attachment),
 `media_caption` up to 1000. A parity test guards those numbers.
 """
 
@@ -14,16 +14,11 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.cabinet.schemas.tickets import TicketCreateRequest, TicketMessageCreateRequest, TicketMessageResponse
 
-class UserTicketMessageResponse(BaseModel):
-    id: int
-    message_text: str
-    is_from_admin: bool
-    has_media: bool = False
-    media_type: str | None = None
-    media_file_id: str | None = None
-    media_caption: str | None = None
-    created_at: datetime
+
+class UserTicketMessageResponse(TicketMessageResponse):
+    """Machine API uses the same validated contract as the v5 cabinet."""
 
 
 class UserTicketSummaryResponse(BaseModel):
@@ -50,16 +45,9 @@ class UserTicketListResponse(BaseModel):
     offset: int = 0
 
 
-class UserTicketCreateRequest(BaseModel):
-    title: str = Field(..., min_length=3, max_length=255, description='Ticket title')
-    message: str = Field(..., min_length=10, max_length=4000, description='Initial message from the person')
-    media_type: str | None = Field(default=None, description='Media type: photo, video, document')
-    media_file_id: str | None = Field(default=None, description='Telegram file_id of uploaded media')
-    media_caption: str | None = Field(default=None, max_length=1000, description='Media caption')
+class UserTicketCreateRequest(TicketCreateRequest):
+    """Machine API uses the same validated contract as the v5 cabinet."""
 
 
-class UserTicketMessageCreateRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=4000, description='Message from the person')
-    media_type: str | None = Field(default=None, description='Media type: photo, video, document')
-    media_file_id: str | None = Field(default=None, description='Telegram file_id of uploaded media')
-    media_caption: str | None = Field(default=None, max_length=1000, description='Media caption')
+class UserTicketMessageCreateRequest(TicketMessageCreateRequest):
+    """Machine API uses the same validated contract as the v5 cabinet."""

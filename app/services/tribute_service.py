@@ -7,7 +7,11 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import settings
-from app.database.crud.transaction import create_transaction, get_transaction_by_external_id
+from app.database.crud.transaction import (
+    create_transaction,
+    emit_transaction_side_effects,
+    get_transaction_by_external_id,
+)
 from app.database.crud.user import get_user_by_telegram_id
 from app.database.database import get_db
 from app.database.models import PaymentMethod, TransactionType
@@ -17,6 +21,10 @@ from app.utils.user_utils import format_referrer_info
 
 
 logger = structlog.get_logger(__name__)
+# логгеры платёжных модулей не доходят ни до админ-чата и журнала ошибок (IGNORED_LOGGER_PREFIXES),
+# ни до файлов (ExcludePaymentFilter) — только stdout. Незачисленную оплату сообщаем логгером вне этих списков:
+# запись в system_error_events (страница системных ошибок, 30 дней), админ-чат, error.log.
+alert_logger = structlog.get_logger('app.tribute_alert')
 
 
 class TributeService:
@@ -77,6 +85,16 @@ class TributeService:
 
         processed_data = await self.tribute_api.process_webhook(webhook_data)
         if not processed_data:
+            # Подпись уже проверена — это событие Tribute (например, анонимный донат без telegram_user_id).
+            # Тревожим только за донаты: отмена подписки и прочие события без денег — не повод.
+            event_name = webhook_data.get('name')
+            if event_name not in (None, 'new_donation', 'recurrent_donation'):
+                return {'status': 'ignored', 'reason': 'invalid_data'}
+            alert_logger.error(
+                'Tribute: событие без telegram_user_id, оплата могла не зачислиться — сверить в кабинете Tribute',
+                event_name=webhook_data.get('name'),
+                created_at=webhook_data.get('created_at'),
+            )
             return {'status': 'ignored', 'reason': 'invalid_data'}
 
         event_type = processed_data.get('event_type', 'payment')
@@ -92,6 +110,11 @@ class TributeService:
         return {'status': 'ok', 'event': event_type}
 
     async def _handle_successful_payment(self, payment_data: dict[str, Any]):
+        # ошибка не глотается — вебхук отвечает 5xx, Tribute повторяет доставку (5 мин … 8 ч,
+        # около суток). Повтор безопасен: транзакция и баланс — один коммит, зачисленный payment_id пропускается.
+        # Но только ДО коммита: после него деньги уже на балансе, и 5xx здесь опасен — у синтетического
+        # ключа tribute_<tg>_<amount> повтор старше 24 ч зачисляется заново (см. create_unique_tribute_transaction).
+        credited = False
         try:
             user_telegram_id = payment_data['user_id']
             amount_kopeks = payment_data['amount_kopeks']
@@ -99,7 +122,7 @@ class TributeService:
             trb_user_id = payment_data.get('trb_user_id')
 
             logger.info(
-                'Обрабатываем успешный Tribute платеж: user_telegram_id=, amount=, payment_id=, trb_user_id=',
+                'Обрабатываем успешный Tribute платеж',
                 user_telegram_id=user_telegram_id,
                 amount_kopeks=amount_kopeks,
                 payment_id=payment_id,
@@ -109,11 +132,19 @@ class TributeService:
             async for session in get_db():
                 user = await get_user_by_telegram_id(session, user_telegram_id)
                 if not user:
-                    logger.error('Пользователь не найден', user_telegram_id=user_telegram_id)
+                    # 200 и громкая запись, а не 5xx: платили с Telegram-аккаунта, которого нет в боте,
+                    # повтор доставки этого не исправит, а сутки отказов — 9 одинаковых тревог и риск для вебхука.
+                    alert_logger.error(
+                        'Tribute: пользователь не найден, оплата НЕ зачислена — зачислить вручную',
+                        user_telegram_id=user_telegram_id,
+                        amount_kopeks=amount_kopeks,
+                        payment_id=payment_id,
+                        trb_user_id=trb_user_id,
+                    )
                     return
 
                 logger.info(
-                    'Найден пользователь текущий баланс: коп',
+                    'Найден пользователь',
                     telegram_id=user.telegram_id,
                     balance_kopeks=user.balance_kopeks,
                 )
@@ -125,23 +156,33 @@ class TributeService:
                 )
 
                 if duplicate_transaction:
-                    logger.warning('Найден дубликат платежа в течение 24ч:')
-                    logger.warning('Transaction ID', duplicate_transaction_id=duplicate_transaction.id)
-                    logger.warning('Amount: коп', amount_kopeks=duplicate_transaction.amount_kopeks)
-                    logger.warning('Created', created_at=duplicate_transaction.created_at)
-                    logger.warning('External ID', external_id=duplicate_transaction.external_id)
+                    logger.warning('Найден дубликат платежа в течение 24ч')
+                    logger.warning('Дубликат: ID транзакции', duplicate_transaction_id=duplicate_transaction.id)
+                    logger.warning('Дубликат: сумма', amount_kopeks=duplicate_transaction.amount_kopeks)
+                    logger.warning('Дубликат: дата создания', created_at=duplicate_transaction.created_at)
+                    logger.warning('Дубликат: внешний ID', external_id=duplicate_transaction.external_id)
                     logger.warning('Платеж игнорирован - это дубликат свежего платежа')
                     return
 
                 from app.database.crud.transaction import create_unique_tribute_transaction
 
-                transaction = await create_unique_tribute_transaction(
+                transaction, created = await create_unique_tribute_transaction(
                     db=session,
                     user_id=user.id,
                     payment_id=payment_id,
                     amount_kopeks=amount_kopeks,
                     description=f'Пополнение через Tribute: {amount_kopeks / 100}₽ (ID: {payment_id})',
                 )
+
+                if not created:
+                    # Replayed webhook for an already-processed payment — the balance was
+                    # credited on first delivery; crediting again would be a double-spend.
+                    logger.warning(
+                        'Tribute: платёж уже обработан ранее, повторное начисление пропущено',
+                        payment_id=payment_id,
+                        transaction_id=transaction.id,
+                    )
+                    return
 
                 # Lock user row to prevent concurrent balance race conditions
                 from app.database.crud.user import lock_user_for_update
@@ -159,7 +200,19 @@ class TributeService:
                 referrer_info = format_referrer_info(user)
                 topup_status = '🆕 Первое пополнение' if was_first_topup else '🔄 Пополнение'
 
+                # транзакция (flush в create_unique_tribute_transaction) и зачисление — одним коммитом
                 await session.commit()
+                credited = True
+                await emit_transaction_side_effects(
+                    session,
+                    transaction,
+                    amount_kopeks=amount_kopeks,
+                    user_id=user.id,
+                    type=TransactionType.DEPOSIT,
+                    payment_method=PaymentMethod.TRIBUTE,
+                    external_id=transaction.external_id,
+                    description=transaction.description,
+                )
 
                 try:
                     from app.services.referral_service import process_referral_topup
@@ -181,7 +234,7 @@ class TributeService:
                     balance_kopeks=user.balance_kopeks,
                     amount_kopeks=amount_kopeks,
                 )
-                logger.info('✅ Создана транзакция ID', transaction_id=transaction.id)
+                logger.info('✅ Создана транзакция', transaction_id=transaction.id)
 
                 if was_first_topup:
                     logger.info('Отмечен первый топап для пользователя', user_telegram_id=user_telegram_id)
@@ -214,7 +267,17 @@ class TributeService:
                 break
 
         except Exception as e:
-            logger.error('Ошибка обработки успешного Tribute платежа', error=e, exc_info=True)
+            if credited:
+                # Баланс уже пополнен — сбой в уведомлениях/побочных эффектах. Отвечаем 200: повтор не нужен
+                # и для синтетического ключа привёл бы к двойному зачислению.
+                alert_logger.error(
+                    'Tribute: оплата зачислена, но обработка после зачисления упала', error=e, exc_info=True
+                )
+                return
+            alert_logger.error(
+                'Tribute: ошибка зачисления, ответ 5xx — Tribute повторит доставку', error=e, exc_info=True
+            )
+            raise
 
     async def _handle_failed_payment(self, payment_data: dict[str, Any]):
         try:
@@ -288,6 +351,9 @@ class TributeService:
             logger.error('Ошибка обработки возврата Tribute', error=e)
 
     async def _send_success_notification(self, user_id: int, amount_kopeks: int):
+        if not settings.is_notifications_enabled():
+            return
+
         # Skip if no telegram_id (email-only user)
         if not user_id:
             logger.debug('Пропуск уведомления Tribute для пользователя без telegram_id')
@@ -326,6 +392,9 @@ class TributeService:
             logger.error('Ошибка отправки уведомления об успешном платеже', error=e)
 
     async def _send_failure_notification(self, user_id: int):
+        if not settings.is_notifications_enabled():
+            return
+
         # Skip if no telegram_id (email-only user)
         if not user_id:
             logger.debug('Пропуск уведомления об ошибке Tribute для пользователя без telegram_id')
@@ -355,6 +424,9 @@ class TributeService:
             logger.error('Ошибка отправки уведомления о неудачном платеже', error=e)
 
     async def _send_refund_notification(self, user_id: int, amount_kopeks: int):
+        if not settings.is_notifications_enabled():
+            return
+
         # Skip if no telegram_id (email-only user)
         if not user_id:
             logger.debug('Пропуск уведомления о возврате Tribute для пользователя без telegram_id')
@@ -392,7 +464,7 @@ class TributeService:
     ) -> bool:
         try:
             logger.info(
-                '🔧 ПРИНУДИТЕЛЬНАЯ ОБРАБОТКА: payment_id=, user_id=, amount',
+                '🔧 ПРИНУДИТЕЛЬНАЯ ОБРАБОТКА платежа',
                 payment_id=payment_id,
                 user_id=user_id,
                 amount_kopeks=amount_kopeks,
@@ -429,7 +501,7 @@ class TributeService:
                 await session.commit()
 
                 logger.info(
-                    '💰 ПРИНУДИТЕЛЬНО обновлен баланс: коп', old_balance=old_balance, balance_kopeks=user.balance_kopeks
+                    '💰 ПРИНУДИТЕЛЬНО обновлён баланс', old_balance=old_balance, balance_kopeks=user.balance_kopeks
                 )
 
                 await self._send_success_notification(user_id, amount_kopeks)
