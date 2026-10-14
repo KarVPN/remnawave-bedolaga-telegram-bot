@@ -47,3 +47,24 @@ These are individually reviewed protocol constraints, not a general exemption fo
 MD5/SHA-1. New uses in local credentials, sessions or authorization still require
 review. Any provider migration to a newer signature scheme should be a separately
 validated adapter change.
+
+## Reviewed model limitations
+
+The owner explicitly approved these individual false-positive dispositions on
+2026-10-15. Their rationale is also recorded on the GitHub alerts.
+
+- **#468, `py/full-ssrf`:** the URL remains user-controlled by design, but every
+  destination is validated before its request. Literal non-global IPs, credentials
+  and non-HTTP schemes are rejected, redirects are handled explicitly, and the
+  actual `aiohttp.TCPConnector` uses `PublicOnlyResolver` to refuse private DNS
+  results before connecting. Tests cover both the real connector and redirect
+  destinations. The generic data-flow query does not model these custom guards.
+- **#78/#79, `py/unsafe-cyclic-import`:** `pricing_utils` imports `RenewalPricing`
+  only under `typing.TYPE_CHECKING`, and its annotation is quoted. Runtime imports
+  of `PricingEngine` are local to functions. Fresh Python 3.14 processes importing
+  the modules in either order both resolved the classes and functions successfully;
+  the complete test suite also passed.
+
+These dispositions apply to the reviewed implementation and its regression tests.
+Changes to the resolver, redirect checks or runtime import structure need a fresh
+review; the CodeQL query suite remains enabled.
