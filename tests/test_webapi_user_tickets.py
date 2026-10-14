@@ -52,6 +52,7 @@ OTHER_INTERNAL_USER_ID = 42
 NOW = datetime(2024, 5, 1, 12, 0, tzinfo=UTC)
 
 BASE = f'/tickets/by-telegram-id/{TELEGRAM_ID}'
+ACCOUNT_BASE = f'/tickets/by-user-id/{INTERNAL_USER_ID}'
 FIRST_MESSAGE = 'Подключение не устанавливается уже час'
 
 
@@ -88,6 +89,7 @@ class _Store:
 
     def __init__(self) -> None:
         self.users: dict[int, User] = {}
+        self.users_by_id: dict[int, User] = {}
         self.tickets: dict[int, Ticket] = {}
         # Сообщения, созданные через машинные роуты.
         self.created_messages: list[TicketMessage] = []
@@ -100,9 +102,17 @@ class _Store:
         self._ticket_seq = 0
         self._message_seq = 0
 
-    def add_user(self, telegram_id: int, user_id: int) -> User:
-        user = User(id=user_id, telegram_id=telegram_id, username=f'user{user_id}', first_name='Test')
-        self.users[telegram_id] = user
+    def add_user(self, telegram_id: int | None, user_id: int, *, email: str | None = None) -> User:
+        user = User(
+            id=user_id,
+            telegram_id=telegram_id,
+            username=f'user{user_id}',
+            first_name='Test',
+            email=email,
+        )
+        if telegram_id is not None:
+            self.users[telegram_id] = user
+        self.users_by_id[user_id] = user
         return user
 
     def new_message(
@@ -169,10 +179,13 @@ def store(monkeypatch) -> _Store:
     module = user_tickets_route
 
     def person(user_id: int) -> User:
-        return next(user for user in store.users.values() if user.id == user_id)
+        return store.users_by_id[user_id]
 
     async def get_user_by_telegram_id(_db, telegram_id):
         return store.users.get(telegram_id)
+
+    async def get_user_by_id(_db, user_id):
+        return store.users_by_id.get(user_id)
 
     async def get_user_tickets(_db, user_id, status=None, limit=20, offset=0, *, load_messages=False):
         store.query_calls.append(
@@ -247,9 +260,7 @@ def store(monkeypatch) -> _Store:
 
     async def notify_admins_about_new_ticket(ticket, _db):
         first = ticket.messages[0] if ticket.messages else None
-        store.announced_media.append(
-            (first.media_file_id if first else None, first.media_type if first else None)
-        )
+        store.announced_media.append((first.media_file_id if first else None, first.media_type if first else None))
         store.telegram_notifications.append(f'new:{ticket.id}')
 
     async def notify_admins_about_ticket_reply(ticket, reply_text, _db, *, media_file_id=None, media_type=None):
@@ -271,6 +282,7 @@ def store(monkeypatch) -> _Store:
         store.cabinet_websocket_events.append(f'reply:{ticket_id}')
 
     monkeypatch.setattr(module, 'get_user_by_telegram_id', get_user_by_telegram_id)
+    monkeypatch.setattr(module, 'get_user_by_id', get_user_by_id)
     monkeypatch.setattr(TicketCRUD, 'get_user_tickets', staticmethod(get_user_tickets))
     monkeypatch.setattr(TicketCRUD, 'count_user_tickets_by_statuses', staticmethod(count_user_tickets_by_statuses))
     monkeypatch.setattr(TicketCRUD, 'get_ticket_by_id', staticmethod(get_ticket_by_id))
@@ -380,6 +392,11 @@ class TestAuthorisation:
 
         assert response.status_code == 401
         assert seen_keys == ['cabinet-user-jwt']
+
+    async def test_account_id_route_requires_the_machine_key(self, unauthorised_app):
+        response = await _call(unauthorised_app, 'GET', ACCOUNT_BASE, key=None)
+
+        assert response.status_code == 401
 
     def test_every_route_uses_the_shared_machine_key_dependency(self):
         """Новая зависимость авторизации не заводится: у всех роутов та же проверка ключа."""
@@ -701,6 +718,90 @@ class TestFieldBounds:
         assert response.status_code == 201
 
 
+class TestAccountIDRoutes:
+    """Cabinet ID is canonical and supports profiles without Telegram."""
+
+    async def test_email_only_account_can_list_create_read_reply_and_upload_media(
+        self, machine_app, store, media_uploads
+    ):
+        user = store.add_user(None, INTERNAL_USER_ID, email='person@example.test')
+
+        listing = await _call(machine_app, 'GET', ACCOUNT_BASE)
+        assert listing.status_code == 200
+        assert listing.json()['items'] == []
+
+        uploaded = await _upload(machine_app, path=f'{ACCOUNT_BASE}/media', caption='Лог приложения')
+        assert uploaded.status_code == 201
+        assert uploaded.json()['media_file_id'] == UPLOADED_FILE_ID
+        assert media_uploads[-1].telegram_id is None
+        assert media_uploads[-1].caption is None
+        assert media_uploads[-1].data == b'log line\n'
+
+        created = await _call(
+            machine_app,
+            'POST',
+            ACCOUNT_BASE,
+            body={
+                'title': 'Проблема с подключением',
+                'message': 'Прикладываю журнал приложения',
+                'media_type': 'document',
+                'media_file_id': UPLOADED_FILE_ID,
+                'media_caption': 'Лог приложения',
+            },
+        )
+        assert created.status_code == 201
+        ticket_id = created.json()['id']
+        assert created.json()['messages'][0]['media_file_id'] == UPLOADED_FILE_ID
+        assert store.announced_media[-1] == (UPLOADED_FILE_ID, 'document')
+
+        detail = await _call(machine_app, 'GET', f'{ACCOUNT_BASE}/{ticket_id}')
+        assert detail.status_code == 200
+        assert detail.json()['messages'][0]['media_file_id'] == UPLOADED_FILE_ID
+
+        replied = await _call(
+            machine_app,
+            'POST',
+            f'{ACCOUNT_BASE}/{ticket_id}/messages',
+            body={
+                'message': 'Добавляю ещё одну деталь',
+                'media_type': 'document',
+                'media_file_id': UPLOADED_FILE_ID,
+            },
+        )
+        assert replied.status_code == 201
+        assert replied.json()['media_file_id'] == UPLOADED_FILE_ID
+        assert store.announced_media[-1] == (UPLOADED_FILE_ID, 'document')
+
+        listing = await _call(machine_app, 'GET', ACCOUNT_BASE)
+        assert listing.status_code == 200
+        assert listing.json()['items'][0]['id'] == ticket_id
+        assert store.tickets[ticket_id].user_id == user.id
+
+    async def test_account_ticket_does_not_expose_another_users_ticket(self, machine_app, store):
+        owner = store.add_user(None, INTERNAL_USER_ID, email='owner@example.test')
+        other = store.add_user(OTHER_TELEGRAM_ID, OTHER_INTERNAL_USER_ID)
+        store.add_ticket(other, ticket_id=77, title='Чужое обращение')
+
+        response = await _call(machine_app, 'GET', f'{ACCOUNT_BASE}/77')
+
+        assert response.status_code == 404
+        assert response.json() == {'detail': 'Ticket not found'}
+        assert store.tickets[77].user_id == other.id
+        assert owner.id != other.id
+
+    async def test_account_id_does_not_resolve_a_colliding_telegram_id(self, machine_app, store):
+        account = store.add_user(None, TELEGRAM_ID, email='email@example.test')
+        other = store.add_user(TELEGRAM_ID, OTHER_INTERNAL_USER_ID)
+        store.add_ticket(account, ticket_id=81, title='Мой тикет')
+        store.add_ticket(other, ticket_id=82, title='Чужой тикет')
+
+        response = await _call(machine_app, 'GET', f'/tickets/by-user-id/{TELEGRAM_ID}')
+
+        assert response.status_code == 200
+        assert [ticket['id'] for ticket in response.json()['items']] == [81]
+        assert store.tickets[82].user_id == other.id
+
+
 class TestContract:
     """Контракт для BFF и приложения: ровно эти пути и форма, как у кабинета."""
 
@@ -712,6 +813,10 @@ class TestContract:
             '/by-telegram-id/{telegram_id}/media',
             '/by-telegram-id/{telegram_id}/{ticket_id}',
             '/by-telegram-id/{telegram_id}/{ticket_id}/messages',
+            '/by-user-id/{user_id}',
+            '/by-user-id/{user_id}/media',
+            '/by-user-id/{user_id}/{ticket_id}',
+            '/by-user-id/{user_id}/{ticket_id}/messages',
         }
 
     def test_router_has_no_admin_capabilities(self):
@@ -754,13 +859,27 @@ def media_uploads(monkeypatch) -> list[SimpleNamespace]:
         )
         return UPLOADED_FILE_ID
 
+    async def upload_ticket_media_to_admin_chat(*, filename, data, media_type):
+        calls.append(
+            SimpleNamespace(
+                telegram_id=None,
+                filename=filename,
+                data=data,
+                media_type=media_type,
+                caption=None,
+            )
+        )
+        return UPLOADED_FILE_ID
+
     monkeypatch.setattr(user_tickets_route, 'upload_ticket_media', upload_ticket_media)
+    monkeypatch.setattr(user_tickets_route, 'upload_ticket_media_to_admin_chat', upload_ticket_media_to_admin_chat)
     return calls
 
 
 async def _upload(
     app: FastAPI,
     *,
+    path: str = MEDIA_URL,
     filename: str = 'app.log',
     content: bytes = b'log line\n',
     content_type: str = 'text/plain',
@@ -776,7 +895,7 @@ async def _upload(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url='http://bot') as client:
-        return await client.post(MEDIA_URL, files=files, data=data, headers=headers)
+        return await client.post(path, files=files, data=data, headers=headers)
 
 
 class TestTicketMediaUpload:
@@ -937,4 +1056,3 @@ class TestTicketMediaUpload:
         )
         assert replied.status_code == 201
         assert store.announced_media[-1] == (UPLOADED_FILE_ID, 'document')
-
