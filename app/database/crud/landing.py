@@ -76,6 +76,11 @@ _LANDING_UPDATABLE_FIELDS = frozenset(
         'discount_ends_at',
         'discount_badge_text',
         'background_config',
+        'sticky_pay_button',
+        'analytics_view_enabled',
+        'analytics_view_goal',
+        'analytics_click_enabled',
+        'analytics_click_goal',
     }
 )
 
@@ -144,7 +149,7 @@ async def create_guest_purchase(db: AsyncSession, *, commit: bool = True, **kwar
     logger.info(
         'Created guest purchase',
         purchase_id=purchase.id,
-        token_prefix=purchase.token[:5],
+        token_length=len(purchase.token),
         status=purchase.status,
         landing_id=purchase.landing_id,
     )
@@ -200,7 +205,7 @@ async def update_purchase_status(
     logger.info(
         'Updated guest purchase status',
         purchase_id=purchase.id,
-        token_prefix=token[:5],
+        token_length=len(token),
         old_status=old_status,
         new_status=purchase.status,
     )

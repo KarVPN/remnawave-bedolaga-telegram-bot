@@ -29,11 +29,14 @@ class SubscriptionSummary(BaseModel):
     subscription_url: str | None = None
     subscription_crypto_link: str | None = None
     connected_squads: list[str] = Field(default_factory=list)
+    tariff_id: int | None = None
+    tariff_name: str | None = None
 
 
 class UserResponse(BaseModel):
     id: int
     telegram_id: int | None = None
+    email: str | None = None
     username: str | None = None
     first_name: str | None = None
     last_name: str | None = None
@@ -50,6 +53,35 @@ class UserResponse(BaseModel):
     last_activity: datetime | None = None
     promo_group: PromoGroupSummary | None = None
     subscription: SubscriptionSummary | None = None
+    subscriptions: list[SubscriptionSummary] = Field(default_factory=list)
+
+
+class UserNotifyRequest(BaseModel):
+    """Сообщение пользователю от имени сервиса.
+
+    Текст готовит вызывающая сторона: ручка ничего не сочиняет и не решает,
+    что человеку сказать, — только доставляет по доступным каналам.
+    """
+
+    text: str = Field(..., min_length=1, max_length=4000, description='Text for Telegram / plain part of the email')
+    channels: list[str] | None = Field(
+        default=None,
+        description='Subset of "telegram", "email". Omit to use every channel the user has.',
+    )
+    email_subject: str | None = Field(default=None, max_length=200)
+    email_html: str | None = Field(default=None, description='HTML body; falls back to text')
+    parse_mode: str | None = Field(default='HTML', description='Telegram parse mode, null for plain text')
+
+
+class UserNotifyChannelResult(BaseModel):
+    sent: bool
+    reason: str | None = Field(default=None, description='Why it was skipped or failed')
+
+
+class UserNotifyResponse(BaseModel):
+    user_id: int
+    telegram: UserNotifyChannelResult
+    email: UserNotifyChannelResult
 
 
 class MachineUserIdentityResponse(BaseModel):
@@ -58,7 +90,10 @@ class MachineUserIdentityResponse(BaseModel):
     id: int
     telegram_id: int | None = None
     status: str
-    remnawave_uuid: str | None = None
+    remnawave_id: int | None = None
+    remnawave_uuid: str | None = Field(
+        default=None, deprecated=True, description='Legacy field; always null with Remnawave 3. Use remnawave_id.'
+    )
 
 
 class UserListResponse(BaseModel):
@@ -96,6 +131,60 @@ class BalanceUpdateRequest(BaseModel):
     create_transaction: bool = True
 
 
+class BalanceDepositRequest(BaseModel):
+    """Ручное пополнение баланса. Рассчитано на автоматизацию (агент поддержки)."""
+
+    amount_kopeks: int = Field(
+        ...,
+        gt=0,
+        le=100_000_000,
+        description='Сумма пополнения в копейках. Только положительная: эндпоинт умеет лишь зачислять.',
+    )
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            'Ключ идемпотентности (номер тикета, uuid попытки). Повторный запрос с тем же ключом '
+            'не начислит деньги второй раз и вернёт исходный результат с duplicate=true. '
+            'Обязателен по-хорошему для любой автоматической интеграции: без него сетевой таймаут '
+            'и ретрай приведут к двойному начислению.'
+        ),
+    )
+    description: str | None = Field(
+        default=None,
+        max_length=500,
+        description='Описание транзакции. Видно пользователю в истории операций.',
+    )
+    notify_user: bool = Field(
+        default=True,
+        description='Отправить пользователю уведомление о пополнении (Telegram или email).',
+    )
+    apply_topup_bonuses: bool = Field(
+        default=True,
+        description=(
+            'Запустить те же авто-действия, что и настоящий платёж: реферальная комиссия, '
+            'отметка первого пополнения, возобновление приостановленной суточной подписки, '
+            'автопокупка сохранённой корзины. Выключайте, только если нужно именно «просто деньги».'
+        ),
+    )
+
+
+class BalanceDepositResponse(BaseModel):
+    success: bool
+    duplicate: bool = Field(
+        ...,
+        description='true — запрос с таким idempotency_key уже был обработан, баланс не менялся.',
+    )
+    user_id: int
+    telegram_id: int | None = None
+    transaction_id: int
+    amount_kopeks: int = Field(..., description='Сумма проведённой транзакции.')
+    old_balance_kopeks: int
+    new_balance_kopeks: int
+    new_balance_rubles: float
+
+
 class UserSubscriptionCreateRequest(BaseModel):
     """Схема для создания подписки через users API (user_id берется из URL)"""
 
@@ -106,3 +195,7 @@ class UserSubscriptionCreateRequest(BaseModel):
     squad_uuid: str | None = None
     connected_squads: list[str] | None = None
     replace_existing: bool = False
+    subscription_id: int | None = Field(
+        default=None,
+        description='ID of existing subscription to replace (required in multi-tariff mode when replace_existing=true)',
+    )

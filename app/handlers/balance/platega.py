@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.models import User
 from app.keyboards.inline import get_back_keyboard
+from app.keyboards.topup_amounts import get_topup_amount_keyboard
 from app.localization.texts import get_texts
 from app.services.payment_service import PaymentService
 from app.states import BalanceStates
@@ -20,8 +21,7 @@ logger = structlog.get_logger(__name__)
 
 
 def _get_active_methods() -> list[int]:
-    methods = settings.get_platega_active_methods()
-    return [code for code in methods if code in {2, 10, 11, 12, 13}]
+    return settings.get_platega_active_methods()
 
 
 async def _prompt_amount(
@@ -43,6 +43,7 @@ async def _prompt_amount(
         # Если сумма уже известна (например, после быстрого выбора),
         # сразу создаём платеж и сбрасываем временное значение.
         await state.update_data(platega_pending_amount=None)
+        await state.set_state(BalanceStates.waiting_for_amount)
 
         from app.database.database import AsyncSessionLocal
 
@@ -71,7 +72,7 @@ async def _prompt_amount(
         (f'💳 <b>Оплата через Platega ({{method_name}})</b>\n\n{default_prompt_body}Оплата происходит через Platega.'),
     )
 
-    keyboard = get_back_keyboard(db_user.language)
+    keyboard = await get_topup_amount_keyboard('platega', db_user.language, back_callback='back_to_menu')
 
     await message.edit_text(
         prompt_template.format(
@@ -295,8 +296,9 @@ async def process_platega_payment_amount(
                 'PLATEGA_AMOUNT_TOO_LOW',
                 'Минимальная сумма для оплаты через Platega: {amount}',
             ).format(amount=settings.format_price(settings.PLATEGA_MIN_AMOUNT_KOPEKS)),
-            reply_markup=get_back_keyboard(db_user.language),
+            reply_markup=get_back_keyboard(db_user.language, callback_data='balance_topup'),
         )
+        await state.set_state(BalanceStates.waiting_for_amount)
         return
 
     if amount_kopeks > settings.PLATEGA_MAX_AMOUNT_KOPEKS:
@@ -305,8 +307,9 @@ async def process_platega_payment_amount(
                 'PLATEGA_AMOUNT_TOO_HIGH',
                 'Максимальная сумма для оплаты через Platega: {amount}',
             ).format(amount=settings.format_price(settings.PLATEGA_MAX_AMOUNT_KOPEKS)),
-            reply_markup=get_back_keyboard(db_user.language),
+            reply_markup=get_back_keyboard(db_user.language, callback_data='balance_topup'),
         )
+        await state.set_state(BalanceStates.waiting_for_amount)
         return
 
     try:

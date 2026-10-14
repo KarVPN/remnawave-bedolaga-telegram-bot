@@ -14,8 +14,113 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.database import AsyncSessionLocal
 
+from .email_layout import EMAIL_LAYOUT_TYPE, layout_is_valid, refresh_email_layout_cache, render_email_layout
+
 
 logger = structlog.get_logger(__name__)
+
+# Placeholders available in EVERY template regardless of notification type.
+# Injected at the single render chokepoint (get_rendered_override), so an
+# admin can use them in any subject/body; per-type context wins on conflict.
+COMMON_CONTEXT_VARS = [
+    'service_name',
+    'cabinet_url',
+    'support_username',
+    'username',
+    'email',
+    'date',
+    'unsubscribe_url',
+]
+
+
+# Старые имена плейсхолдеров -> актуальные. 2026-03-07 (v3.25.0) редактор
+# переименовал переменные под реальные ключи контекста, а шаблоны, сохранённые
+# на старых именах, молча уходили с литералом «{new_end_date}». Подставляется
+# в чокпойнте рендера override и в sample-контексте редактора — одинаково.
+LEGACY_PLACEHOLDER_ALIASES: dict[str, str] = {
+    'new_end_date': 'new_expires_at',
+    'end_date': 'expires_at',
+    'amount': 'formatted_amount',
+    'balance': 'formatted_balance',
+    'formatted_required': 'required_amount',
+    'reason': 'comment',
+}
+# Тот же старый ключ мог означать разное у разных типов: пробуем по порядку.
+_LEGACY_FALLBACKS: dict[str, tuple[str, ...]] = {
+    'balance': ('formatted_balance', 'current_balance'),
+    'formatted_balance': ('current_balance',),
+    'formatted_amount': ('formatted_bonus',),
+    'amount': ('formatted_amount', 'formatted_bonus', 'formatted_reward'),
+}
+
+
+def apply_legacy_aliases(context: dict[str, Any]) -> dict[str, Any]:
+    """Возвращает копию контекста со старыми именами плейсхолдеров, если есть новые."""
+    result = dict(context)
+    for old, sources in {**{k: (v,) for k, v in LEGACY_PLACEHOLDER_ALIASES.items()}, **_LEGACY_FALLBACKS}.items():
+        if result.get(old) in (None, ''):
+            for source in sources:
+                if result.get(source) not in (None, ''):
+                    result[old] = result[source]
+                    break
+    return result
+
+
+def build_common_context() -> dict[str, Any]:
+    """Values for the type-independent placeholders.
+
+    Instance-level values resolve here; recipient-level ones (username,
+    email) are supplied by the sending code and merged over these defaults —
+    the empty-string defaults only guarantee the placeholder never leaks
+    into a delivered email as a literal ``{username}``.
+    """
+    from app.config import settings
+    from app.utils.timezone import format_email_datetime
+
+    return {
+        'service_name': settings.SMTP_FROM_NAME or 'VPN Service',
+        'cabinet_url': getattr(settings, 'CABINET_URL', '') or '',
+        'support_username': getattr(settings, 'SUPPORT_USERNAME', '') or '',
+        'username': '',
+        'email': '',
+        'date': format_email_datetime(datetime.now(UTC), fmt='%d.%m.%Y'),
+        # Пустая строка по умолчанию: у транзакционных писем отписки нет, но
+        # плейсхолдер обязан резолвиться — иначе админский шаблон с
+        # {unsubscribe_url} доставил бы его литералом.
+        'unsubscribe_url': '',
+    }
+
+
+def substitute_context_vars(
+    text: str,
+    context: dict[str, Any] | None,
+    *,
+    escape: bool = True,
+) -> str:
+    """
+    Replace {var} placeholders in template text with context values.
+
+    Args:
+        text: Template text containing {var} placeholders.
+        context: Mapping of variable names to values.
+        escape: HTML-escape values (use False for plain-text contexts
+            like the subject line, where newlines are stripped instead).
+
+    Returns:
+        New string with placeholders substituted.
+    """
+    if not context:
+        return text
+    result = text
+    for key, value in context.items():
+        if value is None:
+            replacement = ''
+        elif escape:
+            replacement = html.escape(str(value))
+        else:
+            replacement = str(value).replace('\r', '').replace('\n', '')
+        result = result.replace(f'{{{key}}}', replacement)
+    return result
 
 
 async def get_template_override(
@@ -177,13 +282,26 @@ async def get_rendered_override(
     language: str,
     context: dict[str, Any] | None = None,
     db: AsyncSession | None = None,
+    required_vars: list[str] | None = None,
 ) -> tuple[str, str] | None:
     """
     Get a custom template override rendered with the base email template.
 
+    Args:
+        required_vars: Context variable names whose values MUST appear in the
+            rendered body (e.g. 'verification_url' for verification emails).
+            If a required value is missing — the admin saved a template without
+            the placeholder — the override is rejected and None is returned so
+            the caller falls back to the default template instead of sending
+            a useless email.
+
     Returns:
-        Tuple of (subject, body_html) if override exists, None otherwise.
+        Tuple of (subject, body_html) if a usable override exists, None otherwise.
     """
+    # Все пути отправки проходят здесь — заодно подтягивается сохранённая
+    # обёртка писем, которой синхронный рендер пользуется из кэша.
+    await refresh_email_layout_cache(db)
+
     override = await get_template_override(notification_type, language, db)
     if not override:
         return None
@@ -191,21 +309,37 @@ async def get_rendered_override(
     from .email_templates import EmailNotificationTemplates
 
     templates = EmailNotificationTemplates()
-    body_html = override['body_html']
+    # Type-independent placeholders work in every template; caller context wins.
+    # Старые имена ({new_end_date}, {amount}, ...) продолжают работать.
+    context = apply_legacy_aliases({**build_common_context(), **(context or {})})
 
-    # Simple variable substitution for context vars like {username}, {verification_url}, etc.
-    if context:
-        for key, value in context.items():
-            body_html = body_html.replace(f'{{{key}}}', html.escape(str(value)))
+    if notification_type == EMAIL_LAYOUT_TYPE:
+        # Превью/тест самой обёртки: в {content} встаёт пример письма как HTML.
+        if not layout_is_valid(override['body_html']):
+            return None
+        return (override['subject'], render_email_layout(override['body_html'], language, context))
+    body_html = substitute_context_vars(override['body_html'], context)
 
-    rendered = templates._wrap_override_template(body_html, language)
-    subject = override['subject']
+    if required_vars and context:
+        missing = [
+            var
+            for var in required_vars
+            if context.get(var) not in (None, '') and html.escape(str(context[var])) not in body_html
+        ]
+        if missing:
+            logger.warning(
+                'Override шаблона не содержит обязательные переменные — используется дефолтный шаблон',
+                notification_type=notification_type,
+                language=language,
+                missing=missing,
+            )
+            return None
 
-    # Also substitute in subject
-    if context:
-        for key, value in context.items():
-            safe_value = str(value).replace('\r', '').replace('\n', '')
-            subject = subject.replace(f'{{{key}}}', safe_value)
+    # Маркетинговый override без ссылки отписки в подвале — раньше терялась.
+    rendered = templates._wrap_override_template(
+        body_html, language, unsubscribe_url=str(context.get('unsubscribe_url') or ''), context=context
+    )
+    subject = substitute_context_vars(override['subject'], context, escape=False)
 
     return (subject, rendered)
 

@@ -56,16 +56,9 @@ logger = structlog.get_logger(__name__)
 
 
 def _serialize_message(message: TicketMessage) -> UserTicketMessageResponse:
-    return UserTicketMessageResponse(
-        id=message.id,
-        message_text=message.message_text or '',
-        is_from_admin=bool(message.is_from_admin),
-        has_media=bool(message.media_file_id),
-        media_type=message.media_type,
-        media_file_id=message.media_file_id,
-        media_caption=message.media_caption,
-        created_at=message.created_at,
-    )
+    from app.cabinet.routes.tickets import _message_to_response
+
+    return UserTicketMessageResponse.model_validate(_message_to_response(message).model_dump())
 
 
 def _serialize_summary(ticket: Ticket) -> UserTicketSummaryResponse:
@@ -294,6 +287,11 @@ async def create_person_ticket(
         media_type=payload.media_type,
         media_file_id=payload.media_file_id,
         media_caption=payload.media_caption,
+        **(
+            {'media_items': [item.model_dump(exclude={'token'}) for item in payload.media_items]}
+            if payload.media_items
+            else {}
+        ),
     )
 
     await _announce_new_ticket(ticket, db)
@@ -350,6 +348,11 @@ async def add_person_ticket_message(
         media_type=payload.media_type,
         media_file_id=payload.media_file_id,
         media_caption=payload.media_caption,
+        **(
+            {'media_items': [item.model_dump(exclude={'token'}) for item in payload.media_items]}
+            if payload.media_items
+            else {}
+        ),
     )
 
     await _announce_ticket_reply(
@@ -481,6 +484,11 @@ async def create_account_ticket(
         media_type=payload.media_type,
         media_file_id=payload.media_file_id,
         media_caption=payload.media_caption,
+        **(
+            {'media_items': [item.model_dump(exclude={'token'}) for item in payload.media_items]}
+            if payload.media_items
+            else {}
+        ),
     )
     await _announce_new_ticket(ticket, db)
     created = await TicketCRUD.get_ticket_by_id(db, ticket.id, load_messages=True, load_user=False)
@@ -530,6 +538,11 @@ async def add_account_ticket_message(
         media_type=payload.media_type,
         media_file_id=payload.media_file_id,
         media_caption=payload.media_caption,
+        **(
+            {'media_items': [item.model_dump(exclude={'token'}) for item in payload.media_items]}
+            if payload.media_items
+            else {}
+        ),
     )
     await _announce_ticket_reply(
         ticket,

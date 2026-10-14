@@ -1108,7 +1108,7 @@ async def get_network_user_detail(
     # Fetch user with subscription eagerly loaded
     stmt = (
         select(User)
-        .options(selectinload(User.subscription).selectinload(Subscription.tariff))
+        .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
         .where(User.id == user_id)
     )
     result = await db.execute(stmt)
@@ -1204,14 +1204,16 @@ async def get_network_user_detail(
     subscription_name: str | None = None
     subscription_end: str | None = None
     subscription_status: str | None = None
-    if user.subscription is not None:
-        if user.subscription.tariff is not None:
-            subscription_name = user.subscription.tariff.name
-        subscription_end = _format_datetime(user.subscription.end_date)
+    subs = getattr(user, 'subscriptions', None) or []
+    subscription = next((s for s in subs if s.is_active), subs[0] if subs else None)
+    if subscription is not None:
+        if subscription.tariff is not None:
+            subscription_name = subscription.tariff.name
+        subscription_end = _format_datetime(subscription.end_date)
         subscription_status = _compute_subscription_status(
-            user.subscription.is_trial,
-            user.subscription.status,
-            user.subscription.end_date,
+            subscription.is_trial,
+            subscription.status,
+            subscription.end_date,
             datetime.now(UTC),
         )
 
@@ -1392,19 +1394,16 @@ async def search_referral_network(
         user_conditions.append(User.telegram_id == numeric_val)
         user_conditions.append(User.id == numeric_val)
 
-    # Find matching users that are part of the referral network
-    network_user_ids = await _fetch_network_user_ids(db)
-
-    user_stmt = (
-        select(User)
-        .where(
-            and_(
-                User.id.in_(network_user_ids) if network_user_ids else literal(False),
-                or_(*user_conditions),
-            )
-        )
-        .limit(SEARCH_RESULTS_LIMIT)
-    )
+    # Search any matching user, regardless of whether they're currently part of
+    # the referral network. Telegram bug report #362374 — an operator with a
+    # fresh install reported "не находит ни одного пользователя" because the
+    # previous query filtered by `_fetch_network_user_ids` (users who already
+    # have referrals or campaign registrations). Now an admin can search by
+    # telegram_id/username/email to seed the scope from any existing account;
+    # the scoped graph endpoint will then assemble whatever ancestors and
+    # descendants exist around the selected user (often just the user
+    # themselves on a fresh bot, which is the correct visualization).
+    user_stmt = select(User).where(or_(*user_conditions)).limit(SEARCH_RESULTS_LIMIT)
     user_result = await db.execute(user_stmt)
     matched_users = list(user_result.scalars().all())
 

@@ -8,9 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.rules import get_current_rules_content, get_rules_by_language
 from app.database.models import User
+from app.services import legal_consent_service
 from app.services.faq_service import FaqService
 from app.services.privacy_policy_service import PrivacyPolicyService
 from app.services.public_offer_service import PublicOfferService
+from app.services.recurrent_payments_service import RecurrentPaymentsService
+from app.utils.display_mode import is_visible_in_web
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 
@@ -42,6 +45,20 @@ def _get_available_language_codes() -> list[str]:
         seen.add(normalized)
         codes.append(normalized)
     return codes
+
+
+def _default_language_code() -> str:
+    return _normalize_language_code(settings.DEFAULT_LANGUAGE) or 'ru'
+
+
+def _has_content(document) -> bool:
+    """Есть ли у документа текст.
+
+    Редактор в админке сохраняет строку на каждый язык, в том числе пустую. Fallback
+    сервисов срабатывает только когда строки нет, поэтому пустую строку он пропускает
+    дальше — и пользователь видел встроенную заглушку вместо документа.
+    """
+    return bool(document and (document.content or '').strip())
 
 
 # ============ Schemas ============
@@ -77,6 +94,13 @@ class PublicOfferResponse(BaseModel):
     updated_at: str | None = None
 
 
+class RecurrentPaymentsResponse(BaseModel):
+    """Recurring-payments terms document."""
+
+    content: str
+    updated_at: str | None = None
+
+
 class ServiceInfoResponse(BaseModel):
     """General service info."""
 
@@ -94,6 +118,23 @@ class SupportConfigResponse(BaseModel):
     support_type: str  # "tickets", "profile", "url", "both"
     support_url: str | None = None
     support_username: str | None = None
+    contact_is_telegram: bool = False
+
+
+class InfoVisibilityResponse(BaseModel):
+    faq: bool
+    rules: bool
+    privacy: bool
+    offer: bool
+    recurrent: bool
+
+
+class LegalConsentConfigResponse(BaseModel):
+    """Что показать на экране первой авторизации нового пользователя."""
+
+    required: bool
+    prechecked: bool
+    documents: list[str]
 
 
 # ============ Routes ============
@@ -105,6 +146,8 @@ async def get_faq_pages(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get list of FAQ pages."""
+    if not is_visible_in_web(settings.FAQ_DISPLAY_MODE):
+        return []
     requested_lang = FaqService.normalize_language(language)
     pages = await FaqService.get_pages(
         db,
@@ -131,6 +174,11 @@ async def get_faq_page(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get a specific FAQ page by ID."""
+    if not is_visible_in_web(settings.FAQ_DISPLAY_MODE):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='FAQ is not available',
+        )
     requested_lang = FaqService.normalize_language(language)
     page = await FaqService.get_page(
         db,
@@ -160,16 +208,25 @@ async def get_rules(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get service rules - uses same function as bot."""
+    if not is_visible_in_web(settings.SERVICE_RULES_DISPLAY_MODE):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Rules are not available',
+        )
     requested_lang = language.split('-', maxsplit=1)[0].lower()
-
-    # Use the same function as bot to ensure consistent content
-    content = await get_current_rules_content(db, requested_lang)
-
-    # Try to get updated_at from DB record
     rules = await get_rules_by_language(db, requested_lang)
-    updated_at = None
-    if rules and rules.updated_at:
-        updated_at = rules.updated_at.isoformat()
+    if not _has_content(rules):
+        # Правил на этом языке нет или строка пустая — отдаём правила языка по
+        # умолчанию, а не встроенную заглушку (как и у остальных документов).
+        rules = await get_rules_by_language(db, _default_language_code()) or rules
+
+    if _has_content(rules):
+        content = rules.content
+        updated_at = rules.updated_at.isoformat() if rules.updated_at else None
+    else:
+        # Та же встроенная заглушка, что показывает бот.
+        content = await get_current_rules_content(db, _default_language_code())
+        updated_at = None
 
     return RulesResponse(content=content, updated_at=updated_at)
 
@@ -180,8 +237,15 @@ async def get_privacy_policy(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get privacy policy."""
+    if not is_visible_in_web(settings.PRIVACY_POLICY_DISPLAY_MODE):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Privacy policy is not available',
+        )
     requested_lang = PrivacyPolicyService.normalize_language(language)
     policy = await PrivacyPolicyService.get_policy(db, requested_lang, fallback=True)
+    if not _has_content(policy):
+        policy = await PrivacyPolicyService.get_policy(db, _default_language_code(), fallback=False) or policy
 
     if policy and policy.content:
         updated_at = policy.updated_at.isoformat() if policy.updated_at else None
@@ -203,8 +267,15 @@ async def get_public_offer(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get public offer."""
+    if not is_visible_in_web(settings.PUBLIC_OFFER_DISPLAY_MODE):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Public offer is not available',
+        )
     requested_lang = PublicOfferService.normalize_language(language)
     offer = await PublicOfferService.get_offer(db, requested_lang, fallback=True)
+    if not _has_content(offer):
+        offer = await PublicOfferService.get_offer(db, _default_language_code(), fallback=False) or offer
 
     if offer and offer.content:
         updated_at = offer.updated_at.isoformat() if offer.updated_at else None
@@ -220,15 +291,62 @@ async def get_public_offer(
     )
 
 
+@router.get('/recurrent-payments', response_model=RecurrentPaymentsResponse)
+async def get_recurrent_payments(
+    language: str = Query('ru', min_length=2, max_length=10),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Get recurring-payments terms document."""
+    if not is_visible_in_web(settings.RECURRENT_PAYMENTS_DISPLAY_MODE):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Recurring-payments document is not available',
+        )
+    requested_lang = RecurrentPaymentsService.normalize_language(language)
+    document = await RecurrentPaymentsService.get_document(db, requested_lang, fallback=True)
+    if not _has_content(document):
+        document = await RecurrentPaymentsService.get_document(db, _default_language_code(), fallback=False) or document
+
+    if document and document.content:
+        updated_at = document.updated_at.isoformat() if document.updated_at else None
+        return RecurrentPaymentsResponse(content=document.content, updated_at=updated_at)
+
+    # Return default document if none found
+    return RecurrentPaymentsResponse(
+        content="""# Рекуррентные платежи
+
+Условия автоматических регулярных списаний.
+""",
+        updated_at=None,
+    )
+
+
 @router.get('/service', response_model=ServiceInfoResponse)
-async def get_service_info():
-    """Get general service information."""
+async def get_service_info(
+    language: str = Query('ru', min_length=2, max_length=10),
+):
+    """Get general service information.
+
+    Название и описание берём из брендинга (MINIAPP_SERVICE_NAME_*/
+    MINIAPP_SERVICE_DESCRIPTION_*) — того же источника, что и мини-апп, чтобы
+    сервис не назывался в двух местах по-разному. Раньше здесь читались
+    SERVICE_NAME / SERVICE_DESCRIPTION / WEBSITE_URL, которых в Settings нет,
+    поэтому любой инстанс отдавал «VPN Service» с пустыми контактами.
+    """
+    requested_lang = _normalize_language_code(language)
+    branding = settings.get_miniapp_branding()
+    name = branding['service_name'].get(requested_lang) or branding['service_name']['default']
+    description = branding['service_description'].get(requested_lang) or branding['service_description']['default']
+
+    # Незаполненный контакт — это null, а не пустая строка: так отвечала прежняя
+    # версия ручки (`getattr(...) or getattr(...)`), так же поступает соседний
+    # /support-config, и только так работает клиентская проверка «контакт задан».
     return ServiceInfoResponse(
-        name=getattr(settings, 'SERVICE_NAME', None) or getattr(settings, 'BOT_NAME', 'VPN Service'),
-        description=getattr(settings, 'SERVICE_DESCRIPTION', None),
-        support_email=getattr(settings, 'SUPPORT_EMAIL', None),
-        support_telegram=getattr(settings, 'SUPPORT_USERNAME', None) or getattr(settings, 'SUPPORT_TELEGRAM', None),
-        website=getattr(settings, 'WEBSITE_URL', None),
+        name=name,
+        description=description,
+        support_email=(settings.SUPPORT_EMAIL or '').strip() or None,
+        support_telegram=(settings.SUPPORT_USERNAME or '').strip() or None,
+        website=(settings.SERVICE_WEBSITE_URL or '').strip() or None,
     )
 
 
@@ -284,19 +402,31 @@ async def update_user_language(
 @router.get('/support-config', response_model=SupportConfigResponse)
 async def get_support_config():
     """Get support/tickets configuration for cabinet."""
-    # Use SUPPORT_SYSTEM_MODE setting (configurable from admin panel)
-    support_mode = settings.get_support_system_mode()  # returns: tickets, contact, or both
+    # Режим берём через сервис: он владеет persisted-значением (data/support_settings.json)
+    # и синхронизирует его в settings. Чтение settings напрямую отдало бы значение
+    # из .env, если сервис в этом процессе ещё ни разу не загружался.
+    from app.services.support_settings_service import SupportSettingsService
+
+    support_mode = SupportSettingsService.get_system_mode()  # returns: tickets, contact, or both
+
+    # SUPPORT_USERNAME принимает и @username, и произвольный URL (см.
+    # Settings.get_support_contact_url) — бот этим уже пользуется и вешает ссылку
+    # на кнопку «Связаться с поддержкой». Кабинет резолвит контакт тем же методом,
+    # чтобы внешний хелпдеск открывался одинаково в обеих поверхностях.
+    contact_url = settings.get_support_contact_url()
+    contact_is_telegram = settings.is_support_contact_telegram()
 
     # Map support mode to support type for frontend
     # - "tickets" mode -> tickets only, no contact
-    # - "contact" mode -> contact only (profile), no tickets
+    # - "contact" mode -> contact only, no tickets: "profile" для Telegram,
+    #   "url" для внешнего хелпдеска
     # - "both" mode -> tickets enabled, contact available as fallback
     if support_mode == 'tickets':
         tickets_enabled = True
         support_type = 'tickets'
     elif support_mode == 'contact':
         tickets_enabled = False
-        support_type = 'profile'
+        support_type = 'profile' if contact_is_telegram else 'url'
     else:  # both
         tickets_enabled = True
         support_type = 'both'
@@ -304,6 +434,38 @@ async def get_support_config():
     return SupportConfigResponse(
         tickets_enabled=tickets_enabled,
         support_type=support_type,
-        support_url=None,  # Cabinet doesn't use custom URLs
-        support_username=settings.SUPPORT_USERNAME,  # Always return for fallback
+        support_url=contact_url,
+        # Нормализованный вид (@user либо URL) — сырое значение могло бы прийти
+        # без схемы и клиент склеил бы из него битую t.me-ссылку.
+        support_username=settings.get_support_contact_display() or None,
+        contact_is_telegram=contact_is_telegram,
+    )
+
+
+@router.get('/legal-consent', response_model=LegalConsentConfigResponse)
+async def get_legal_consent_config(
+    language: str = Query('ru', min_length=2, max_length=10),
+    db: AsyncSession = Depends(get_cabinet_db),
+):
+    """Нужны ли новому пользователю галочки «ознакомлен» и с чем именно.
+
+    Публичный: экран логина запрашивает это ДО авторизации. Возвращает только ключи
+    документов — тексты и ссылки на них у кабинета свои.
+    """
+    requirement = await legal_consent_service.get_requirement(db, language)
+    return LegalConsentConfigResponse(
+        required=requirement.required,
+        prechecked=requirement.prechecked,
+        documents=requirement.documents,
+    )
+
+
+@router.get('/visibility', response_model=InfoVisibilityResponse)
+async def get_info_visibility():
+    return InfoVisibilityResponse(
+        faq=is_visible_in_web(settings.FAQ_DISPLAY_MODE),
+        rules=is_visible_in_web(settings.SERVICE_RULES_DISPLAY_MODE),
+        privacy=is_visible_in_web(settings.PRIVACY_POLICY_DISPLAY_MODE),
+        offer=is_visible_in_web(settings.PUBLIC_OFFER_DISPLAY_MODE),
+        recurrent=is_visible_in_web(settings.RECURRENT_PAYMENTS_DISPLAY_MODE),
     )

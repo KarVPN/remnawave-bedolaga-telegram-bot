@@ -76,7 +76,7 @@ async def set_active_pinned_message(
     await db.commit()
     await db.refresh(pinned_message)
 
-    logger.info('Создано новое закрепленное сообщение #', pinned_message_id=pinned_message.id)
+    logger.info('Создано новое закрепленное сообщение', pinned_message_id=pinned_message.id)
     return pinned_message
 
 
@@ -89,7 +89,7 @@ async def deactivate_active_pinned_message(db: AsyncSession) -> PinnedMessage | 
     pinned_message.updated_at = datetime.now(UTC)
     await db.commit()
     await db.refresh(pinned_message)
-    logger.info('Деактивировано закрепленное сообщение #', pinned_message_id=pinned_message.id)
+    logger.info('Деактивировано закрепленное сообщение', pinned_message_id=pinned_message.id)
     return pinned_message
 
 
@@ -175,7 +175,7 @@ async def broadcast_pinned_message(
                     break
                 except TelegramRetryAfter as retry_error:
                     delay = min(retry_error.retry_after + 1, 30)
-                    logger.warning('RetryAfter for user , waiting seconds', telegram_id=telegram_id, delay=delay)
+                    logger.warning('RetryAfter for user — waiting before retry', telegram_id=telegram_id, delay=delay)
                     await asyncio.sleep(delay)
                 except Exception as send_error:
                     logger.error(
@@ -205,11 +205,13 @@ async def unpin_active_pinned_message(
     """
     Открепляет активное сообщение у всех пользователей.
 
-    ВАЖНО: Извлекаем telegram_id в список ДО начала долгой операции,
+    ВАЖНО: Деактивация в БД происходит ПОСЛЕ откреплений в Telegram,
+    чтобы при сбое можно было повторить операцию.
+    Извлекаем telegram_id в список ДО начала долгой операции,
     чтобы избежать обращения к ORM-объектам после истечения таймаута
     соединения с БД.
     """
-    pinned_message = await deactivate_active_pinned_message(db)
+    pinned_message = await get_active_pinned_message(db)
     if not pinned_message:
         return 0, 0, False
 
@@ -259,6 +261,11 @@ async def unpin_active_pinned_message(
         tasks = [unpin_for_telegram_id(tid) for tid in batch]
         await asyncio.gather(*tasks)
         await asyncio.sleep(0.05)
+
+    # Деактивируем ПОСЛЕ откреплений через fresh session —
+    # исходная сессия может протухнуть за время долгого цикла Telegram API
+    async with AsyncSessionLocal() as fresh_db:
+        await deactivate_active_pinned_message(fresh_db)
 
     return unpinned_count, failed_count, True
 
@@ -349,7 +356,7 @@ async def _unpin_message_for_user(bot: Bot, chat_id: int, max_retries: int = 3) 
             if attempt < max_retries - 1:
                 delay = min(e.retry_after + 1, 30)
                 logger.warning(
-                    'RetryAfter при откреплении для , ожидание сек (попытка /)',
+                    'RetryAfter при откреплении — ждём перед повтором',
                     chat_id=chat_id,
                     delay=delay,
                     attempt=attempt + 1,

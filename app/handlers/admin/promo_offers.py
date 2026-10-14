@@ -46,6 +46,7 @@ from app.utils.decorators import admin_required, error_handler
 from app.utils.formatters import format_datetime, format_duration
 from app.utils.miniapp_buttons import build_miniapp_or_callback_button
 from app.utils.subscription_utils import get_display_subscription_link
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -71,13 +72,9 @@ async def _safe_delete_message_by_id(bot, chat_id: int, message_id: int) -> None
         await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest as exc:
         if 'message to delete not found' not in str(exc).lower():
-            logger.debug(
-                'Не удалось удалить сообщение администратора (,)', chat_id=chat_id, message_id=message_id, exc=exc
-            )
+            logger.debug('Не удалось удалить сообщение администратора', chat_id=chat_id, message_id=message_id, exc=exc)
     except TelegramForbiddenError:
-        logger.debug(
-            'Недостаточно прав для удаления сообщения администратора (,)', chat_id=chat_id, message_id=message_id
-        )
+        logger.debug('Недостаточно прав для удаления сообщения администратора', chat_id=chat_id, message_id=message_id)
 
 
 async def _clear_promo_offer_search_prompt(state: FSMContext, bot) -> None:
@@ -307,7 +304,7 @@ def _format_promo_offer_log_entry(
     index: int,
     texts,
 ) -> str:
-    timestamp = entry.created_at.strftime('%d.%m.%Y %H:%M') if entry.created_at else '-'
+    timestamp = format_local_datetime(entry.created_at, '%d.%m.%Y %H:%M') if entry.created_at else '-'
     action_key = ACTION_LABEL_KEYS.get(entry.action, '')
     action_label = texts.get(action_key, entry.action.title())
     lines = [f'{index}. <b>{timestamp}</b> — {action_label}']
@@ -1468,7 +1465,51 @@ async def show_selected_user_details(
         )
 
     subscription = getattr(user, 'subscription', None)
-    if subscription:
+    subscriptions_list = getattr(user, 'subscriptions', None) or []
+    if settings.is_multi_tariff_enabled() and subscriptions_list:
+        lines.append('')
+        lines.append(texts.t('ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION', '💳 <b>Подписки</b>'))
+        for sub in subscriptions_list:
+            tariff_name = sub.tariff.name if sub.tariff else f'#{sub.id}'
+            lines.append(f'<b>{tariff_name}</b>')
+            lines.append(
+                texts.t(
+                    'ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION_STATUS',
+                    'Статус: {status}',
+                ).format(status=sub.status_display)
+            )
+            end_date_text = (
+                format_datetime(sub.end_date)
+                if sub.end_date
+                else texts.t(
+                    'ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION_END_UNKNOWN',
+                    'не указано',
+                )
+            )
+            lines.append(
+                texts.t(
+                    'ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION_END',
+                    'Истекает: {date}',
+                ).format(date=end_date_text)
+            )
+            lines.append(
+                texts.t(
+                    'ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION_TRAFFIC',
+                    'Трафик: {used}/{limit} ГБ',
+                ).format(
+                    used=sub.traffic_used_gb or 0,
+                    limit=sub.traffic_limit_gb or 0,
+                )
+            )
+            connected = sub.connected_squads or []
+            if connected:
+                lines.append(
+                    texts.t(
+                        'ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION_SQUADS',
+                        'Подключено сквадов: {count}',
+                    ).format(count=len(connected))
+                )
+    elif subscription:
         lines.append('')
         lines.append(texts.t('ADMIN_PROMO_OFFER_SEND_USER_SUBSCRIPTION', '💳 <b>Подписка</b>'))
         lines.append(
@@ -1771,7 +1812,21 @@ async def show_selected_user_details(
             ).format(count=len(active_offers))
         )
 
-    if subscription:
+    if settings.is_multi_tariff_enabled() and subscriptions_list:
+        now = datetime.now(UTC)
+        sub_ids = [sub.id for sub in subscriptions_list]
+        result = await db.execute(
+            select(SubscriptionTemporaryAccess)
+            .options(selectinload(SubscriptionTemporaryAccess.offer))
+            .where(
+                SubscriptionTemporaryAccess.subscription_id.in_(sub_ids),
+                SubscriptionTemporaryAccess.is_active == True,
+                SubscriptionTemporaryAccess.expires_at > now,
+            )
+            .order_by(SubscriptionTemporaryAccess.expires_at.desc())
+        )
+        accesses = result.scalars().all()
+    elif subscription:
         now = datetime.now(UTC)
         result = await db.execute(
             select(SubscriptionTemporaryAccess)
@@ -1844,7 +1899,11 @@ async def show_selected_user_details(
 
 
 def _build_connect_button_rows(user: User, texts) -> list[list[InlineKeyboardButton]]:
-    subscription = getattr(user, 'subscription', None)
+    if settings.is_multi_tariff_enabled():
+        subs = getattr(user, 'subscriptions', None) or []
+        subscription = next((s for s in subs if s.subscription_url), None)
+    else:
+        subscription = getattr(user, 'subscription', None)
     if not subscription:
         return []
 
@@ -1921,21 +1980,38 @@ async def _send_offer_to_users(
 
     async def send_single_offer(user):
         """Отправляет одно предложение с семафором ограничения"""
-        # Skip email-only users (no telegram_id)
-        if not user.telegram_id:
-            logger.debug('Пропуск email-пользователя при рассылке промо', user_id=user.id)
+        from app.utils.notification_prefs import is_promo_offers_enabled
+
+        # Email-only юзеры (без telegram_id) раньше пропускались целиком —
+        # ни оффера, ни уведомления. Теперь оффер создаётся, а уведомление
+        # уходит на подтверждённую почту (активация — в кабинете).
+        if not user.telegram_id and not (user.email and user.email_verified):
+            logger.debug('У пользователя нет ни Telegram, ни подтверждённого email — промо пропущено', user_id=user.id)
             return False
 
         async with semaphore:
             try:
                 # Используем отдельную сессию для изоляции транзакции
                 async with AsyncSessionLocal() as new_db:
+                    if settings.is_multi_tariff_enabled():
+                        _user_subs = getattr(user, 'subscriptions', None) or []
+                        _active_subs = [s for s in _user_subs if s.is_active]
+                        if _active_subs:
+                            _non_daily = [s for s in _active_subs if not getattr(s, 'is_daily_tariff', False)]
+                            _eligible = _non_daily or _active_subs
+                            _best = max(_eligible, key=lambda s: s.days_left)
+                            _offer_sub_id = _best.id
+                        elif _user_subs:
+                            _offer_sub_id = _user_subs[0].id
+                        else:
+                            _offer_sub_id = None
+                    else:
+                        _offer_sub = getattr(user, 'subscription', None)
+                        _offer_sub_id = _offer_sub.id if _offer_sub else None
                     offer_record = await upsert_discount_offer(
                         new_db,
                         user_id=user.id,
-                        subscription_id=getattr(user, 'subscription', None).id
-                        if getattr(user, 'subscription', None)
-                        else None,
+                        subscription_id=_offer_sub_id,
                         notification_type=f'promo_template_{template.id}',
                         discount_percent=template.discount_percent,
                         bonus_amount_kopeks=0,
@@ -1949,6 +2025,38 @@ async def _send_offer_to_users(
                             'active_discount_hours': template.active_discount_hours,
                         },
                     )
+
+                    message_text = _render_template_text(
+                        template,
+                        user.language or db_user.language,
+                        server_name=squad_name,
+                    )
+
+                    # Настройка уведомлений глушит СООБЩЕНИЕ, но не саму скидку:
+                    # оффер уже создан выше и остаётся доступным в кабинете и
+                    # миниаппе. Так же ведёт себя кабинетная рассылка
+                    # (`admin_promo_offers.broadcast`), и расходиться они не должны.
+                    if not settings.is_notifications_enabled() or not is_promo_offers_enabled(user):
+                        logger.debug(
+                            'Промо-оффер создан, уведомление подавлено настройками',
+                            user_id=user.id,
+                        )
+                        return True
+
+                    if not user.telegram_id:
+                        # Email-only юзер: тот же текст на почту, кнопке «Получить»
+                        # соответствует ссылка на кабинет внутри шаблона письма.
+                        from app.services.promo_offer_email import send_promo_offer_email
+
+                        return await send_promo_offer_email(
+                            email=user.email,
+                            language=user.language or db_user.language,
+                            username=user.first_name or user.username or '',
+                            user_id=user.id,
+                            message_text=message_text,
+                            valid_hours=template.valid_hours,
+                            discount_percent=template.discount_percent or 0,
+                        )
 
                     user_texts = get_texts(user.language or db_user.language)
                     keyboard_rows: list[list[InlineKeyboardButton]] = [
@@ -1971,11 +2079,6 @@ async def _send_offer_to_users(
 
                     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
-                    message_text = _render_template_text(
-                        template,
-                        user.language or db_user.language,
-                        server_name=squad_name,
-                    )
                     await bot.send_message(
                         chat_id=user.telegram_id,
                         text=message_text,
@@ -2051,8 +2154,14 @@ async def send_offer_to_segment(callback: CallbackQuery, db_user: User, db: Asyn
     if template.offer_type == 'test_access' and squad_uuid:
         filtered_users: list[User] = []
         for user in users:
-            subscription = getattr(user, 'subscription', None)
-            connected = set(subscription.connected_squads or []) if subscription else set()
+            if settings.is_multi_tariff_enabled():
+                all_squads: set[str] = set()
+                for s in getattr(user, 'subscriptions', None) or []:
+                    all_squads.update(s.connected_squads or [])
+                connected = all_squads
+            else:
+                subscription = getattr(user, 'subscription', None)
+                connected = set(subscription.connected_squads or []) if subscription else set()
             if squad_uuid in connected:
                 continue
             filtered_users.append(user)

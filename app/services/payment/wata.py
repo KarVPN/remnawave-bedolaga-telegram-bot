@@ -168,7 +168,7 @@ class WataPaymentMixin:
         )
 
         logger.info(
-            'Создан WATA платеж на ₽ для пользователя',
+            'Создан WATA платеж',
             payment_link_id=payment_link_id,
             amount_kopeks=amount_kopeks / 100,
             user_id=user_id,
@@ -218,9 +218,7 @@ class WataPaymentMixin:
             payment = await payment_module.get_wata_payment_by_link_id(db, payment_link_id)
 
         if not payment:
-            logger.error(
-                'WATA платеж не найден (order_id payment_link_id=)', order_id=order_id, payment_link_id=payment_link_id
-            )
+            logger.error('WATA платеж не найден', order_id=order_id, payment_link_id=payment_link_id)
             return False
 
         # Lock payment row immediately to prevent concurrent webhook processing (TOCTOU race)
@@ -353,7 +351,7 @@ class WataPaymentMixin:
                                 break
                     except WataAPIError as error:
                         logger.error(
-                            'Ошибка поиска WATA транзакций для', payment_link_id=payment.payment_link_id, error=error
+                            'Ошибка поиска WATA транзакций', payment_link_id=payment.payment_link_id, error=error
                         )
                     except Exception as error:  # pragma: no cover - safety net
                         logger.exception('Непредвиденная ошибка при поиске WATA транзакции', error=error)
@@ -399,7 +397,7 @@ class WataPaymentMixin:
                     payment = await self._finalize_wata_payment(db, payment, transaction_payload)
             else:
                 logger.debug(
-                    'WATA транзакция в статусе , повторная обработка не требуется',
+                    'WATA транзакция в этом статусе повторной обработки не требует',
                     transaction_id=transaction_id or getattr(payment, 'payment_link_id', ''),
                     normalized_status=normalized_status or 'unknown',
                 )
@@ -576,7 +574,7 @@ class WataPaymentMixin:
             except Exception as error:
                 logger.error('Ошибка отправки админ уведомления WATA', error=error)
 
-        if getattr(self, 'bot', None) and user.telegram_id:
+        if getattr(self, 'bot', None) and user.telegram_id and settings.is_notifications_enabled():
             try:
                 keyboard = await self.build_topup_success_keyboard(user)
                 await self.bot.send_message(

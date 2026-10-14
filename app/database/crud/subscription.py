@@ -1,27 +1,74 @@
+import contextlib
+import math
+import secrets
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, case, delete, func, select, update
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.exc import StaleDataError
 
 from app.config import settings
+from app.database.constants import ALIVE_SUBSCRIPTION_STATUSES as _ALIVE_SUBSCRIPTION_STATUSES
 from app.database.crud.notification import clear_notifications
 from app.database.models import (
     Subscription,
     SubscriptionServer,
     SubscriptionStatus,
+    Tariff,
     Transaction,
     TransactionType,
     User,
     UserStatus,
 )
-from app.utils.timezone import format_local_datetime
+from app.utils.subscription_time import ends_within_days
+from app.utils.timezone import format_local_datetime, local_day_start
 
 
 logger = structlog.get_logger(__name__)
+
+# Статусы «живой» подписки — в app.database.constants; имя здесь оставлено для
+# существующих импортов.
+ALIVE_SUBSCRIPTION_STATUSES = _ALIVE_SUBSCRIPTION_STATUSES
+
+# Кортеж для SQLAlchemy .in_() — вычисляется один раз, не аллоцируется при каждом вызове.
+_ALIVE_SUBSCRIPTION_STATUSES_TUPLE: tuple[str, ...] = tuple(ALIVE_SUBSCRIPTION_STATUSES)
+
+# Имя частичного уникального индекса, конфликт по которому мы ожидаем
+# при гонке создания триальной подписки.
+UQ_TRIAL_CONSTRAINT = 'uq_subscriptions_user_tariff_active'
+
+
+def _is_trial_unique_violation(exc: IntegrityError) -> bool:
+    """Проверяет, вызвана ли IntegrityError конфликтом по нашему constraint.
+
+    Использует структурированное поле asyncpg (``exc.orig.constraint_name``),
+    со строковым fallback на случай обёрток или будущей смены драйвера.
+    """
+    orig = exc.orig
+    if orig is None:
+        return False
+    # asyncpg: UniqueViolationError.constraint_name
+    name = getattr(orig, 'constraint_name', None)
+    if name is not None:
+        return name == UQ_TRIAL_CONSTRAINT
+    # Строковый fallback — менее надёжен, но лучше чем ничего
+    return UQ_TRIAL_CONSTRAINT.lower() in str(orig).lower()
+
+
+async def generate_unique_short_id(db: AsyncSession, max_attempts: int = 10) -> str:
+    """Generate a unique remnawave_short_id (6 hex chars) with collision check."""
+    for _ in range(max_attempts):
+        short_id = secrets.token_hex(3)
+        existing = await db.execute(select(Subscription.id).where(Subscription.remnawave_short_id == short_id).limit(1))
+        if existing.scalar_one_or_none() is None:
+            return short_id
+    # Fallback: 8 chars for extra entropy
+    return secrets.token_hex(4)
+
 
 _WEBHOOK_GUARD_SECONDS = 60
 
@@ -67,6 +114,14 @@ def is_active_paid_subscription(subscription: Subscription | None) -> bool:
 
 
 async def get_subscription_by_user_id(db: AsyncSession, user_id: int) -> Subscription | None:
+    """Get primary subscription for user.
+
+    Returns the first active/trial subscription, or the most recently created one.
+    Multi-tariff compatible: prioritizes active subscriptions.
+    For multi-tariff operations on a specific subscription, use get_subscription_by_id_for_user().
+    """
+    from app.database.models import SubscriptionStatus
+
     result = await db.execute(
         select(Subscription)
         .options(
@@ -74,7 +129,16 @@ async def get_subscription_by_user_id(db: AsyncSession, user_id: int) -> Subscri
             selectinload(Subscription.tariff),
         )
         .where(Subscription.user_id == user_id)
-        .order_by(Subscription.created_at.desc())
+        .order_by(
+            # Active/trial subscriptions first, then by end_date (most remaining time)
+            case(
+                (Subscription.status == SubscriptionStatus.ACTIVE.value, 0),
+                (Subscription.status == SubscriptionStatus.TRIAL.value, 1),
+                else_=2,
+            ),
+            Subscription.end_date.desc().nulls_last(),
+            Subscription.created_at.desc(),
+        )
         .limit(1)
     )
     subscription = result.scalar_one_or_none()
@@ -89,6 +153,23 @@ async def get_subscription_by_user_id(db: AsyncSession, user_id: int) -> Subscri
         subscription = await check_and_update_subscription_status(db, subscription)
 
     return subscription
+
+
+def apply_trial_conversion_defaults(subscription: Subscription) -> None:
+    """Настройки, которые подписка получает, перестав быть триалом.
+
+    У триала ``autopay_enabled`` всегда False: автоплатёж для пробника запрещён —
+    включение отклоняют и бот, и кабинет, а выборка автоплатежей фильтрует
+    ``is_trial``. Значит, на триальной строке пользователь этот флаг выставить не
+    мог, и затирать тут нечего: реальное значение по ``DEFAULT_AUTOPAY_ENABLED``
+    подписка должна получать ровно в момент, когда становится платной.
+
+    Вызывать ТОЛЬКО там, где строка действительно БЫЛА триалом. На продлении уже
+    платной подписки это затрёт осознанный выбор пользователя — поэтому
+    ``_revive_paid_subscription`` и админское продление, где ``is_trial = False``
+    ставится и для не-триалов, сюда не заходят.
+    """
+    subscription.autopay_enabled = settings.is_autopay_enabled_by_default()
 
 
 async def create_trial_subscription(
@@ -108,12 +189,16 @@ async def create_trial_subscription(
         tariff_id: ID тарифа (для режима тарифов)
     """
     duration_days = duration_days or settings.TRIAL_DURATION_DAYS
-    traffic_limit_gb = traffic_limit_gb or settings.TRIAL_TRAFFIC_LIMIT_GB
+    # 0 ГБ — это осознанный БЕЗЛИМИТ (валидное значение), поэтому отличаем
+    # «не передано» (None → берём конфиг) от «0» (оставляем безлимит). `or` тут
+    # затирал бы намеренный безлимит триал-тарифа значением TRIAL_TRAFFIC_LIMIT_GB.
+    if traffic_limit_gb is None:
+        traffic_limit_gb = settings.TRIAL_TRAFFIC_LIMIT_GB
     if device_limit is None:
         device_limit = settings.TRIAL_DEVICE_LIMIT
 
-    # Если переданы connected_squads, используем их
-    # Иначе используем squad_uuid или получаем случайный
+    # Если переданы connected_squads, используем их.
+    # Иначе используем squad_uuid или все доступные сквады по умолчанию.
     final_squads = []
     if connected_squads:
         final_squads = connected_squads
@@ -121,13 +206,14 @@ async def create_trial_subscription(
         final_squads = [squad_uuid]
     else:
         try:
-            from app.database.crud.server_squad import get_random_trial_squad_uuid
+            from app.database.crud.server_squad import get_effective_tariff_squad_uuids
 
-            random_squad = await get_random_trial_squad_uuid(db)
-            if random_squad:
-                final_squads = [random_squad]
+            final_squads = await get_effective_tariff_squad_uuids(db, None)
+            if final_squads:
                 logger.debug(
-                    'Выбран сквад для триальной подписки пользователя', random_squad=random_squad, user_id=user_id
+                    'Выбраны дефолтные сквады для триальной подписки пользователя',
+                    final_squads=final_squads,
+                    user_id=user_id,
                 )
         except Exception as error:
             logger.error('Не удалось получить сквад для триальной подписки пользователя', user_id=user_id, error=error)
@@ -135,7 +221,17 @@ async def create_trial_subscription(
     end_date = datetime.now(UTC) + timedelta(days=duration_days)
 
     # Check for existing PENDING trial subscription (retry after failed payment)
-    existing = await get_subscription_by_user_id(db, user_id)
+    # In multi-tariff mode, only reuse a subscription for the SAME tariff to avoid
+    # overwriting a paid subscription for a different tariff.
+    existing = None
+    if settings.is_multi_tariff_enabled() and tariff_id is not None:
+        for sub in await get_active_subscriptions_by_user_id(db, user_id):
+            if sub.tariff_id == tariff_id:
+                existing = sub
+                break
+    else:
+        existing = await get_subscription_by_user_id(db, user_id)
+
     if existing and existing.is_trial and existing.status == SubscriptionStatus.PENDING.value:
         existing.status = SubscriptionStatus.ACTIVE.value
         existing.start_date = datetime.now(UTC)
@@ -144,12 +240,35 @@ async def create_trial_subscription(
         existing.device_limit = device_limit
         existing.connected_squads = final_squads
         existing.tariff_id = tariff_id
+        if not existing.remnawave_short_id:
+            existing.remnawave_short_id = await generate_unique_short_id(db)
         await db.commit()
         await db.refresh(existing)
         logger.info(
             '🎁 Обновлена PENDING триальная подписка для пользователя', existing_id=existing.id, user_id=user_id
         )
         return existing
+
+    # Идемпотентность: если живая (active/trial/limited) подписка на этот тариф уже
+    # существует (например, из-за двойного клика / гонки запросов), не пытаемся
+    # вставить дубликат — иначе сработает частичный UNIQUE
+    # ``uq_subscriptions_user_tariff_active`` и упадём с IntegrityError. Возвращаем
+    # существующую подписку как результат активации.
+    # Проверяем явно только «живые» статусы: в single-tariff ветке existing приходит
+    # из get_subscription_by_user_id(), который может вернуть EXPIRED/DISABLED —
+    # в этом случае нужно создать новый триал, а не вернуть устаревшую запись.
+    # PENDING уже обработан блоком выше и сюда не доходит.
+    if existing and existing.status in ALIVE_SUBSCRIPTION_STATUSES:
+        logger.info(
+            '🎁 Живая подписка для пользователя уже существует — возвращаем её без INSERT',
+            existing_id=existing.id,
+            existing_status=existing.status,
+            existing_is_trial=existing.is_trial,
+            user_id=user_id,
+        )
+        return existing
+
+    short_id = await generate_unique_short_id(db)
 
     subscription = Subscription(
         user_id=user_id,
@@ -160,17 +279,44 @@ async def create_trial_subscription(
         traffic_limit_gb=traffic_limit_gb,
         device_limit=device_limit,
         connected_squads=final_squads,
-        autopay_enabled=settings.is_autopay_enabled_by_default(),
+        autopay_enabled=False,
         autopay_days_before=settings.DEFAULT_AUTOPAY_DAYS_BEFORE,
         tariff_id=tariff_id,
+        remnawave_short_id=short_id,
     )
 
     db.add(subscription)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # Всегда откатываем транзакцию и убираем объект из сессии — независимо от
+        # причины ошибки, сессию нельзя оставлять в broken-состоянии.
+        await db.rollback()
+        with contextlib.suppress(InvalidRequestError):
+            db.expunge(subscription)
+
+        # Пробрасываем ошибки, не связанные с конфликтом по нашему уникальному индексу,
+        # чтобы не маскировать неожиданные IntegrityError из других constraint'ов.
+        if not _is_trial_unique_violation(exc):
+            raise
+
+        logger.warning(
+            '⚠️ Гонка при создании триальной подписки — подписка уже создана параллельно',
+            user_id=user_id,
+            tariff_id=tariff_id,
+        )
+        if settings.is_multi_tariff_enabled() and tariff_id is not None:
+            concurrent = await get_subscription_by_user_and_tariff(db, user_id, tariff_id)
+        else:
+            concurrent = await get_subscription_by_user_id(db, user_id)
+        if concurrent:
+            return concurrent
+        raise
     await db.refresh(subscription)
 
     logger.info(
-        f'🎁 Создана триальная подписка для пользователя {user_id}' + (f' с тарифом {tariff_id}' if tariff_id else '')
+        f'🎁 Создана триальная подписка для пользователя {user_id}'
+        + (f' с тарифом {tariff_id}' if tariff_id is not None else '')
     )
 
     if final_squads:
@@ -196,24 +342,101 @@ async def create_trial_subscription(
     return subscription
 
 
-async def create_paid_subscription(
+async def _revive_paid_subscription(
     db: AsyncSession,
-    user_id: int,
+    subscription: Subscription,
+    *,
     duration_days: int,
-    traffic_limit_gb: int = 0,
-    device_limit: int | None = None,
-    connected_squads: list[str] = None,
-    update_server_counters: bool = False,
-    is_trial: bool = False,
-    tariff_id: int | None = None,
-    commit: bool = True,
+    traffic_limit_gb: int,
+    device_limit: int | None,
+    connected_squads: list[str] | None,
+    update_server_counters: bool,
+    commit: bool,
 ) -> Subscription:
-    end_date = datetime.now(UTC) + timedelta(days=duration_days)
+    """Revive/extend an existing (possibly expired) tariff subscription in place.
 
-    if device_limit is None:
-        device_limit = settings.DEFAULT_DEVICE_LIMIT
+    Backs the one-subscription-per-tariff invariant in multi-tariff mode: instead
+    of inserting a duplicate, reuse the record (keeping its Remnawave link).
+    Mirrors the classic extend branch — extend from the current end_date if still
+    alive, otherwise start a fresh period from now and reset used traffic.
+    """
+    # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+    from app.services.grace_access_echo import undo_grace_overlay_echo
 
-    # Fallback: если connected_squads пустой — берём первый доступный сквад
+    await undo_grace_overlay_echo(db, subscription)
+    now = datetime.now(UTC)
+    was_alive = subscription.end_date is not None and subscription.end_date > now
+
+    subscription.is_trial = False
+    subscription.status = SubscriptionStatus.ACTIVE.value
+    subscription.traffic_limit_gb = traffic_limit_gb
+    if device_limit is not None:
+        subscription.device_limit = device_limit
+    if connected_squads:
+        subscription.connected_squads = list(connected_squads)
+
+    base_date = subscription.end_date if was_alive else now
+    if not was_alive:
+        subscription.start_date = now
+        subscription.traffic_used_gb = 0.0
+    subscription.end_date = base_date + timedelta(days=duration_days)
+    subscription.updated_at = now
+
+    if commit:
+        await db.commit()
+        await db.refresh(subscription)
+    else:
+        await db.flush()
+
+    try:
+        killed = await deactivate_user_trial_subscriptions(
+            db, subscription.user_id, exclude_subscription_id=subscription.id
+        )
+        if killed:
+            logger.info(
+                'Deactivated trial subscriptions on paid revive',
+                user_id=subscription.user_id,
+                killed_count=len(killed),
+            )
+    except Exception as trial_err:
+        logger.warning('Failed to deactivate trials on paid revive', error=trial_err)
+
+    squad_uuids = list(subscription.connected_squads or [])
+    if update_server_counters and squad_uuids:
+        try:
+            from app.database.crud.server_squad import (
+                add_user_to_servers,
+                get_server_ids_by_uuids,
+            )
+
+            server_ids = await get_server_ids_by_uuids(db, squad_uuids)
+            if server_ids:
+                await add_user_to_servers(db, server_ids)
+        except Exception as error:
+            logger.warning('Failed to bump server counters on paid revive', error=error)
+
+    logger.info(
+        '♻️ Реанимирована подписка вместо создания дубля',
+        user_id=subscription.user_id,
+        subscription_id=subscription.id,
+        tariff_id=subscription.tariff_id,
+        was_alive=was_alive,
+    )
+    return subscription
+
+
+async def _resolve_connected_squads(
+    db: AsyncSession,
+    connected_squads: list[str] | None,
+    *,
+    user_id: int,
+) -> list[str]:
+    """Fallback: если connected_squads пустой — берём первый доступный сквад.
+
+    Общий для вставки новой платной подписки и конверсии триала: без него
+    конверсия молча оставила бы юзера на триальных сквадах при пустом списке,
+    тогда как вставка подключала бы fallback-сквад.
+    """
     final_squads = list(connected_squads or [])
     if not final_squads:
         try:
@@ -229,6 +452,200 @@ async def create_paid_subscription(
                 )
         except Exception as error:
             logger.error('❌ Не удалось получить fallback сквад', user_id=user_id, error=error)
+    return final_squads
+
+
+async def _convert_trial_subscription_to_paid(
+    db: AsyncSession,
+    trial_subscription: Subscription,
+    *,
+    tariff_id: int,
+    duration_days: int,
+    traffic_limit_gb: int,
+    device_limit: int | None,
+    connected_squads: list[str] | None,
+    commit: bool,
+) -> Subscription | None:
+    """Convert an alive trial subscription into the purchased paid tariff in place.
+
+    Multi-tariff used to INSERT a fresh subscription (→ a brand-new Remnawave
+    user) on the first paid purchase and merely disable the trial row, so the
+    user got a NEW link/panel user while the dead trial kept showing in the
+    cabinet (prod report 2026-07). Reusing the trial row keeps the SAME
+    Remnawave user/link the user already configured during the trial — the
+    callers' "update, don't create" panel sync kicks in automatically because
+    the row carries ``remnawave_id``. ``extend_subscription`` does the heavy
+    lifting: tariff change with TRIAL_ADD_REMAINING_DAYS_TO_PAID carry-over,
+    ``is_trial`` reset (+ the ``_converted_from_trial`` marker), traffic/device
+    limits, daily flags and deactivation of any other trials.
+
+    Server counters are deliberately NOT bumped here: the trial row already
+    incremented them at trial creation, and the old insert path's +1 was paired
+    with the killed trial's separate decrement — re-adding on an in-place
+    conversion would double-count the same subscription.
+
+    Returns ``None`` when, under the row lock, the candidate turns out to no
+    longer be an alive trial — a concurrent purchase already converted it.
+    Without this re-check two concurrent purchases of different tariffs would
+    both convert the SAME row and the second would silently overwrite the
+    first's tariff (money lost with no exception). The caller falls back to
+    the plain insert, which is exactly the pre-conversion behaviour.
+    """
+    try:
+        await _lock_subscription_row(db, trial_subscription)
+        await db.refresh(trial_subscription, ['is_trial', 'status', 'tariff_id', 'end_date'])
+    except Exception as lock_error:
+        logger.warning(
+            'Не удалось перечитать кандидата конверсии триала под локом — обычная вставка',
+            subscription_id=trial_subscription.id,
+            error=lock_error,
+        )
+        return None
+    if not trial_subscription.is_trial or trial_subscription.status not in _ALIVE_SUBSCRIPTION_STATUSES_TUPLE:
+        logger.info(
+            'Кандидат конверсии триала уже не живой триал (конкурентная покупка) — обычная вставка',
+            subscription_id=trial_subscription.id,
+            user_id=trial_subscription.user_id,
+        )
+        return None
+
+    final_squads = await _resolve_connected_squads(db, connected_squads, user_id=trial_subscription.user_id)
+    subscription = await extend_subscription(
+        db,
+        trial_subscription,
+        days=duration_days,
+        tariff_id=tariff_id,
+        traffic_limit_gb=traffic_limit_gb,
+        device_limit=device_limit if device_limit is not None else settings.DEFAULT_DEVICE_LIMIT,
+        connected_squads=final_squads or None,
+        commit=commit,
+    )
+
+    logger.info(
+        '🎓 Триал конвертирован в купленный тариф вместо создания новой подписки',
+        user_id=subscription.user_id,
+        subscription_id=subscription.id,
+        tariff_id=tariff_id,
+    )
+    return subscription
+
+
+async def _alive_trial_conversion_candidate(
+    db: AsyncSession,
+    user_id: int,
+    same_tariff_existing: Subscription | None,
+) -> Subscription | None:
+    """Единое правило выбора кандидата конверсии триала при платной покупке.
+
+    Живой триал ПОКУПАЕМОГО тарифа (переданный ``same_tariff_existing``)
+    приоритетнее любого другого: его конверсия гарантированно не столкнётся с
+    ``uq_subscriptions_user_tariff_active``. Иначе — самый живой триал юзера.
+    """
+    if (
+        same_tariff_existing is not None
+        and same_tariff_existing.is_trial
+        and same_tariff_existing.status in _ALIVE_SUBSCRIPTION_STATUSES_TUPLE
+    ):
+        return same_tariff_existing
+    return await get_alive_trial_subscription(db, user_id)
+
+
+async def resolve_trial_conversion_candidate(
+    db: AsyncSession,
+    user_id: int,
+    tariff_id: int,
+) -> Subscription | None:
+    """Кандидат конверсии триала, каким его увидит ``create_paid_subscription``.
+
+    Для вызывающих, которым кандидат нужен ДО ``create_paid_subscription``
+    (кабинет исключает его из раннего убийства триалов). Повторяет приоритеты
+    create_paid_subscription через тот же ``_alive_trial_conversion_candidate``:
+    если у юзера есть EXPIRED подписка ПОКУПАЕМОГО тарифа, создание уйдёт в
+    revive-ветку (#3004) и конверсии не будет — возвращаем None, чтобы
+    вызывающий обращался с триалом по-старому (kill + перенос остатка +
+    отключение панельного юзера).
+    """
+    existing = await get_subscription_by_user_and_tariff(db, user_id, tariff_id, include_inactive=True)
+    if existing is not None and existing.status == SubscriptionStatus.EXPIRED.value:
+        return None
+    return await _alive_trial_conversion_candidate(db, user_id, existing)
+
+
+async def create_paid_subscription(
+    db: AsyncSession,
+    user_id: int,
+    duration_days: int,
+    traffic_limit_gb: int = 0,
+    device_limit: int | None = None,
+    connected_squads: list[str] = None,
+    update_server_counters: bool = False,
+    is_trial: bool = False,
+    tariff_id: int | None = None,
+    commit: bool = True,
+    conversion_trial: Subscription | None = None,
+) -> Subscription:
+    # Multi-tariff invariant: at most ONE subscription per (user, tariff). If a
+    # subscription for this tariff has EXPIRED, revive it in place instead of
+    # inserting a duplicate — the partial unique index only guards the alive
+    # statuses, so expired duplicates otherwise piled up. This includes an EXPIRED
+    # TRIAL of the same tariff: re-purchasing converts it in place
+    # (_revive_paid_subscription sets is_trial=False and resets traffic BEFORE the
+    # trial-cleanup, so no self-deactivation) — the user keeps the SAME Remnawave
+    # user/link instead of getting a brand-new one (#3004, prod report 2026-06).
+    # This makes the bot/guest paths match the cabinet purchase flow. Scope still
+    # narrow: an ACTIVE/LIMITED tariff falls through to the insert (its unique-index
+    # "already active" handling); classic mode (tariff_id is None) creates fresh.
+    if not is_trial and tariff_id is not None and settings.is_multi_tariff_enabled():
+        _existing = await get_subscription_by_user_and_tariff(db, user_id, tariff_id, include_inactive=True)
+        if _existing is not None and _existing.status == SubscriptionStatus.EXPIRED.value:
+            return await _revive_paid_subscription(
+                db,
+                _existing,
+                duration_days=duration_days,
+                traffic_limit_gb=traffic_limit_gb,
+                device_limit=device_limit,
+                connected_squads=connected_squads,
+                update_server_counters=update_server_counters,
+                commit=commit,
+            )
+
+        # Paid purchase while an alive (active/trial/limited) TRIAL exists —
+        # usually of a DIFFERENT tariff: convert that trial row in place instead
+        # of inserting a new subscription. Otherwise the user gets a brand-new
+        # Remnawave user/link while the killed trial keeps hanging in the
+        # cabinet (prod report 2026-07: триал → покупка тарифа → «две подписки»,
+        # см. скрин #disabled + #created). Mirrors the classic-mode purchase,
+        # which has always converted the trial in place. ``conversion_trial``
+        # lets callers that pre-resolved the candidate (cabinet, via
+        # ``resolve_trial_conversion_candidate``) pass it through instead of a
+        # second lookup; the selection rule is shared either way.
+        _alive_trial = conversion_trial
+        if _alive_trial is None:
+            _alive_trial = await _alive_trial_conversion_candidate(db, user_id, _existing)
+        if _alive_trial is not None:
+            _converted = await _convert_trial_subscription_to_paid(
+                db,
+                _alive_trial,
+                tariff_id=tariff_id,
+                duration_days=duration_days,
+                traffic_limit_gb=traffic_limit_gb,
+                device_limit=device_limit,
+                connected_squads=connected_squads,
+                commit=commit,
+            )
+            if _converted is not None:
+                return _converted
+            # Гонка: кандидат уже конвертирован конкурентной покупкой — падаем
+            # в обычную вставку (две платные подписки, как до фикса).
+
+    end_date = datetime.now(UTC) + timedelta(days=duration_days)
+
+    if device_limit is None:
+        device_limit = settings.DEFAULT_DEVICE_LIMIT
+
+    final_squads = await _resolve_connected_squads(db, connected_squads, user_id=user_id)
+
+    short_id = await generate_unique_short_id(db)
 
     subscription = Subscription(
         user_id=user_id,
@@ -242,6 +659,7 @@ async def create_paid_subscription(
         autopay_enabled=settings.is_autopay_enabled_by_default(),
         autopay_days_before=settings.DEFAULT_AUTOPAY_DAYS_BEFORE,
         tariff_id=tariff_id,
+        remnawave_short_id=short_id,
     )
 
     db.add(subscription)
@@ -251,8 +669,22 @@ async def create_paid_subscription(
     else:
         await db.flush()
 
+    # Kill all trial subscriptions when creating a paid subscription
+    # Trial = probe, must die on any paid purchase (regardless of path: bot, cabinet, webhook)
+    if not is_trial:
+        try:
+            killed = await deactivate_user_trial_subscriptions(db, user_id, exclude_subscription_id=subscription.id)
+            if killed:
+                logger.info(
+                    'Deactivated trial subscriptions on paid purchase',
+                    user_id=user_id,
+                    killed_count=len(killed),
+                )
+        except Exception as trial_err:
+            logger.warning('Failed to deactivate trials on paid purchase', error=trial_err)
+
     logger.info(
-        '💎 Создана платная подписка для пользователя ID: статус',
+        '💎 Создана платная подписка',
         user_id=user_id,
         subscription_id=subscription.id,
         status=subscription.status,
@@ -299,12 +731,17 @@ async def replace_subscription(
     device_limit: int,
     connected_squads: list[str],
     is_trial: bool,
+    tariff_id: int | None = None,
     autopay_enabled: bool | None = None,
     autopay_days_before: int | None = None,
     update_server_counters: bool = False,
     commit: bool = True,
 ) -> Subscription:
     """Перезаписывает параметры существующей подписки пользователя."""
+
+    # Lock — защита от гонки с параллельным add_subscription_traffic / housekeeping
+    # (юзер мог докупить трафик ровно в момент replace). Берём ДО любых мутаций.
+    await _lock_subscription_row(db, subscription)
 
     current_time = datetime.now(UTC)
     old_squads = set(subscription.connected_squads or [])
@@ -331,6 +768,8 @@ async def replace_subscription(
     new_autopay_enabled = subscription.autopay_enabled if autopay_enabled is None else autopay_enabled
     new_autopay_days_before = subscription.autopay_days_before if autopay_days_before is None else autopay_days_before
 
+    if tariff_id is not None:
+        subscription.tariff_id = tariff_id
     subscription.status = SubscriptionStatus.ACTIVE.value
     subscription.is_trial = is_trial
     subscription.start_date = current_time
@@ -338,10 +777,16 @@ async def replace_subscription(
     subscription.traffic_limit_gb = traffic_limit_gb
     subscription.traffic_used_gb = 0.0
 
-    # Удаляем записи TrafficPurchase перед сбросом purchased_traffic_gb
+    # Удаляем записи TrafficPurchase перед сбросом purchased_traffic_gb.
+    # synchronize_session='fetch' — корректно инвалидирует ORM identity map
+    # на случай если ранее в сессии были загружены TrafficPurchase объекты.
     from app.database.models import TrafficPurchase
 
-    await db.execute(delete(TrafficPurchase).where(TrafficPurchase.subscription_id == subscription.id))
+    await db.execute(
+        delete(TrafficPurchase)
+        .where(TrafficPurchase.subscription_id == subscription.id)
+        .execution_options(synchronize_session='fetch')
+    )
     subscription.purchased_traffic_gb = 0  # Сбрасываем докупленный трафик при замене подписки
     subscription.traffic_reset_at = None  # Сбрасываем дату сброса трафика
     subscription.device_limit = device_limit
@@ -384,7 +829,7 @@ async def replace_subscription(
                 )
 
             logger.info(
-                '♻️ Обновлены параметры подписки : удалено сквадов , добавлено',
+                '♻️ Обновлены параметры подписки',
                 subscription_id=subscription.id,
                 squads_to_remove_count=len(squads_to_remove),
                 squads_to_add_count=len(squads_to_add),
@@ -399,6 +844,293 @@ async def replace_subscription(
     return subscription
 
 
+async def _lock_subscription_row(db: AsyncSession, subscription: Subscription) -> None:
+    """Берёт `SELECT ... FOR UPDATE` lock на строку Subscription и обновляет
+    атрибуты, чувствительные к гонке с `add_subscription_traffic`.
+
+    Без refresh()'а после lock'а мы продолжили бы читать stale значения из
+    ORM identity map (они были загружены ДО lock'а): TOCTOU был бы закрыт
+    только для записи, но не для чтения. Refresh подтягивает свежие значения,
+    взятые уже под lock'ом, поэтому helper'ы видят актуальный state.
+
+    Идемпотентно: повторный lock в той же транзакции — noop (Postgres держит
+    лок до конца транзакции).
+    """
+    await db.execute(select(Subscription.id).where(Subscription.id == subscription.id).with_for_update())
+    # Подтягиваем поля, которые могут быть обновлены конкурентным add_subscription_traffic
+    await db.refresh(subscription, ['traffic_limit_gb', 'purchased_traffic_gb', 'traffic_reset_at'])
+
+
+async def _housekeep_expired_purchases(
+    db: AsyncSession,
+    subscription: Subscription,
+    *,
+    now: datetime,
+) -> int:
+    """Удаляет истёкшие TrafficPurchase и приводит инвариант к актуальному.
+
+    Используется как fallback на путях, где база не меняется (например, продление
+    того же тарифа в multi-tariff): надо просто подчистить просрочку и привести
+    `purchased_traffic_gb` / `traffic_reset_at` к реальности.
+
+    Вычисляет `base = max(current_total - old_purchased, 0)` и пересобирает
+    `total = base + new_purchased`. Это устойчиво к лёгкому рассинхрону инварианта
+    (детерминированная сходимость), в отличие от вычитания `expired_gb`, которое
+    бы пропагандировало старую ошибку.
+
+    Тарифная подписка пересобирается от базы ТАРИФА (см. ``_tariff_base_traffic_limit``);
+    без тарифа безлимит (current_total == 0) не трогает.
+
+    Возвращает текущий `purchased_traffic_gb` после housekeeping.
+    """
+    from app.database.models import TrafficPurchase
+
+    # Lock subscription row — защита от lost update с конкурентным add_subscription_traffic
+    await _lock_subscription_row(db, subscription)
+
+    # Тарифная подписка: база — тариф, поверх — активные докупки. Так ЛЮБОЕ
+    # продление возвращает подписку к условиям тарифа, в том числе ту, которой
+    # прежняя ошибка (база из FIXED_TRAFFIC_LIMIT_GB) выдала безлимит.
+    tariff_base = await _tariff_base_traffic_limit(db, subscription)
+    if tariff_base is not None:
+        # Тариф без лимита (0) — тоже условие тарифа: подписка безлимитная, даже
+        # если в ней остался чужой лимит (грейс ставил «расход + 1 ГБ», правка
+        # админом). Раньше ноль проходил мимо, и безлимит не возвращался при
+        # продлении (жалоба 2026-09-15). Докупки с безлимитом не складываются.
+        purchased, _ = await _apply_base_limit_preserving_active_purchases(db, subscription, tariff_base, now=now)
+        return purchased
+
+    current_total = subscription.traffic_limit_gb or 0
+
+    # Классическая безлимитная подписка (без тарифа, лимит 0) — housekeeping
+    # только истёкших, инвариант не трогаем. Тарифную решает база тарифа выше.
+    if current_total == 0:
+        await db.execute(
+            delete(TrafficPurchase)
+            .where(
+                TrafficPurchase.subscription_id == subscription.id,
+                TrafficPurchase.expires_at <= now,
+            )
+            .execution_options(synchronize_session='fetch')
+        )
+        subscription.purchased_traffic_gb = 0
+        subscription.traffic_reset_at = None
+        return 0
+
+    old_purchased = subscription.purchased_traffic_gb or 0
+    # Восстанавливаем базу из текущего инварианта — это единственный известный
+    # источник информации о базовом лимите в multi-tariff без знания тарифа.
+    base_limit = max(current_total - old_purchased, 0)
+
+    await db.execute(
+        delete(TrafficPurchase)
+        .where(
+            TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.expires_at <= now,
+        )
+        .execution_options(synchronize_session='fetch')
+    )
+    active_result = await db.execute(
+        select(TrafficPurchase).where(
+            TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.expires_at > now,
+        )
+    )
+    active_packages = active_result.scalars().all()
+
+    purchased_gb = sum(p.traffic_gb for p in active_packages) if active_packages else 0
+    nearest_expiry = min((p.expires_at for p in active_packages), default=None)
+
+    subscription.traffic_limit_gb = base_limit + purchased_gb
+    subscription.purchased_traffic_gb = purchased_gb
+    subscription.traffic_reset_at = nearest_expiry
+
+    return purchased_gb
+
+
+async def _tariff_base_traffic_limit(db: AsyncSession, subscription: Subscription) -> int | None:
+    """Базовый лимит трафика по тарифу подписки; ``None`` — подписка без тарифа.
+
+    Тариф — источник правды для базы: его лимит (0 — безлимит) плюс активные
+    докупки и есть трафик подписки. Тариф с произвольным трафиком хранит выбор
+    человека в самой подписке — тогда база берётся оттуда, а к лимиту тарифа
+    возвращаемся, только если она потеряна.
+    """
+    if subscription.tariff_id is None:
+        return None
+    from app.database.crud.tariff import get_tariff_by_id
+
+    tariff = await get_tariff_by_id(db, subscription.tariff_id)
+    if tariff is None:
+        return None
+    if getattr(tariff, 'custom_traffic_enabled', False):
+        current_base = max((subscription.traffic_limit_gb or 0) - (subscription.purchased_traffic_gb or 0), 0)
+        if current_base > 0:
+            return current_base
+    return max(0, int(tariff.traffic_limit_gb or 0))
+
+
+async def _resolve_base_traffic_limit(db: AsyncSession, subscription: Subscription) -> int:
+    """Базовый лимит трафика подписки (без докупок) для пересборки при продлении.
+
+    Тарифная подписка — по тарифу (``_tariff_base_traffic_limit``). Классическая
+    (без тарифа): в фиксированном режиме — настройка, иначе единственный источник —
+    текущий инвариант ``total = base + purchased``. Глобальные настройки трафика
+    описывают классический режим и к тарифной подписке отношения не имеют.
+    """
+    tariff_base = await _tariff_base_traffic_limit(db, subscription)
+    if tariff_base is not None:
+        return tariff_base
+    if settings.is_traffic_fixed():
+        return settings.get_fixed_traffic_limit()
+    return max((subscription.traffic_limit_gb or 0) - (subscription.purchased_traffic_gb or 0), 0)
+
+
+async def reconcile_tariff_traffic_limit(
+    db: AsyncSession, subscription: Subscription, *, now: datetime | None = None
+) -> None:
+    """Вернуть тарифную подписку к условиям тарифа: база тарифа + активные докупки.
+
+    ``extend_subscription`` делает это на каждом продлении сам. Отдельный вход нужен
+    продлениям, которые идут мимо него — рекуррентным списаниям Lava и Platega,
+    продлевающим через метод модели, — иначе подписка, которой прошлая ошибка
+    выдала безлимит, на таком продлении так и оставалась бы безлимитной.
+    Подписку без тарифа не трогает. Оверлей грейса, осевший в подписке, отсюда не
+    убрать — к этому моменту дату уже сдвинули; такие продления зовут
+    ``undo_grace_overlay_echo`` до расчёта срока (сторож
+    ``test_renewal_undoes_grace_echo_first``).
+    """
+    if subscription.tariff_id is None:
+        return
+    await _housekeep_expired_purchases(db, subscription, now=now or datetime.now(UTC))
+
+
+async def _apply_base_limit_preserving_active_purchases(
+    db: AsyncSession,
+    subscription: Subscription,
+    base_limit_gb: int,
+    *,
+    now: datetime,
+) -> tuple[int, int]:
+    """Пересобирает `traffic_limit_gb` инвариант после смены базового лимита.
+
+    Истёкшие `TrafficPurchase` (expires_at <= now) удаляются — это нормальный housekeeping.
+    Активные пакеты (expires_at > now) **сохраняются**: они куплены отдельно за деньги,
+    у каждого свой срок жизни, и renewal/смена тарифа основной подписки не должна их
+    обнулять. Без этого юзер видит «трафик слетел после продления».
+
+    Если `base_limit_gb == 0` (безлимит) — total остаётся 0, докупки не складываются с
+    безлимитом (это семантически не имеет смысла). Истёкшие пакеты всё равно подчищаем.
+
+    Возвращает (active_purchased_gb, fresh_total_limit_gb).
+    """
+    from app.database.models import TrafficPurchase
+
+    # Lock subscription row — защита от lost update с конкурентным add_subscription_traffic
+    await _lock_subscription_row(db, subscription)
+
+    # Безлимит — на безлимитном тарифе докупки не имеют смысла. Удаляем ВСЕ
+    # TrafficPurchase (включая активные), чтобы они не "воскресли" при возврате
+    # на лимитный тариф. Логируем для аудита: если у юзера были оплаченные
+    # активные пакеты, это видно в логе (полезно для решений о компенсации).
+    if base_limit_gb == 0:
+        active_check = await db.execute(
+            select(TrafficPurchase).where(
+                TrafficPurchase.subscription_id == subscription.id,
+                TrafficPurchase.expires_at > now,
+            )
+        )
+        dropped_active = active_check.scalars().all()
+        if dropped_active:
+            logger.warning(
+                '⚠️ Переход на безлимит при активных TrafficPurchase — пакеты удаляются',
+                subscription_id=subscription.id,
+                user_id=subscription.user_id,
+                dropped_count=len(dropped_active),
+                dropped_total_gb=sum(p.traffic_gb for p in dropped_active),
+                dropped_ids=[p.id for p in dropped_active],
+            )
+        await db.execute(
+            delete(TrafficPurchase)
+            .where(TrafficPurchase.subscription_id == subscription.id)
+            .execution_options(synchronize_session='fetch')
+        )
+        subscription.traffic_limit_gb = 0
+        subscription.purchased_traffic_gb = 0
+        subscription.traffic_reset_at = None
+        return 0, 0
+
+    await db.execute(
+        delete(TrafficPurchase)
+        .where(
+            TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.expires_at <= now,
+        )
+        .execution_options(synchronize_session='fetch')
+    )
+    active_result = await db.execute(
+        select(TrafficPurchase).where(
+            TrafficPurchase.subscription_id == subscription.id,
+            TrafficPurchase.expires_at > now,
+        )
+    )
+    active_packages = active_result.scalars().all()
+
+    purchased_gb = sum(p.traffic_gb for p in active_packages) if active_packages else 0
+    nearest_expiry = min((p.expires_at for p in active_packages), default=None)
+
+    subscription.traffic_limit_gb = base_limit_gb + purchased_gb
+    subscription.purchased_traffic_gb = purchased_gb
+    subscription.traffic_reset_at = nearest_expiry
+
+    return purchased_gb, subscription.traffic_limit_gb
+
+
+def should_carry_trial_remaining_days() -> bool:
+    """Переносить ли остаток триальных дней на платную подписку при переходе.
+
+    ``TARIFF_SWITCH_RESET_FREE_DAYS`` — мастер-переключатель сброса бесплатного
+    периода: пока он включён, остаток триала НЕ переносится ни на одном пути
+    покупки, даже если ``TRIAL_ADD_REMAINING_DAYS_TO_PAID=true`` (иначе флаг сброса
+    оставался мёртвым для триалов — «бесплатная версия» бота это именно триал, а
+    не 0₽-тариф). Перенос возможен только когда сброс ВЫКЛЮЧЕН и явно включён
+    ``TRIAL_ADD_REMAINING_DAYS_TO_PAID``.
+    """
+    return bool(settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID and not settings.TARIFF_SWITCH_RESET_FREE_DAYS)
+
+
+def _should_carry_remaining_days(*, is_trial: bool, source_is_free: bool) -> bool:
+    """Переносить ли остаток дней при СМЕНЕ тарифа на новый срок.
+
+    - Триал: по ``should_carry_trial_remaining_days`` (TARIFF_SWITCH_RESET_FREE_DAYS
+      перебивает TRIAL_ADD_REMAINING_DAYS_TO_PAID).
+    - Бесплатный 0₽ тариф (``source_is_free`` уже учитывает TARIFF_SWITCH_RESET_FREE_DAYS):
+      не переносим — наспамленные дни нельзя бесплатно унести на платный тариф.
+    - Обычная платная подписка: переносим как раньше.
+    """
+    if is_trial:
+        return should_carry_trial_remaining_days()
+    if source_is_free:
+        return False
+    return True
+
+
+async def _is_free_source_tariff(db: AsyncSession, tariff_id: int) -> bool:
+    """True, если исходный тариф полностью бесплатный (0₽).
+
+    Любая ошибка → False (переносим дни как раньше), чтобы смена тарифа никогда
+    не падала из-за этой проверки.
+    """
+    try:
+        from app.database.crud.tariff import get_tariff_by_id
+
+        tariff = await get_tariff_by_id(db, tariff_id)
+        return bool(tariff is not None and tariff.is_free)
+    except Exception as e:
+        logger.warning('Не удалось определить бесплатность исходного тарифа', tariff_id=tariff_id, error=e)
+        return False
+
+
 async def extend_subscription(
     db: AsyncSession,
     subscription: Subscription,
@@ -408,6 +1140,8 @@ async def extend_subscription(
     traffic_limit_gb: int | None = None,
     device_limit: int | None = None,
     connected_squads: list[str] | None = None,
+    convert_trial: bool = True,
+    reset_used_traffic: bool | None = None,
     commit: bool = True,
 ) -> Subscription:
     """Продлевает подписку на указанное количество дней.
@@ -420,14 +1154,36 @@ async def extend_subscription(
         traffic_limit_gb: Лимит трафика ГБ (опционально, для режима тарифов)
         device_limit: Лимит устройств (опционально, для режима тарифов)
         connected_squads: Список UUID сквадов (опционально, для режима тарифов)
+        convert_trial: снимать ли триальный флаг при передаче tariff_id.
+            True (по умолчанию) — для НАСТОЯЩИХ покупок тарифа. Передавайте
+            False для бесплатного релейбла/смены тарифа без оплаты, иначе триал
+            превратится в фантомную платную подписку и попадёт в авто-продление
+            (баг #629889).
+        reset_used_traffic: решение вызывающего, обнулять ли израсходованный
+            трафик при переданном ``traffic_limit_gb``. Вызывающий тем же решением
+            сбрасывает (или нет) счётчик в панели — иначе бот показывает расход 0,
+            а панель настоящий. ``None`` — прежнее правило: при смене тарифа по
+            ``RESET_TRAFFIC_ON_TARIFF_SWITCH``, при продлении всегда.
     """
-    from app.database.models import TrafficPurchase
-
     current_time = datetime.now(UTC)
 
-    logger.info('🔄 Продление подписки на дней', subscription_id=subscription.id, days=days)
+    # Lock + refresh traffic-полей ДО любых чтений и расчёта base_limit для веток.
+    # Защищает от гонки с параллельным add_subscription_traffic (тот тоже берёт lock).
+    # Повторный lock в той же транзакции — noop (SubscriptionRenewalService уже мог
+    # взять lock через with_for_update).
+    await _lock_subscription_row(db, subscription)
+
+    if days > 0:
+        # Оверлей грейса, осевший в подписке (v4.10–4.11 принимали его за продление
+        # в панели), — не условия подписки: сквад грейса, «расход + квота», дата
+        # конца грейса. Возвращаем прежние значения до расчёта нового срока.
+        from app.services.grace_access_echo import undo_grace_overlay_echo
+
+        await undo_grace_overlay_echo(db, subscription)
+
+    logger.info('🔄 Продление подписки', subscription_id=subscription.id, days=days)
     logger.info(
-        '📊 Текущие параметры: статус=, окончание=, тариф',
+        '📊 Текущие параметры подписки',
         status=subscription.status,
         end_date=subscription.end_date,
         tariff_id=subscription.tariff_id,
@@ -437,6 +1193,11 @@ async def extend_subscription(
     # Включает переход из классического режима (tariff_id=None) в тарифный
     is_tariff_change = tariff_id is not None and (subscription.tariff_id is None or tariff_id != subscription.tariff_id)
 
+    # Флаг: была ли housekeeping-ветка вызвана. Если нет — в конце прогоним
+    # _housekeep_expired_purchases как fallback, чтобы истёкшие пакеты не копились
+    # на путях renewal в multi-tariff (SubscriptionRenewalService и т.п.).
+    _housekeeping_done = False
+
     # Определяем, была ли подписка истёкшей ДО продления (статус меняется ниже)
     was_expired = subscription.status in (
         SubscriptionStatus.EXPIRED.value,
@@ -445,19 +1206,25 @@ async def extend_subscription(
     ) or (subscription.end_date is not None and subscription.end_date <= current_time)
 
     if is_tariff_change:
-        logger.info('🔄 Обнаружена СМЕНА тарифа: →', tariff_id=subscription.tariff_id, tariff_id_2=tariff_id)
+        logger.info('🔄 Обнаружена СМЕНА тарифа', tariff_id=subscription.tariff_id, tariff_id_2=tariff_id)
 
     if days < 0:
         subscription.end_date = subscription.end_date + timedelta(days=days)
-        logger.info(
-            '📅 Срок подписки уменьшен на дней, новая дата окончания', abs=abs(days), end_date=subscription.end_date
-        )
+        logger.info('📅 Срок подписки уменьшен', abs=abs(days), end_date=subscription.end_date)
     elif is_tariff_change:
-        # При СМЕНЕ тарифа сохраняем оставшееся время активной подписки
-        # Для триалов — только если включена настройка TRIAL_ADD_REMAINING_DAYS_TO_PAID
+        # При СМЕНЕ тарифа сохраняем оставшееся время активной подписки.
+        # НЕ переносим дни, если исходная подписка — триал (без
+        # TRIAL_ADD_REMAINING_DAYS_TO_PAID) ИЛИ бесплатный 0₽ тариф
+        # (TARIFF_SWITCH_RESET_FREE_DAYS) — иначе наспамленные на бесплатке дни
+        # бесплатно уносятся на платный тариф.
         remaining_seconds = 0
         if subscription.end_date and subscription.end_date > current_time:
-            if not subscription.is_trial or settings.TRIAL_ADD_REMAINING_DAYS_TO_PAID:
+            source_is_free = bool(
+                settings.TARIFF_SWITCH_RESET_FREE_DAYS
+                and subscription.tariff_id  # ещё старый тариф — переназначается ниже
+                and await _is_free_source_tariff(db, subscription.tariff_id)
+            )
+            if _should_carry_remaining_days(is_trial=subscription.is_trial, source_is_free=source_is_free):
                 remaining = subscription.end_date - current_time
                 remaining_seconds = max(0, remaining.total_seconds())
                 logger.info(
@@ -465,6 +1232,12 @@ async def extend_subscription(
                     remaining_seconds=int(remaining_seconds),
                     subscription_id=subscription.id,
                     is_trial=subscription.is_trial,
+                )
+            elif source_is_free:
+                logger.info(
+                    '🧹 Смена с бесплатного тарифа: остаток дней не переносится',
+                    subscription_id=subscription.id,
+                    source_tariff_id=subscription.tariff_id,
                 )
         subscription.end_date = current_time + timedelta(days=days, seconds=remaining_seconds)
         subscription.start_date = current_time
@@ -481,7 +1254,7 @@ async def extend_subscription(
     else:
         # Подписка истекла - начинаем с текущей даты
         subscription.end_date = current_time + timedelta(days=days)
-        logger.info('📅 Подписка истекла, устанавливаем новую дату окончания на дней', days=days)
+        logger.info('📅 Подписка истекла, устанавливаем новую дату окончания', days=days)
 
     # УДАЛЕНО: Автоматическая конвертация триала по длительности
     # Теперь триал конвертируется ТОЛЬКО после успешного коммита продления
@@ -509,63 +1282,92 @@ async def extend_subscription(
         subscription.status = SubscriptionStatus.ACTIVE.value
         logger.info('🔄 Статус подписки изменён с trial на ACTIVE', subscription_id=subscription.id)
     elif days > 0 and subscription.status == SubscriptionStatus.PENDING.value:
-        logger.warning('⚠️ Попытка продлить PENDING подписку , дни', subscription_id=subscription.id, days=days)
+        logger.warning('⚠️ Попытка продлить PENDING подписку', subscription_id=subscription.id, days=days)
 
     # Обновляем параметры тарифа, если переданы
     if tariff_id is not None:
         old_tariff_id = subscription.tariff_id
         subscription.tariff_id = tariff_id
-        logger.info('📦 Обновлен тариф подписки: →', old_tariff_id=old_tariff_id, tariff_id=tariff_id)
+        logger.info('📦 Обновлен тариф подписки', old_tariff_id=old_tariff_id, tariff_id=tariff_id)
 
-        # При покупке тарифа сбрасываем триальный статус
-        if subscription.is_trial:
+        # При покупке тарифа сбрасываем триальный статус — но ТОЛЬКО для настоящих
+        # покупок. Бесплатный релейбл/смена тарифа без оплаты должны передавать
+        # convert_trial=False, иначе триал станет фантомной платной подпиской и
+        # попадёт в авто-продление (баг #629889).
+        if subscription.is_trial and convert_trial:
             subscription.is_trial = False
+            # Transient marker (not persisted): lets purchase handlers report the
+            # payment as a trial→paid conversion without a signature change.
+            subscription._converted_from_trial = True
+            apply_trial_conversion_defaults(subscription)
             logger.info('🎓 Подписка конвертирована из триала в платную', subscription_id=subscription.id)
 
     if traffic_limit_gb is not None:
         old_traffic = subscription.traffic_limit_gb
-        # Сброс использованного трафика: при смене тарифа — по настройке, при продлении — всегда
-        if is_tariff_change:
+        # Сброс использованного трафика: при смене тарифа — по настройке, при продлении — всегда;
+        # вызывающий, который сам решает про панель, передаёт своё решение.
+        if reset_used_traffic is not None:
+            if reset_used_traffic:
+                subscription.traffic_used_gb = 0.0
+        elif is_tariff_change:
             if settings.RESET_TRAFFIC_ON_TARIFF_SWITCH:
                 subscription.traffic_used_gb = 0.0
         else:
             subscription.traffic_used_gb = 0.0
 
         if is_tariff_change or was_expired:
-            # При СМЕНЕ тарифа или ИСТЁКШЕЙ подписке — сбрасываем все докупки трафика
-            subscription.traffic_limit_gb = traffic_limit_gb
-            await db.execute(delete(TrafficPurchase).where(TrafficPurchase.subscription_id == subscription.id))
-            subscription.purchased_traffic_gb = 0
-            subscription.traffic_reset_at = None
+            # Базовый лимит обновляется (новый тариф или подписка истекала). Истёкшие
+            # TrafficPurchase убираем, ЕЩЁ АКТИВНЫЕ — сохраняем: их купили отдельно
+            # за деньги, у них собственный срок жизни. Раньше тут был хардкод DELETE
+            # ВСЕХ пакетов — отсюда юзерский баг «трафик слетел после продления».
+            purchased, new_total = await _apply_base_limit_preserving_active_purchases(
+                db, subscription, traffic_limit_gb, now=current_time
+            )
             reason = 'смена тарифа' if is_tariff_change else 'подписка была истёкшей'
             logger.info(
-                '📊 Обновлен лимит трафика: ГБ → ГБ (докупки сброшены)',
+                '📊 Обновлен лимит трафика (активные докупки сохранены)',
                 old_traffic=old_traffic,
-                traffic_limit_gb=traffic_limit_gb,
+                new_total=new_total,
+                preserved_purchased=purchased,
                 reason=reason,
             )
+            _housekeeping_done = True
         else:
-            # Подписка активна, тот же тариф — сохраняем докупленный трафик
-            purchased = subscription.purchased_traffic_gb or 0
-            subscription.traffic_limit_gb = traffic_limit_gb + purchased
-            logger.info(
-                '📊 Обновлен лимит трафика: ГБ → ГБ (докупки сохранены: ГБ)',
-                old_traffic=old_traffic,
-                traffic_limit_gb=traffic_limit_gb + purchased,
-                purchased=purchased,
+            # Подписка активна, тот же тариф — сохраняем докупленный трафик.
+            # Также проводим housekeeping: истёкшие TrafficPurchase удаляются,
+            # purchased_traffic_gb пересчитывается из активных.
+            purchased, new_total = await _apply_base_limit_preserving_active_purchases(
+                db, subscription, traffic_limit_gb, now=current_time
             )
+            logger.info(
+                '📊 Обновлен лимит трафика (активные докупки сохранены)',
+                old_traffic=old_traffic,
+                new_total=new_total,
+                preserved_purchased=purchased,
+            )
+            _housekeeping_done = True
     elif settings.RESET_TRAFFIC_ON_PAYMENT:
         subscription.traffic_used_gb = 0.0
         if subscription.tariff_id is None or was_expired:
-            # Классический режим или истёкшая подписка — сбрасываем докупки
-            await db.execute(delete(TrafficPurchase).where(TrafficPurchase.subscription_id == subscription.id))
-            subscription.purchased_traffic_gb = 0
-            subscription.traffic_reset_at = None
+            # Истекают только истёкшие пакеты, активные сохраняются.
+            # Раньше тут был хардкод DELETE всех TrafficPurchase — отсюда жалобы
+            # «при продлении докупленный трафик слетел».
+            # Базу решает тариф подписки, если он есть (см. _resolve_base_traffic_limit):
+            # раньше сюда попадала и истёкшая ТАРИФНАЯ подписка, а базу ей считали
+            # по правилам классического режима — из FIXED_TRAFFIC_LIMIT_GB, и при нуле
+            # там человек после продления получал безлимит вместо лимита тарифа.
+            base_limit = await _resolve_base_traffic_limit(db, subscription)
+            purchased, _ = await _apply_base_limit_preserving_active_purchases(
+                db, subscription, base_limit, now=current_time
+            )
             logger.info(
-                '🔄 Сбрасываем использованный и докупленный трафик',
+                '🔄 Сброс использованного трафика; активные докупки сохранены',
                 was_expired=was_expired,
                 tariff_id=subscription.tariff_id,
+                base_limit=base_limit,
+                preserved_purchased=purchased,
             )
+            _housekeeping_done = True
         else:
             # Активная подписка в режиме тарифов — сохраняем purchased_traffic_gb и traffic_reset_at
             logger.info('🔄 Сбрасываем использованный трафик, докупленный сохранен (режим тарифов)')
@@ -573,7 +1375,7 @@ async def extend_subscription(
     if device_limit is not None:
         old_devices = subscription.device_limit
         subscription.device_limit = device_limit
-        logger.info('📱 Обновлен лимит устройств: →', old_devices=old_devices, device_limit=device_limit)
+        logger.info('📱 Обновлен лимит устройств', old_devices=old_devices, device_limit=device_limit)
 
     if connected_squads is not None:
         if tariff_id is not None and not is_tariff_change and subscription.connected_squads:
@@ -585,7 +1387,7 @@ async def extend_subscription(
         if connected_squads or not subscription.connected_squads:
             old_squads = subscription.connected_squads
             subscription.connected_squads = connected_squads
-            logger.info('🌍 Обновлены сквады: →', old_squads=old_squads, connected_squads=connected_squads)
+            logger.info('🌍 Обновлены сквады', old_squads=old_squads, connected_squads=connected_squads)
         else:
             logger.warning(
                 '⚠️ Попытка перезаписать сквады пустым списком, сохраняем текущие',
@@ -615,22 +1417,40 @@ async def extend_subscription(
             subscription.last_daily_charge_at = None
             logger.info('🔄 Переход с суточного тарифа: очищены daily флаги')
 
-    # В режиме fixed_with_topup при продлении сбрасываем трафик до фиксированного лимита
-    # Только если не передан traffic_limit_gb И у подписки нет тарифа (классический режим)
-    # Если у подписки есть tariff_id - трафик определяется тарифом, не сбрасываем
+    # В режиме fixed_with_topup при продлении базовый лимит возвращаем к
+    # fixed_limit, но активные TrafficPurchase сохраняем (накопительно).
+    # Раньше здесь был хардкод DELETE всех пакетов — это самая частая причина
+    # репорта «трафик слетел». Теперь fixed_limit = base, активные докупки
+    # суммируются поверх через helper, инвариант сохраняется.
     if traffic_limit_gb is None and settings.is_traffic_fixed() and days > 0 and subscription.tariff_id is None:
         fixed_limit = settings.get_fixed_traffic_limit()
         old_limit = subscription.traffic_limit_gb
-        if subscription.traffic_limit_gb != fixed_limit or (subscription.purchased_traffic_gb or 0) > 0:
-            subscription.traffic_limit_gb = fixed_limit
-            await db.execute(delete(TrafficPurchase).where(TrafficPurchase.subscription_id == subscription.id))
-            subscription.purchased_traffic_gb = 0
-            subscription.traffic_reset_at = None  # Сбрасываем дату сброса трафика
-            logger.info(
-                '🔄 Сброс трафика при продлении (fixed_with_topup): ГБ → ГБ',
-                old_limit=old_limit,
-                fixed_limit=fixed_limit,
+        old_purchased = subscription.purchased_traffic_gb or 0
+        expected_total = fixed_limit + old_purchased
+        # Триггерим пересчёт только если состояние реально устарело (нужен
+        # housekeeping истёкших пакетов или base сменился).
+        if subscription.traffic_limit_gb != expected_total or old_purchased > 0:
+            purchased, new_total = await _apply_base_limit_preserving_active_purchases(
+                db, subscription, fixed_limit, now=current_time
             )
+            logger.info(
+                '🔄 Продление в fixed_with_topup: base + активные докупки',
+                old_limit=old_limit,
+                fixed_base=fixed_limit,
+                preserved_purchased=purchased,
+                new_total=new_total,
+            )
+            _housekeeping_done = True
+
+    # Fallback housekeeping: для путей renewal в multi-tariff (например,
+    # SubscriptionRenewalService) ни одна из веток выше не сработала, но просрочка
+    # пакетов всё равно копится. Здесь подчищаем истёкшие TrafficPurchase и
+    # приводим инвариант `total = base + purchased` к реальности.
+    #
+    # Ошибки не глотаем: helper мог частично применить изменения, и тихий swallow
+    # привёл бы к коммиту половинного состояния. Пробрасываем — caller откатит.
+    if days > 0 and not _housekeeping_done:
+        await _housekeep_expired_purchases(db, subscription, now=current_time)
 
     subscription.updated_at = current_time
 
@@ -640,15 +1460,65 @@ async def extend_subscription(
     else:
         await db.flush()
 
-    await clear_notifications(db, subscription.id, commit=commit)
+    # Best-effort cleanup: the extension is already committed above. A failure here
+    # must not propagate — a caller that wraps extend_subscription in a compensating
+    # refund guard would otherwise roll back (a no-op for the committed extension) and
+    # refund a subscription that was actually delivered.
+    try:
+        await clear_notifications(db, subscription.id, commit=commit)
+    except Exception as clear_err:
+        logger.warning('Failed to clear notifications on extend', error=clear_err)
+        if commit:
+            # A failed internal commit leaves the session in an errored state; reset it
+            # so the caller can keep using it (the extension itself is already durable).
+            try:
+                await db.rollback()
+            except Exception as rollback_err:
+                logger.debug('Откат сессии после ошибки очистки уведомлений не удался', error=str(rollback_err))
 
-    logger.info('✅ Подписка продлена до', end_date=subscription.end_date)
-    logger.info('📊 Новые параметры: статус=, окончание', status=subscription.status, end_date=subscription.end_date)
+    # Ручное продление (баланс/промокод/бонусные дни админа) при живой привязке
+    # Lava: двигаем ближайшее автосписание на добавленные дни, иначе Lava спишет
+    # за период, который пользователь уже оплатил другим способом. Наше
+    # собственное рекуррентное списание сюда не заходит — оно продлевает через
+    # метод модели Subscription.extend_subscription.
+    # Только при commit=True: с commit=False вызывающий держит собственную
+    # открытую транзакцию, которая ещё может откатиться — сдвигать дату
+    # списания на стороне Lava до её коммита нельзя (откатить сдвиг нечем).
+    if days > 0 and commit:
+        try:
+            from app.services.payment.lava import shift_lava_next_charge_after_manual_extension
+
+            await shift_lava_next_charge_after_manual_extension(db, subscription.id, days)
+        except Exception as lava_err:  # pragma: no cover - хелпер сам best-effort
+            logger.warning('Failed to shift Lava next charge on extend', error=lava_err)
+
+    # Kill other trial subscriptions if this extension converts trial to paid
+    if not subscription.is_trial and days > 0:
+        try:
+            killed = await deactivate_user_trial_subscriptions(
+                db, subscription.user_id, exclude_subscription_id=subscription.id
+            )
+            if killed:
+                logger.info(
+                    'Deactivated trial subscriptions on extend',
+                    user_id=subscription.user_id,
+                    killed_count=len(killed),
+                )
+        except Exception as trial_err:
+            logger.warning('Failed to deactivate trials on extend', error=trial_err)
+
+    logger.info('✅ Подписка продлена', end_date=subscription.end_date)
+    logger.info('📊 Новые параметры подписки', status=subscription.status, end_date=subscription.end_date)
 
     return subscription
 
 
 async def add_subscription_traffic(db: AsyncSession, subscription: Subscription, gb: int) -> Subscription:
+    # Lock subscription row — защита от lost-update гонки с housekeeping в extend_subscription
+    # (см. _apply_base_limit_preserving_active_purchases / _housekeep_expired_purchases).
+    # Без lock'а одновременный renewal + topup могут затереть друг друга.
+    await _lock_subscription_row(db, subscription)
+
     subscription.add_traffic(gb)
     subscription.updated_at = datetime.now(UTC)
 
@@ -691,6 +1561,15 @@ async def add_subscription_traffic(db: AsyncSession, subscription: Subscription,
         gb=gb,
         new_expires_at=new_expires_at.strftime('%d.%m.%Y'),
     )
+
+    # В классическом режиме докупленный трафик входит в цену продления
+    # (_calculate_classic_mode передаёт purchased_traffic_gb) — привязка с
+    # прежней суммой её больше не покрывает. В тарифном режиме цена не
+    # меняется, и хелпер молча выйдет по совпадению сумм.
+    from app.services.recurrent_amount import sync_recurrent_bindings_after_price_change
+
+    await sync_recurrent_bindings_after_price_change(db, subscription.id)
+
     return subscription
 
 
@@ -699,6 +1578,7 @@ async def add_subscription_devices(db: AsyncSession, subscription: Subscription,
     locked_result = await db.execute(
         select(Subscription)
         .where(Subscription.id == subscription.id)
+        .options(selectinload(Subscription.tariff))
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -717,6 +1597,18 @@ async def add_subscription_devices(db: AsyncSession, subscription: Subscription,
         )
         new_limit = max_devices
 
+    # Check tariff max device limit
+    tariff_max = subscription.tariff.max_device_limit if subscription.tariff else None
+    if tariff_max is not None and tariff_max > 0 and new_limit > tariff_max:
+        logger.warning(
+            '📱 Попытка превысить лимит устройств тарифа',
+            user_id=subscription.user_id,
+            current=subscription.device_limit,
+            requested=devices,
+            tariff_max_devices=tariff_max,
+        )
+        new_limit = tariff_max
+
     subscription.device_limit = new_limit
     subscription.updated_at = datetime.now(UTC)
 
@@ -724,6 +1616,13 @@ async def add_subscription_devices(db: AsyncSession, subscription: Subscription,
     await db.refresh(subscription)
 
     logger.info('📱 К подписке пользователя добавлено устройств', user_id=subscription.user_id, devices=devices)
+
+    # Доп. устройства меняют цену продления — привязка провайдерского
+    # автопродления с прежней суммой перестала её покрывать.
+    from app.services.recurrent_amount import sync_recurrent_bindings_after_price_change
+
+    await sync_recurrent_bindings_after_price_change(db, subscription.id)
+
     return subscription
 
 
@@ -816,15 +1715,47 @@ async def decrement_subscription_server_counts(
         )
 
 
+_AUTOPAY_PERIOD_UNSET = object()
+
+
 async def update_subscription_autopay(
-    db: AsyncSession, subscription: Subscription, enabled: bool, days_before: int = 3
+    db: AsyncSession,
+    subscription: Subscription,
+    enabled: bool,
+    days_before: int | None = None,
+    period_days: int | object | None = _AUTOPAY_PERIOD_UNSET,
 ) -> Subscription:
     subscription.autopay_enabled = enabled
-    subscription.autopay_days_before = days_before
+    if days_before is not None:
+        subscription.autopay_days_before = days_before
+    # Sentinel lets callers distinguish "don't touch" (default) from
+    # "clear to NULL/default" (explicit None).
+    if period_days is not _AUTOPAY_PERIOD_UNSET:
+        subscription.autopay_period_days = period_days  # type: ignore[assignment]
     subscription.updated_at = datetime.now(UTC)
 
     await db.commit()
     await db.refresh(subscription)
+
+    if enabled:
+        # Взаимоисключение движков продления ЦЕНТРАЛИЗОВАНО здесь: включение
+        # balance-autopay отменяет активное СБП-автопродление Platega. Точечные
+        # вызовы на отдельных поверхностях (бот/кабинет) пропускали новые точки
+        # включения (миниапп, админ-тоглы) — и юзер платил дважды за цикл.
+        try:
+            from app.services.cashera_recurring_cancel import cancel_cashera_recurring_for_subscription_safe
+            from app.services.payment.lava import cancel_lava_recurring_for_subscription_safe
+            from app.services.payment.platega import cancel_platega_recurring_for_subscription_safe
+
+            await cancel_platega_recurring_for_subscription_safe(db, subscription.id)
+            await cancel_lava_recurring_for_subscription_safe(db, subscription.id)
+            await cancel_cashera_recurring_for_subscription_safe(db, subscription.id)
+        except Exception as platega_error:  # pragma: no cover - хелпер сам best-effort
+            logger.warning(
+                'Не удалось отменить СБП-автопродление при включении автоплатежа',
+                subscription_id=getattr(subscription, 'id', None),
+                error=str(platega_error),
+            )
 
     status = 'включен' if enabled else 'выключен'
     logger.info('💳 Автоплатеж для подписки пользователя', user_id=subscription.user_id, status=status)
@@ -840,6 +1771,35 @@ async def deactivate_subscription(db: AsyncSession, subscription: Subscription, 
         await db.refresh(subscription)
 
     logger.info('❌ Подписка пользователя деактивирована', user_id=subscription.user_id)
+    return subscription
+
+
+async def reset_subscription(db: AsyncSession, subscription: Subscription, *, commit: bool = True) -> Subscription:
+    """Полностью обнулить подписку «как будто пользователь её не оформлял», НЕ удаляя
+    пользователя из БД (тикеты и аккаунт сохраняются).
+
+    Снимает накопленные дни (в т.ч. наспамленные на бесплатном тарифе), сбрасывает
+    трафик и доступ к серверам, помечает подписку DISABLED. Доступ в панели RemnaWave
+    снимается вызывающей стороной (``disable_remnawave_user``). После этого пользователь
+    может купить тариф с нуля и сам выбрать срок.
+    """
+    now = datetime.now(UTC)
+    subscription.status = SubscriptionStatus.DISABLED.value
+    subscription.end_date = now  # обнуляем срок — наспамленные дни больше не переносятся
+    subscription.connected_squads = []
+    subscription.traffic_used_gb = 0.0
+    subscription.autopay_enabled = False  # не списывать за обнулённую подписку
+    subscription.updated_at = now
+
+    if commit:
+        await db.commit()
+        await db.refresh(subscription)
+
+    logger.info(
+        '🧹 Подписка обнулена администратором (пользователь и тикеты сохранены)',
+        subscription_id=subscription.id,
+        user_id=subscription.user_id,
+    )
     return subscription
 
 
@@ -960,9 +1920,9 @@ async def get_subscriptions_for_autopay(db: AsyncSession) -> list[Subscription]:
         if subscription.tariff and getattr(subscription.tariff, 'is_daily', False):
             continue
 
-        days_until_expiry = (subscription.end_date - current_time).days
-
-        if days_until_expiry <= subscription.autopay_days_before and subscription.end_date > current_time:
+        if subscription.end_date > current_time and ends_within_days(
+            subscription.end_date, subscription.autopay_days_before, current_time
+        ):
             ready_for_autopay.append(subscription)
 
     return ready_for_autopay
@@ -987,7 +1947,7 @@ async def get_subscriptions_statistics(db: AsyncSession) -> dict:
     paid_subscriptions = active_subscriptions - trial_subscriptions
 
     now = datetime.now(UTC)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = local_day_start(now)
     week_ago = today_start - timedelta(days=7)
     month_ago = today_start - timedelta(days=30)
 
@@ -1101,15 +2061,193 @@ async def get_trial_statistics(db: AsyncSession) -> dict:
     }
 
 
+async def wipe_trial_subscriptions(db: AsyncSession, subscriptions) -> int:
+    """Снимает доступ и удаляет переданные триал-подписки — единый код для ботовой
+    кнопки «Сбросить триалы» и кабинетного per-user сброса.
+
+    Что делаем с панельным аккаунтом, решает ``REMNAWAVE_USER_DELETE_MODE``: ``delete``
+    сносит его, ``disable`` только отключает (аккаунт остаётся жить, и следующая
+    покупка/триал включат его же). Раньше режим читался только при полном удалении
+    пользователя, и сброс триала удалял аккаунт вопреки настройке.
+
+    Панель-юзер удаляется ПЕРВЫМ, и только при успехе сносится строка в БД. Порядок
+    «панель → БД» делает операцию race-safe относительно синка панель→бот: когда удаляем
+    строку, панель-юзера уже нет — воскрешать (как is_trial=False) нечего. Удаления в
+    панели идут параллельно с ограничением (Semaphore) на ОДНОМ клиенте API (как массовый
+    синк) — операция тяжёлая. Подписку, у которой удаление в панели не удалось (транзиент),
+    в БД НЕ трогаем (иначе снова orphan + воскрешение) — её подхватит следующий запуск.
+    Чистит ссылку на удалённый аккаунт у `User` (в мультитарифе — только совпадающий
+    id, аккаунт живой соседней подписки остаётся). НЕ коммитит — это делает
+    вызывающий; исключение — когда НИ ОДНО панельное удаление не удалось: тогда в БД
+    мутировать нечего и транзакция откатывается, чтобы снять grace-локи pre-delete
+    guard'а (не вызывайте с несохранёнными изменениями в сессии). Возвращает число
+    реально удалённых подписок.
+    """
+    if not subscriptions:
+        return 0
+
+    from app.services.grace_access_runtime import ensure_no_open_grace_for_subscriptions
+
+    await ensure_no_open_grace_for_subscriptions(
+        db,
+        tuple(int(subscription.id) for subscription in subscriptions),
+    )
+
+    import asyncio
+
+    from sqlalchemy import update
+
+    from app.external.remnawave_api import RemnaWaveInvalidUserIdError
+    from app.services.subscription_service import SubscriptionService
+
+    is_multi = settings.is_multi_tariff_enabled()
+    delete_panel_user = settings.get_remnawave_user_delete_mode() == 'delete'
+    service = SubscriptionService()
+    # subscription.id → id удалённого в панели аккаунта: в мультитарифе по нему
+    # стирается ссылка у человека (см. конец функции).
+    deleted_panel_ids: dict[int, int] = {}
+
+    if service.is_configured:
+        semaphore = asyncio.Semaphore(5)
+
+        async with service.get_api_client() as api:
+
+            async def _delete_panel_user(subscription) -> bool:
+                panel_user_id = (
+                    subscription.remnawave_id
+                    if is_multi
+                    else (subscription.user.remnawave_id if subscription.user else None)
+                )
+                if not panel_user_id:
+                    # Отличаем «панельного юзера никогда не было» от «числовой id
+                    # ещё не проставлен бэкфилом». Во втором случае удалить
+                    # локальную строку значит осиротить ЖИВОЙ панельный аккаунт:
+                    # он останется ACTIVE и продолжит занимать лицензию, а связи
+                    # с ботом уже не будет. Отличить может только сама панель —
+                    # гадать нельзя: строка с shortUuid, которого панель не знает,
+                    # иначе блокировала бы сброс триала навсегда (бэкфил такую
+                    # тоже не разрешает — по построению).
+                    stale_short_uuid = (subscription.remnawave_short_uuid or '').strip()
+                    if not stale_short_uuid:
+                        return True  # в панели нечего удалять
+                    async with semaphore:
+                        try:
+                            adopted = await api.get_user_by_short_uuid(stale_short_uuid)
+                        except Exception as error:
+                            logger.error(
+                                'Не удалось проверить short_uuid в панели — триал не сбрасываем',
+                                subscription_id=subscription.id,
+                                remnawave_short_uuid=stale_short_uuid,
+                                error=error,
+                            )
+                            return False
+                    if adopted is None:
+                        return True  # панель этого shortUuid не знает — удалять нечего
+                    panel_user_id = adopted.id
+                async with semaphore:
+                    try:
+                        if delete_panel_user:
+                            await api.delete_user(panel_user_id)
+                            deleted_panel_ids[subscription.id] = panel_user_id
+                        else:
+                            await api.disable_user(panel_user_id)
+                        return True
+                    except RemnaWaveInvalidUserIdError as error:
+                        # Битая ссылка в БД, а не «панель-юзера нет»: удалять по такому
+                        # идентификатору нечего, но и строку сносить нельзя — иначе можно
+                        # осиротить живого панельного юзера. Оставляем на разбор оператору.
+                        logger.error(
+                            'Непригодный идентификатор панель-юзера при сбросе триала',
+                            panel_user_id=panel_user_id,
+                            subscription_id=subscription.id,
+                            error=error,
+                        )
+                        return False
+                    except Exception as error:
+                        msg = str(error).lower()
+                        if 'not found' in msg or 'not exist' in msg or 'already disabled' in msg:
+                            if delete_panel_user:
+                                deleted_panel_ids[subscription.id] = panel_user_id
+                            return True  # уже удалён/отключён — считаем успехом
+                        logger.error(
+                            'Не удалось снять панель-юзера при сбросе триала',
+                            panel_user_id=panel_user_id,
+                            subscription_id=subscription.id,
+                            delete_mode=settings.get_remnawave_user_delete_mode(),
+                            error=error,
+                        )
+                        return False
+
+            panel_results = await asyncio.gather(
+                *(_delete_panel_user(subscription) for subscription in subscriptions),
+                return_exceptions=True,
+            )
+
+        to_reset = [sub for sub, ok in zip(subscriptions, panel_results, strict=False) if ok is True]
+    else:
+        # Панель не настроена — orphan'ить нечего, чистим только БД.
+        to_reset = list(subscriptions)
+
+    if not to_reset:
+        # Release the pre-delete transaction lock when every external delete
+        # failed and there is intentionally nothing to mutate in the database.
+        await db.rollback()
+        return 0
+
+    for subscription in to_reset:
+        try:
+            await decrement_subscription_server_counts(db, subscription)
+        except Exception as error:  # pragma: no cover - defensive logging
+            logger.error(
+                'Не удалось обновить счётчики серверов при сбросе триала', subscription_id=subscription.id, error=error
+            )
+
+    subscription_ids = [subscription.id for subscription in to_reset]
+    subscription_users = {subscription.id: subscription.user_id for subscription in to_reset}
+
+    try:
+        await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id.in_(subscription_ids)))
+    except Exception as error:  # pragma: no cover - defensive logging
+        logger.error('Ошибка удаления серверных связей триалов', subscription_ids=subscription_ids, error=error)
+        raise
+
+    await db.execute(delete(Subscription).where(Subscription.id.in_(subscription_ids)))
+
+    # single-tariff: панель-юзер на уровне пользователя — чистим устаревшую панельную
+    # идентичность, чтобы синк по ней ничего не восстанавливал. Историческую колонку
+    # remnawave_uuid обнуляем заодно: панель-юзера больше нет, и её единственный
+    # оставшийся потребитель — one-shot бэкфил, который иначе попробует её разрезолвить.
+    # В режиме disable аккаунт остался жив: связь с ним стирать нельзя, иначе следующая
+    # покупка заведёт рядом дубль вместо того, чтобы включить отключённый аккаунт.
+    if not is_multi and delete_panel_user:
+        user_ids = list({subscription.user_id for subscription in to_reset})
+        await db.execute(update(User).where(User.id.in_(user_ids)).values(remnawave_id=None, remnawave_uuid=None))
+    elif is_multi:
+        # Мультитариф: первый аккаунт записан и человеку. Оставить там id удалённого
+        # аккаунта — отдать его следующей покупке (should_create_panel_account привяжет
+        # «свободный аккаунт человека» к новой строке → «User not found» каскадом).
+        # Стираем только совпадающий id: аккаунт живой соседней подписки не трогаем.
+        for subscription_id, user_id in subscription_users.items():
+            dead_panel_id = deleted_panel_ids.get(subscription_id)
+            if dead_panel_id:
+                await db.execute(
+                    update(User).where(User.id == user_id, User.remnawave_id == dead_panel_id).values(remnawave_id=None)
+                )
+
+    return len(to_reset)
+
+
 async def reset_trials_for_users_without_paid_subscription(db: AsyncSession) -> int:
+    """Bulk-сброс истёкших триалов у неплативших (кнопка «Сбросить триалы» в боте).
+
+    Выбирает истёкшие триалы неплативших и делегирует снос в `wipe_trial_subscriptions`
+    (общий код с кабинетным per-user сбросом), затем коммитит.
+    """
     now = datetime.now(UTC)
 
     result = await db.execute(
         select(Subscription)
-        .options(
-            selectinload(Subscription.user),
-            selectinload(Subscription.subscription_servers),
-        )
+        .options(selectinload(Subscription.user))
         .join(User, Subscription.user_id == User.id)
         .where(
             Subscription.is_trial.is_(True),
@@ -1122,38 +2260,17 @@ async def reset_trials_for_users_without_paid_subscription(db: AsyncSession) -> 
     if not subscriptions:
         return 0
 
-    reset_count = len(subscriptions)
-    for subscription in subscriptions:
-        try:
-            await decrement_subscription_server_counts(
-                db,
-                subscription,
-                subscription_servers=subscription.subscription_servers,
-            )
-        except Exception as error:  # pragma: no cover - defensive logging
-            logger.error(
-                'Не удалось обновить счётчики серверов при сбросе триала', subscription_id=subscription.id, error=error
-            )
+    reset_count = await wipe_trial_subscriptions(db, subscriptions)
 
-    subscription_ids = [subscription.id for subscription in subscriptions]
-
-    if subscription_ids:
+    if reset_count:
         try:
-            await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id.in_(subscription_ids)))
+            await db.commit()
         except Exception as error:  # pragma: no cover - defensive logging
-            logger.error('Ошибка удаления серверных связей триалов', subscription_ids=subscription_ids, error=error)
+            await db.rollback()
+            logger.error('Ошибка сохранения сброса триалов', error=error)
             raise
 
-        await db.execute(delete(Subscription).where(Subscription.id.in_(subscription_ids)))
-
-    try:
-        await db.commit()
-    except Exception as error:  # pragma: no cover - defensive logging
-        await db.rollback()
-        logger.error('Ошибка сохранения сброса триалов', error=error)
-        raise
-
-    logger.info('♻️ Сброшено триальных подписок', reset_count=reset_count)
+    logger.info('♻️ Сброшено триальных подписок (удалены из панели)', reset_count=reset_count)
     return reset_count
 
 
@@ -1209,7 +2326,7 @@ async def add_subscription_servers(
 
     if paid_prices is None:
         now = datetime.now(UTC)
-        days_remaining = max(1, (subscription.end_date - now).days)
+        days_remaining = max(1, math.ceil((subscription.end_date - now).total_seconds() / 86400))
         paid_prices = []
 
         from app.database.models import ServerSquad
@@ -1281,11 +2398,38 @@ async def expire_subscription(db: AsyncSession, subscription: Subscription) -> S
     return subscription
 
 
+async def expire_subscription_if_still_due(db: AsyncSession, subscription: Subscription) -> bool:
+    """Погасить подписку, только если в базе она всё ещё ACTIVE с прошедшей датой.
+
+    Мониторинг решает по объекту, прочитанному чуть раньше; продление, закоммиченное
+    между чтением и записью, обычная запись статуса затёрла бы — оплаченная подписка
+    стала бы истёкшей. Условие в самом UPDATE делает проверку и запись одним шагом.
+    Возвращает, погашена ли подписка этим вызовом.
+    """
+    now = datetime.now(UTC)
+    result = await db.execute(
+        update(Subscription)
+        .where(
+            Subscription.id == subscription.id,
+            Subscription.status == SubscriptionStatus.ACTIVE.value,
+            Subscription.end_date <= now,
+        )
+        .values(status=SubscriptionStatus.EXPIRED.value, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    await db.refresh(subscription)
+    expired = result.rowcount == 1
+    if expired:
+        logger.info('⏰ Подписка пользователя помечена как истёкшая', user_id=subscription.user_id)
+    return expired
+
+
 async def check_and_update_subscription_status(db: AsyncSession, subscription: Subscription) -> Subscription:
     current_time = datetime.now(UTC)
 
     logger.info(
-        '🔍 Проверка статуса подписки , текущий статус дата окончания текущее время',
+        '🔍 Проверка статуса подписки',
         subscription_id=subscription.id,
         subscription_status=subscription.status,
         format_local_datetime=format_local_datetime(subscription.end_date),
@@ -1316,7 +2460,7 @@ async def check_and_update_subscription_status(db: AsyncSession, subscription: S
         # Детальное логирование для отладки проблемы с деактивацией
         time_diff = current_time - subscription.end_date
         logger.warning(
-            '⏰ DEACTIVATION: подписка (user_id=) деактивируется в check_and_update_subscription_status. end_date=, current_time=, просрочена на',
+            '⏰ DEACTIVATION: подписка деактивируется в check_and_update_subscription_status',
             subscription_id=subscription.id,
             user_id=subscription.user_id,
             end_date=subscription.end_date,
@@ -1363,6 +2507,7 @@ async def create_subscription_no_commit(
     if connected_squads is None:
         connected_squads = []
 
+    short_id = await generate_unique_short_id(db)
     subscription = Subscription(
         user_id=user_id,
         status=status,
@@ -1373,6 +2518,7 @@ async def create_subscription_no_commit(
         device_limit=device_limit,
         connected_squads=connected_squads,
         remnawave_short_uuid=remnawave_short_uuid,
+        remnawave_short_id=short_id,
         subscription_url=subscription_url,
         subscription_crypto_link=subscription_crypto_link,
         autopay_enabled=(settings.is_autopay_enabled_by_default() if autopay_enabled is None else autopay_enabled),
@@ -1413,6 +2559,7 @@ async def create_subscription(
     if connected_squads is None:
         connected_squads = []
 
+    short_id = await generate_unique_short_id(db)
     subscription = Subscription(
         user_id=user_id,
         status=status,
@@ -1423,6 +2570,7 @@ async def create_subscription(
         device_limit=device_limit,
         connected_squads=connected_squads,
         remnawave_short_uuid=remnawave_short_uuid,
+        remnawave_short_id=short_id,
         subscription_url=subscription_url,
         subscription_crypto_link=subscription_crypto_link,
         autopay_enabled=(settings.is_autopay_enabled_by_default() if autopay_enabled is None else autopay_enabled),
@@ -1460,7 +2608,23 @@ async def create_pending_subscription(
     current_time = datetime.now(UTC)
     end_date = current_time + timedelta(days=duration_days)
 
-    existing_subscription = await get_subscription_by_user_id(db, user_id)
+    if settings.is_multi_tariff_enabled() and tariff_id:
+        active_subs = await get_active_subscriptions_by_user_id(db, user_id)
+        existing_subscription = next((s for s in active_subs if s.tariff_id == tariff_id), None)
+        if not existing_subscription:
+            # Also check non-active subs for this tariff
+            result = await db.execute(
+                select(Subscription)
+                .where(
+                    Subscription.user_id == user_id,
+                    Subscription.tariff_id == tariff_id,
+                )
+                .order_by(Subscription.created_at.desc())
+                .limit(1)
+            )
+            existing_subscription = result.scalar_one_or_none()
+    else:
+        existing_subscription = await get_subscription_by_user_id(db, user_id)
 
     if existing_subscription:
         if (
@@ -1490,7 +2654,7 @@ async def create_pending_subscription(
         await db.refresh(existing_subscription)
 
         logger.info(
-            '♻️ Обновлена ожидающая подписка пользователя , ID метод оплаты',
+            '♻️ Обновлена ожидающая подписка',
             trial_label=trial_label,
             user_id=user_id,
             existing_subscription_id=existing_subscription.id,
@@ -1498,6 +2662,7 @@ async def create_pending_subscription(
         )
         return existing_subscription
 
+    short_id = await generate_unique_short_id(db)
     subscription = Subscription(
         user_id=user_id,
         status=SubscriptionStatus.PENDING.value,
@@ -1510,6 +2675,7 @@ async def create_pending_subscription(
         tariff_id=tariff_id,
         autopay_enabled=settings.is_autopay_enabled_by_default(),
         autopay_days_before=settings.DEFAULT_AUTOPAY_DAYS_BEFORE,
+        remnawave_short_id=short_id,
     )
 
     db.add(subscription)
@@ -1517,13 +2683,66 @@ async def create_pending_subscription(
     await db.refresh(subscription)
 
     logger.info(
-        '💳 Создана ожидающая подписка для пользователя , ID метод оплаты',
+        '💳 Создана ожидающая подписка',
         trial_label=trial_label,
         user_id=user_id,
         subscription_id=subscription.id,
         payment_method=payment_method,
     )
 
+    return subscription
+
+
+async def create_sbp_pending_subscription(
+    db: AsyncSession,
+    user_id: int,
+    tariff: Tariff,
+) -> Subscription:
+    """Заготовка подписки под СБП-оформление (покупка через Platega-рекуррент).
+
+    Создаётся сразу ИСТЁКШЕЙ (end_date=сейчас): доступ не выдаётся, панель не
+    трогается. Первый CONFIRMED-чардж Platega продлит её по каденсу —
+    ``extend_subscription`` переводит EXPIRED → ACTIVE (PENDING не подошёл бы:
+    его чардж-коллбек не активирует), а синк панели в коллбеке создаст
+    panel-юзера. Если юзер так и не подтвердит привязку в банке — остаётся
+    безвредная истёкшая запись без доступа.
+    """
+    squads = list(tariff.allowed_squads or [])
+    if not squads:
+        # Пустой allowed_squads = «все серверы» — зеркально покупке с баланса
+        # (tariff_purchase.py).
+        from app.database.crud.server_squad import get_all_server_squads
+
+        all_servers, _ = await get_all_server_squads(db, available_only=True)
+        squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
+
+    now = datetime.now(UTC)
+    short_id = await generate_unique_short_id(db)
+    subscription = Subscription(
+        user_id=user_id,
+        status=SubscriptionStatus.EXPIRED.value,
+        is_trial=False,
+        start_date=now,
+        end_date=now,
+        traffic_limit_gb=tariff.traffic_limit_gb,
+        device_limit=tariff.device_limit,
+        connected_squads=squads,
+        tariff_id=tariff.id,
+        autopay_enabled=False,
+        autopay_days_before=settings.DEFAULT_AUTOPAY_DAYS_BEFORE,
+        remnawave_short_id=short_id,
+    )
+
+    db.add(subscription)
+    await db.commit()
+    await db.refresh(subscription)
+
+    logger.info(
+        '⚡ Создана СБП-заготовка подписки (активируется первым списанием)',
+        user_id=user_id,
+        subscription_id=subscription.id,
+        tariff_id=tariff.id,
+    )
     return subscription
 
 
@@ -1554,15 +2773,30 @@ async def create_pending_trial_subscription(
     )
 
 
-async def activate_pending_subscription(db: AsyncSession, user_id: int, period_days: int = None) -> Subscription | None:
+async def activate_pending_subscription(
+    db: AsyncSession,
+    user_id: int,
+    period_days: int = None,
+    subscription_id: int | None = None,
+) -> Subscription | None:
     """Активирует pending подписку пользователя, меняя её статус на ACTIVE."""
-    logger.info('Активация pending подписки: пользователь период дней', user_id=user_id, period_days=period_days)
+    logger.info(
+        'Активация pending подписки: пользователь период дней',
+        user_id=user_id,
+        period_days=period_days,
+        subscription_id=subscription_id,
+    )
 
-    # Находим pending подписку пользователя
+    # Находим pending подписку пользователя (последнюю созданную при наличии нескольких)
+    conditions = [
+        Subscription.user_id == user_id,
+        Subscription.status == SubscriptionStatus.PENDING.value,
+    ]
+    if subscription_id is not None:
+        conditions.append(Subscription.id == subscription_id)
+
     result = await db.execute(
-        select(Subscription).where(
-            and_(Subscription.user_id == user_id, Subscription.status == SubscriptionStatus.PENDING.value)
-        )
+        select(Subscription).where(and_(*conditions)).order_by(Subscription.created_at.desc()).limit(1)
     )
     pending_subscription = result.scalar_one_or_none()
 
@@ -1608,7 +2842,7 @@ async def activate_pending_trial_subscription(
 ) -> Subscription | None:
     """Активирует pending триальную подписку по её ID после оплаты."""
     logger.info(
-        'Активация pending триальной подписки: subscription_id=, user_id',
+        'Активация pending триальной подписки',
         subscription_id=subscription_id,
         user_id=user_id,
     )
@@ -1809,6 +3043,58 @@ async def get_expired_daily_subscriptions_for_recovery(db: AsyncSession) -> list
     return list(subscriptions)
 
 
+async def get_limited_daily_subscriptions_for_recovery(db: AsyncSession) -> list[Subscription]:
+    """Суточные подписки, застрявшие в LIMITED (панель зарезала их по лимиту трафика).
+
+    Списание берёт только ACTIVE, авто-возобновление знает про DISABLED и
+    EXPIRED — LIMITED не подхватывал никто, и оплаченная суточная подписка
+    оставалась в этом статусе навсегда.
+
+    Берём только те, у которых наступили следующие сутки: возврат идёт вместе
+    со списанием за новый день, и обнулять счётчик раньше срока нельзя — это
+    выдало бы за календарный день две квоты вместо одной.
+    """
+    from app.database.models import Tariff
+
+    now = datetime.now(UTC)
+    one_day_ago = now - timedelta(hours=24)
+
+    query = (
+        select(Subscription)
+        .join(Tariff, Subscription.tariff_id == Tariff.id)
+        .join(User, Subscription.user_id == User.id)
+        .options(
+            selectinload(Subscription.user),
+            selectinload(Subscription.tariff),
+        )
+        .where(
+            and_(
+                Tariff.is_daily.is_(True),
+                Tariff.is_active.is_(True),
+                Subscription.status == SubscriptionStatus.LIMITED.value,
+                User.status == UserStatus.ACTIVE.value,
+                # is_(False) не ловит NULL, поэтому добавляем OR is_(None)
+                (Subscription.is_daily_paused.is_(False) | Subscription.is_daily_paused.is_(None)),
+                Subscription.is_trial.is_(False),
+                # Баланс > 0 (грубый пред-фильтр; цену со скидкой считает _process_single_charge)
+                User.balance_kopeks > 0,
+                ((Subscription.last_daily_charge_at.is_(None)) | (Subscription.last_daily_charge_at < one_day_ago)),
+            )
+        )
+    )
+
+    result = await db.execute(query)
+    subscriptions = result.scalars().all()
+
+    if subscriptions:
+        logger.info(
+            '🔍 Найдено суточных подписок с исчерпанным трафиком для возврата',
+            subscriptions_count=len(subscriptions),
+        )
+
+    return list(subscriptions)
+
+
 async def pause_daily_subscription(
     db: AsyncSession,
     subscription: Subscription,
@@ -1873,6 +3159,8 @@ async def update_daily_charge_time(
     db: AsyncSession,
     subscription: Subscription,
     charge_time: datetime = None,
+    *,
+    commit: bool = True,
 ) -> Subscription:
     """Обновляет время последнего суточного списания и продлевает подписку на 1 день."""
     now = charge_time or datetime.now(UTC)
@@ -1882,10 +3170,13 @@ async def update_daily_charge_time(
     new_end_date = now + timedelta(days=1)
     if subscription.end_date is None or subscription.end_date < new_end_date:
         subscription.end_date = new_end_date
-        logger.info('📅 Продлена подписка до', subscription_id=subscription.id, new_end_date=new_end_date)
+        logger.info('📅 Продлена подписка', subscription_id=subscription.id, new_end_date=new_end_date)
 
-    await db.commit()
-    await db.refresh(subscription)
+    if commit:
+        await db.commit()
+        await db.refresh(subscription)
+    else:
+        await db.flush()
 
     return subscription
 
@@ -1903,7 +3194,7 @@ async def suspend_daily_subscription_insufficient_balance(
     await db.refresh(subscription)
 
     logger.info(
-        '⚠️ Суточная подписка приостановлена: недостаточно средств (user_id=)',
+        '⚠️ Суточная подписка приостановлена: недостаточно средств',
         subscription_id=subscription.id,
         user_id=subscription.user_id,
     )
@@ -1942,3 +3233,201 @@ async def toggle_daily_subscription_pause(
     if subscription.is_daily_paused:
         return await resume_daily_subscription(db, subscription)
     return await pause_daily_subscription(db, subscription)
+
+
+# ── Multi-tariff CRUD functions ──────────────────────────────────────────────
+
+
+async def get_active_subscriptions_by_user_id(db: AsyncSession, user_id: int) -> list[Subscription]:
+    """Get all active/trial/limited subscriptions for a user.
+
+    Includes LIMITED status because those subscriptions still have time remaining
+    (just ran out of traffic) and should be treated as "alive" for renewal,
+    duplicate prevention, and display purposes.
+    """
+    result = await db.execute(
+        select(Subscription)
+        .options(
+            selectinload(Subscription.user),
+            selectinload(Subscription.tariff),
+        )
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.status.in_(_ALIVE_SUBSCRIPTION_STATUSES_TUPLE),
+        )
+        .order_by(Subscription.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_subscription_by_id_for_user(db: AsyncSession, subscription_id: int, user_id: int) -> Subscription | None:
+    """Get subscription by ID with ownership check (IDOR protection)."""
+    result = await db.execute(
+        select(Subscription)
+        .options(
+            selectinload(Subscription.user),
+            selectinload(Subscription.tariff),
+        )
+        .where(
+            Subscription.id == subscription_id,
+            Subscription.user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_subscription_by_id(db: AsyncSession, subscription_id: int) -> Subscription | None:
+    """Get subscription by ID (admin use only, no ownership check)."""
+    result = await db.execute(
+        select(Subscription)
+        .options(
+            selectinload(Subscription.user),
+            selectinload(Subscription.tariff),
+        )
+        .where(Subscription.id == subscription_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_subscription_by_user_and_tariff(
+    db: AsyncSession,
+    user_id: int,
+    tariff_id: int,
+    *,
+    include_inactive: bool = False,
+) -> Subscription | None:
+    """Get a subscription for a specific user+tariff combination.
+
+    By default matches only "alive" subscriptions (active/trial/limited) — those
+    still have time remaining and should be extended rather than duplicated.
+
+    With ``include_inactive=True`` also matches EXPIRED/DISABLED subscriptions, so
+    a re-purchase of a tariff whose subscription has already lapsed revives that
+    record instead of spawning a duplicate. The partial unique index
+    ``uq_subscriptions_user_tariff_active`` only guards the alive statuses, so
+    without this expired duplicates of the same tariff piled up for users.
+    Prefers the freshest candidate (latest end_date) — an alive one, if any.
+    """
+    statuses = _ALIVE_SUBSCRIPTION_STATUSES_TUPLE
+    if include_inactive:
+        statuses += (SubscriptionStatus.EXPIRED.value, SubscriptionStatus.DISABLED.value)
+
+    result = await db.execute(
+        select(Subscription)
+        .options(
+            selectinload(Subscription.user),
+            selectinload(Subscription.tariff),
+        )
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.tariff_id == tariff_id,
+            Subscription.status.in_(statuses),
+        )
+        .order_by(Subscription.end_date.desc(), Subscription.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_alive_trial_subscription(db: AsyncSession, user_id: int) -> Subscription | None:
+    """Alive (active/trial/limited) trial subscription of the user, if any.
+
+    LIMITED is included on purpose: an exhausted-traffic trial is exactly the
+    «попробовал → покупаю» case and must convert on purchase, not hang around
+    next to the new paid subscription. But an ACTIVE/TRIAL trial always beats a
+    LIMITED one regardless of end_date — the non-limited trial carries the link
+    the user is actually using, and converting the wrong row would kill their
+    working link right after payment. Ties break by freshest ``end_date``.
+    """
+    result = await db.execute(
+        select(Subscription)
+        .options(selectinload(Subscription.tariff))
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.is_trial.is_(True),
+            Subscription.status.in_(_ALIVE_SUBSCRIPTION_STATUSES_TUPLE),
+        )
+        .order_by(
+            case((Subscription.status == SubscriptionStatus.LIMITED.value, 1), else_=0),
+            Subscription.end_date.desc(),
+            Subscription.created_at.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def deactivate_user_trial_subscriptions(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    exclude_subscription_id: int | None = None,
+) -> list[Subscription]:
+    """Deactivate all trial subscriptions for a user.
+
+    Called when user purchases a paid tariff — trial is a probe that must die on purchase.
+    Returns remaining trial time in seconds (for TRIAL_ADD_REMAINING_DAYS_TO_PAID).
+    Handles both tariff-based and squad-based trials uniformly. LIMITED
+    (traffic-exhausted) trials are included: they are alive per the partial
+    unique index and used to survive every paid purchase, hanging in the
+    cabinet next to the new subscription.
+    """
+    result = await db.execute(
+        select(Subscription).where(
+            Subscription.user_id == user_id,
+            Subscription.is_trial.is_(True),
+            Subscription.status.in_(
+                [
+                    SubscriptionStatus.ACTIVE.value,
+                    SubscriptionStatus.TRIAL.value,
+                    SubscriptionStatus.LIMITED.value,
+                ]
+            ),
+        )
+    )
+    trial_subs = list(result.scalars().all())
+
+    deactivated = []
+    for sub in trial_subs:
+        if exclude_subscription_id and sub.id == exclude_subscription_id:
+            continue
+        sub.status = SubscriptionStatus.DISABLED.value
+        sub.is_trial = False
+        sub.autopay_enabled = False
+        sub.updated_at = datetime.now(UTC)
+        deactivated.append(sub)
+        logger.info(
+            'Trial subscription deactivated on paid purchase',
+            subscription_id=sub.id,
+            user_id=user_id,
+            tariff_id=sub.tariff_id,
+        )
+
+    if deactivated:
+        await db.flush()
+
+    return deactivated
+
+
+async def get_all_subscriptions_by_user_id(db: AsyncSession, user_id: int) -> list[Subscription]:
+    """Get all subscriptions for a user (any status).
+
+    Ordering: active first, then trial, then everything else — newest first within each group.
+    """
+    result = await db.execute(
+        select(Subscription)
+        .options(
+            selectinload(Subscription.user),
+            selectinload(Subscription.tariff),
+        )
+        .where(Subscription.user_id == user_id)
+        .order_by(
+            case(
+                (Subscription.status == SubscriptionStatus.ACTIVE.value, 0),
+                (Subscription.status == SubscriptionStatus.TRIAL.value, 1),
+                else_=2,
+            ),
+            Subscription.created_at.desc(),
+        )
+    )
+    return list(result.scalars().all())

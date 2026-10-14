@@ -1,5 +1,6 @@
 """Admin routes for landing page management in cabinet."""
 
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
@@ -23,7 +24,9 @@ from app.database.crud.landing import (
     update_landing,
     update_landing_order,
 )
+from app.database.local_date import local_date_expr
 from app.database.models import GuestPurchase, GuestPurchaseStatus, LandingPage, Tariff, User
+from app.utils.timezone import local_date
 
 from ..dependencies import get_cabinet_db, require_permission
 from .branding import ALLOWED_BG_TYPES, _validate_settings
@@ -37,6 +40,8 @@ router = APIRouter(prefix='/admin/landings', tags=['Cabinet Admin Landings'])
 _RESERVED_SLUGS = frozenset(
     {
         'purchase',
+        'gift',
+        'success',
         'admin',
         'api',
         'health',
@@ -205,6 +210,19 @@ class LandingCreateRequest(BaseModel):
     discount_ends_at: datetime | None = None
     discount_badge_text: dict[str, str] | None = None
     background_config: dict | None = None
+    sticky_pay_button: bool = False
+    analytics_view_enabled: bool = False
+    analytics_view_goal: str | None = Field(default=None, max_length=64)
+    analytics_click_enabled: bool = False
+    analytics_click_goal: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode='after')
+    def validate_analytics_goals(self) -> 'LandingCreateRequest':
+        if self.analytics_view_enabled and not self.analytics_view_goal:
+            raise ValueError('analytics_view_goal is required when analytics_view_enabled is True')
+        if self.analytics_click_enabled and not self.analytics_click_goal:
+            raise ValueError('analytics_click_goal is required when analytics_click_enabled is True')
+        return self
 
     @field_validator('background_config')
     @classmethod
@@ -314,6 +332,11 @@ class LandingUpdateRequest(BaseModel):
     discount_ends_at: datetime | None = None
     discount_badge_text: dict[str, str] | None = None
     background_config: dict | None = None
+    sticky_pay_button: bool | None = None
+    analytics_view_enabled: bool | None = None
+    analytics_view_goal: str | None = Field(default=None, max_length=64)
+    analytics_click_enabled: bool | None = None
+    analytics_click_goal: str | None = Field(default=None, max_length=64)
 
     @field_validator('background_config')
     @classmethod
@@ -461,6 +484,11 @@ class LandingDetailResponse(BaseModel):
     discount_ends_at: datetime | None = None
     discount_badge_text: dict[str, str] | None = None
     background_config: dict | None = None
+    sticky_pay_button: bool = False
+    analytics_view_enabled: bool = False
+    analytics_view_goal: str | None = None
+    analytics_click_enabled: bool = False
+    analytics_click_goal: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -496,11 +524,23 @@ class LandingTariffStat(BaseModel):
     revenue_kopeks: int
 
 
+class LandingPaymentMethodStat(BaseModel):
+    method: str
+    purchases: int
+    revenue_kopeks: int
+
+
+class LandingSourceStat(BaseModel):
+    source: str  # referrer host, or 'direct'
+    purchases: int
+
+
 class LandingStatsResponse(BaseModel):
     # Summary
     total_purchases: int
     total_revenue_kopeks: int
-    total_gifts: int
+    total_gifts: int  # gifts paid (sent)
+    total_gifts_claimed: int = 0  # gifts that reached DELIVERED (claimed)
     total_regular: int
     avg_purchase_kopeks: int
     # Conversion: created -> paid/delivered
@@ -509,8 +549,10 @@ class LandingStatsResponse(BaseModel):
     conversion_rate: float  # percent
     # Daily chart data (last 30 days)
     daily_stats: list[LandingDailyStat]
-    # Tariff breakdown
+    # Breakdowns
     tariff_stats: list[LandingTariffStat]
+    payment_method_stats: list[LandingPaymentMethodStat] = []
+    source_stats: list[LandingSourceStat] = []
 
 
 class LandingPurchaseItem(BaseModel):
@@ -527,6 +569,7 @@ class LandingPurchaseItem(BaseModel):
     currency: str
     payment_method: str | None = None
     status: str
+    referrer: str | None = None
     created_at: datetime | None = None
     paid_at: datetime | None = None
 
@@ -638,6 +681,11 @@ async def create_landing_page(
         discount_ends_at=request.discount_ends_at,
         discount_badge_text=request.discount_badge_text,
         background_config=request.background_config,
+        sticky_pay_button=request.sticky_pay_button,
+        analytics_view_enabled=request.analytics_view_enabled,
+        analytics_view_goal=request.analytics_view_goal,
+        analytics_click_enabled=request.analytics_click_enabled,
+        analytics_click_goal=request.analytics_click_goal,
     )
 
     logger.info('Admin created landing page', admin_id=admin.id, slug=landing.slug, landing_id=landing.id)
@@ -813,6 +861,17 @@ async def get_landing_stats(
             func.count(case((and_(is_successful, GuestPurchase.is_gift.is_(True)), GuestPurchase.id))).label(
                 'total_gifts'
             ),
+            func.count(
+                case(
+                    (
+                        and_(
+                            GuestPurchase.is_gift.is_(True),
+                            GuestPurchase.status == GuestPurchaseStatus.DELIVERED.value,
+                        ),
+                        GuestPurchase.id,
+                    )
+                )
+            ).label('total_gifts_claimed'),
         ).where(GuestPurchase.landing_id == landing_id)
     )
     row = summary_result.one()
@@ -820,6 +879,7 @@ async def get_landing_stats(
     total_successful: int = row.total_successful
     total_revenue_kopeks: int = row.total_revenue_kopeks
     total_gifts: int = row.total_gifts
+    total_gifts_claimed: int = row.total_gifts_claimed
     total_regular = total_successful - total_gifts
     avg_purchase_kopeks = total_revenue_kopeks // total_successful if total_successful > 0 else 0
     conversion_rate = round(total_successful / total_created * 100, 1) if total_created > 0 else 0.0
@@ -827,10 +887,10 @@ async def get_landing_stats(
     # -- Daily stats for last N days --
     now = datetime.now(UTC)
     cutoff = now - timedelta(days=_STATS_PERIOD_DAYS)
-    day_at_utc = func.date(func.timezone('UTC', GuestPurchase.paid_at))
+    day_paid = local_date_expr(GuestPurchase.paid_at, db)
     daily_result = await db.execute(
         select(
-            day_at_utc.label('day'),
+            day_paid.label('day'),
             func.count(GuestPurchase.id).label('purchases'),
             func.coalesce(func.sum(GuestPurchase.amount_kopeks), 0).label('revenue_kopeks'),
             func.count(case((GuestPurchase.is_gift.is_(True), GuestPurchase.id))).label('gifts'),
@@ -840,29 +900,29 @@ async def get_landing_stats(
             is_successful,
             GuestPurchase.paid_at >= cutoff,
         )
-        .group_by(day_at_utc)
-        .order_by(day_at_utc)
+        .group_by(day_paid)
+        .order_by(day_paid)
     )
     daily_rows = {str(r.day): r for r in daily_result.all()}
 
     # Created per day (all statuses, by created_at)
-    day_created_utc = func.date(func.timezone('UTC', GuestPurchase.created_at))
+    day_created = local_date_expr(GuestPurchase.created_at, db)
     created_result = await db.execute(
         select(
-            day_created_utc.label('day'),
+            day_created.label('day'),
             func.count(GuestPurchase.id).label('created'),
         )
         .where(
             GuestPurchase.landing_id == landing_id,
             GuestPurchase.created_at >= cutoff,
         )
-        .group_by(day_created_utc)
-        .order_by(day_created_utc)
+        .group_by(day_created)
+        .order_by(day_created)
     )
     created_rows = {str(r.day): r.created for r in created_result.all()}
 
     # Fill missing days with zeros
-    today = now.date()
+    today = local_date(now)  # ключи дней из SQL — локальные (#3136)
     daily_stats: list[LandingDailyStat] = []
     for i in range(_STATS_PERIOD_DAYS, -1, -1):
         day = today - timedelta(days=i)
@@ -916,10 +976,49 @@ async def get_landing_stats(
         for r in tariff_result.all()
     ]
 
+    # -- Payment method breakdown (successful purchases) --
+    pm_result = await db.execute(
+        select(
+            func.coalesce(GuestPurchase.payment_method, 'unknown').label('method'),
+            func.count(GuestPurchase.id).label('purchases'),
+            func.coalesce(func.sum(GuestPurchase.amount_kopeks), 0).label('revenue_kopeks'),
+        )
+        .where(GuestPurchase.landing_id == landing_id, is_successful)
+        .group_by(GuestPurchase.payment_method)
+        .order_by(func.count(GuestPurchase.id).desc())
+    )
+    payment_method_stats = [
+        LandingPaymentMethodStat(method=r.method, purchases=r.purchases, revenue_kopeks=r.revenue_kopeks)
+        for r in pm_result.all()
+    ]
+
+    # -- Traffic source breakdown (by referrer host; raw URLs are aggregated to hosts) --
+    source_result = await db.execute(
+        select(
+            GuestPurchase.referrer,
+            func.count(GuestPurchase.id).label('purchases'),
+        )
+        .where(GuestPurchase.landing_id == landing_id, is_successful)
+        .group_by(GuestPurchase.referrer)
+    )
+    host_counts: Counter[str] = Counter()
+    for r in source_result.all():
+        ref = r.referrer
+        if not ref:
+            host = 'direct'
+        else:
+            try:
+                host = urlparse(ref).hostname or ref
+            except ValueError:
+                host = ref
+        host_counts[host] += r.purchases
+    source_stats = [LandingSourceStat(source=h, purchases=c) for h, c in host_counts.most_common(8)]
+
     return LandingStatsResponse(
         total_purchases=total_created,
         total_revenue_kopeks=total_revenue_kopeks,
         total_gifts=total_gifts,
+        total_gifts_claimed=total_gifts_claimed,
         total_regular=total_regular,
         avg_purchase_kopeks=avg_purchase_kopeks,
         total_created=total_created,
@@ -927,6 +1026,8 @@ async def get_landing_stats(
         conversion_rate=conversion_rate,
         daily_stats=daily_stats,
         tariff_stats=tariff_stats,
+        payment_method_stats=payment_method_stats,
+        source_stats=source_stats,
     )
 
 
@@ -979,6 +1080,7 @@ async def get_landing_purchases(
             GuestPurchase.currency,
             GuestPurchase.payment_method,
             GuestPurchase.status,
+            GuestPurchase.referrer,
             GuestPurchase.created_at,
             GuestPurchase.paid_at,
         )
@@ -1004,6 +1106,7 @@ async def get_landing_purchases(
             currency=row.currency,
             payment_method=row.payment_method,
             status=row.status,
+            referrer=row.referrer,
             created_at=row.created_at,
             paid_at=row.paid_at,
         )
@@ -1068,6 +1171,11 @@ def _landing_to_detail(landing: LandingPage) -> LandingDetailResponse:
         discount_ends_at=landing.discount_ends_at,
         discount_badge_text=landing.discount_badge_text,
         background_config=landing.background_config,
+        sticky_pay_button=landing.sticky_pay_button,
+        analytics_view_enabled=landing.analytics_view_enabled,
+        analytics_view_goal=landing.analytics_view_goal,
+        analytics_click_enabled=landing.analytics_click_enabled,
+        analytics_click_goal=landing.analytics_click_goal,
         created_at=landing.created_at,
         updated_at=landing.updated_at,
     )

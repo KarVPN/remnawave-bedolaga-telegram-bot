@@ -30,6 +30,8 @@ class TelegramWebhookOverloadedError(TelegramWebhookProcessorError):
 class TelegramWebhookProcessor:
     """Асинхронная очередь обработки Telegram webhook-ов."""
 
+    active: TelegramWebhookProcessor | None = None  # запущенная очередь: по ней живое меню видит нагрузку
+
     def __init__(
         self,
         *,
@@ -62,6 +64,7 @@ class TelegramWebhookProcessor:
                 return
 
             self._running = True
+            TelegramWebhookProcessor.active = self
             self._queue = asyncio.Queue(maxsize=self._queue_maxsize)
             self._workers.clear()
 
@@ -74,7 +77,7 @@ class TelegramWebhookProcessor:
 
             if self._worker_count:
                 logger.info(
-                    '🚀 Telegram webhook processor запущен: воркеров, очередь',
+                    '🚀 Telegram webhook processor запущен',
                     worker_count=self._worker_count,
                     queue_maxsize=self._queue_maxsize,
                 )
@@ -93,7 +96,7 @@ class TelegramWebhookProcessor:
                     await asyncio.wait_for(self._queue.join(), timeout=self._shutdown_timeout)
                 except TimeoutError:
                     logger.warning(
-                        '⏱️ Не удалось дождаться завершения очереди Telegram webhook за секунд',
+                        '⏱️ Не удалось дождаться завершения очереди Telegram webhook',
                         shutdown_timeout=self._shutdown_timeout,
                     )
             else:
@@ -107,9 +110,7 @@ class TelegramWebhookProcessor:
                         drained += 1
                         self._queue.task_done()
                 if drained:
-                    logger.warning(
-                        'Очередь Telegram webhook остановлена без воркеров, потеряно обновлений', drained=drained
-                    )
+                    logger.warning('Очередь Telegram webhook остановлена без воркеров', drained=drained)
 
             for _ in range(len(self._workers)):
                 try:

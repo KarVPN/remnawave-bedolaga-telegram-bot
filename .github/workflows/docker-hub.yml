@@ -16,59 +16,61 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v5
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0  
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     - name: Get version info
       id: version
       run: |
-        echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-        
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
         echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-        
-        # Определяем версию и теги
+
+        # Read base version from release-please manifest (single source of truth)
+        BASE_VERSION=$(jq -r '."."' .release-please-manifest.json)
+
         if [[ $GITHUB_REF == refs/tags/* ]]; then
           VERSION=${GITHUB_REF#refs/tags/}
           TAGS="fr1ngg/remnawave-bedolaga-telegram-bot:latest,fr1ngg/remnawave-bedolaga-telegram-bot:${VERSION}"
           echo "🏷️ Собираем релизную версию: $VERSION"
         elif [[ $GITHUB_REF == refs/heads/main ]]; then
-          VERSION="v3.7.0-$(git rev-parse --short HEAD)" # x-release-please-version
+          VERSION="v${BASE_VERSION}-${SHORT_SHA}"
           TAGS="fr1ngg/remnawave-bedolaga-telegram-bot:latest,fr1ngg/remnawave-bedolaga-telegram-bot:${VERSION}"
           echo "🚀 Собираем версию из main: $VERSION"
         elif [[ $GITHUB_REF == refs/heads/dev ]]; then
-          VERSION="v3.7.0-dev-$(git rev-parse --short HEAD)" # x-release-please-version
+          VERSION="v${BASE_VERSION}-dev-${SHORT_SHA}"
           TAGS="fr1ngg/remnawave-bedolaga-telegram-bot:dev,fr1ngg/remnawave-bedolaga-telegram-bot:${VERSION}"
           echo "🧪 Собираем dev версию: $VERSION"
         else
-          VERSION="v3.7.0-pr-$(git rev-parse --short HEAD)" # x-release-please-version
-          TAGS="fr1ngg/remnawave-bedolaga-telegram-bot:pr-$(git rev-parse --short HEAD)"
+          VERSION="v${BASE_VERSION}-pr-${SHORT_SHA}"
+          TAGS="fr1ngg/remnawave-bedolaga-telegram-bot:pr-${SHORT_SHA}"
           echo "🔀 Собираем PR версию: $VERSION"
         fi
-        
+
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "tags=$TAGS" >> $GITHUB_OUTPUT
         echo "should_push=${{ github.event_name != 'pull_request' }}" >> $GITHUB_OUTPUT
-        
+
         echo "=== Информация о сборке ==="
         echo "Версия: $VERSION"
-        echo "Коммит: $(git rev-parse --short HEAD)"
+        echo "Коммит: $SHORT_SHA"
         echo "Теги: $TAGS"
         echo "Push: ${{ github.event_name != 'pull_request' }}"
         echo "==========================="
 
     - name: Login to Docker Hub
       if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
+      uses: docker/login-action@v4
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
 
     - name: Build and push Docker image
-      uses: docker/build-push-action@v6
+      uses: docker/build-push-action@v7
       with:
         context: .
         file: ./Dockerfile

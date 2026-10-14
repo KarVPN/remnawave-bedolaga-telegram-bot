@@ -2,124 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import json
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.cabinet.auth.jwt_handler import get_token_payload
+from app.cabinet.ws_manager import CabinetConnectionManager, cabinet_ws_manager  # noqa: F401  реэкспорт
 from app.config import settings
 from app.database.crud.user import get_user_by_id
 from app.database.database import AsyncSessionLocal
+from app.utils.websocket_errors import CLIENT_GONE_ERRORS, is_client_gone
 
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
-
-
-class CabinetConnectionManager:
-    """Менеджер WebSocket подключений для кабинета."""
-
-    def __init__(self):
-        # user_id -> set of websocket connections
-        self._user_connections: dict[int, set[WebSocket]] = {}
-        # admin user_ids -> set of websocket connections
-        self._admin_connections: dict[int, set[WebSocket]] = {}
-        self._lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket, user_id: int, is_admin: bool) -> None:
-        """Зарегистрировать подключение."""
-        async with self._lock:
-            if user_id not in self._user_connections:
-                self._user_connections[user_id] = set()
-            self._user_connections[user_id].add(websocket)
-
-            if is_admin:
-                if user_id not in self._admin_connections:
-                    self._admin_connections[user_id] = set()
-                self._admin_connections[user_id].add(websocket)
-
-        logger.debug(
-            'Cabinet WS connected: user_id is_admin total_users',
-            user_id=user_id,
-            is_admin=is_admin,
-            user_connections_count=len(self._user_connections),
-        )
-
-    async def disconnect(self, websocket: WebSocket, user_id: int) -> None:
-        """Отменить регистрацию подключения."""
-        async with self._lock:
-            if user_id in self._user_connections:
-                self._user_connections[user_id].discard(websocket)
-                if not self._user_connections[user_id]:
-                    del self._user_connections[user_id]
-
-            if user_id in self._admin_connections:
-                self._admin_connections[user_id].discard(websocket)
-                if not self._admin_connections[user_id]:
-                    del self._admin_connections[user_id]
-
-        logger.debug('Cabinet WS disconnected: user_id', user_id=user_id)
-
-    async def send_to_user(self, user_id: int, message: dict) -> None:
-        """Отправить сообщение конкретному пользователю."""
-        # Snapshot connections under the lock to avoid mutation during iteration
-        async with self._lock:
-            connections = list(self._user_connections.get(user_id, set()))
-
-        if not connections:
-            return
-
-        disconnected = set()
-        data = json.dumps(message, default=str, ensure_ascii=False)
-
-        for ws in connections:
-            try:
-                await ws.send_text(data)
-            except Exception as e:
-                logger.warning('Failed to send to user', user_id=user_id, e=e)
-                disconnected.add(ws)
-
-        # Cleanup disconnected
-        if disconnected:
-            async with self._lock:
-                for ws in disconnected:
-                    self._user_connections.get(user_id, set()).discard(ws)
-
-    async def send_to_admins(self, message: dict) -> None:
-        """Отправить сообщение всем админам."""
-        # Snapshot connections under the lock to avoid mutation during iteration
-        async with self._lock:
-            if not self._admin_connections:
-                return
-            # Create a snapshot: list of (user_id, list of websockets)
-            admin_snapshot = [(user_id, list(connections)) for user_id, connections in self._admin_connections.items()]
-
-        data = json.dumps(message, default=str, ensure_ascii=False)
-        disconnected_by_user: dict[int, set[WebSocket]] = {}
-
-        for user_id, connections in admin_snapshot:
-            for ws in connections:
-                try:
-                    await ws.send_text(data)
-                except Exception as e:
-                    logger.warning('Failed to send to admin', user_id=user_id, e=e)
-                    if user_id not in disconnected_by_user:
-                        disconnected_by_user[user_id] = set()
-                    disconnected_by_user[user_id].add(ws)
-
-        # Cleanup disconnected
-        if disconnected_by_user:
-            async with self._lock:
-                for user_id, ws_set in disconnected_by_user.items():
-                    for ws in ws_set:
-                        self._admin_connections.get(user_id, set()).discard(ws)
-
-
-# Глобальный менеджер подключений
-cabinet_ws_manager = CabinetConnectionManager()
 
 
 async def verify_cabinet_ws_token(token: str) -> tuple[int | None, bool]:
@@ -156,6 +56,16 @@ async def verify_cabinet_ws_token(token: str) -> tuple[int | None, bool]:
         return None, False
 
 
+async def _reject(websocket: WebSocket, reason: str) -> None:
+    """Принять и сразу закрыть соединение с кодом отказа.
+
+    Клиент может отвалиться и здесь — тогда закрывать уже нечего и некому.
+    """
+    with contextlib.suppress(*CLIENT_GONE_ERRORS):
+        await websocket.accept()
+        await websocket.close(code=1008, reason=reason)
+
+
 @router.websocket('/ws')
 async def cabinet_websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint для real-time уведомлений кабинета."""
@@ -166,9 +76,7 @@ async def cabinet_websocket_endpoint(websocket: WebSocket):
 
     if not token:
         logger.debug('Cabinet WS: No token from', client_host=client_host)
-        # Принимаем и сразу закрываем с кодом ошибки
-        await websocket.accept()
-        await websocket.close(code=1008, reason='Unauthorized: No token')
+        await _reject(websocket, 'Unauthorized: No token')
         return
 
     # Верифицируем токен
@@ -176,9 +84,7 @@ async def cabinet_websocket_endpoint(websocket: WebSocket):
 
     if not user_id:
         logger.debug('Cabinet WS: Invalid token from', client_host=client_host)
-        # Принимаем и сразу закрываем с кодом ошибки
-        await websocket.accept()
-        await websocket.close(code=1008, reason='Unauthorized: Invalid token')
+        await _reject(websocket, 'Unauthorized: Invalid token')
         return
 
     # Принимаем соединение
@@ -186,6 +92,11 @@ async def cabinet_websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
         logger.debug('Cabinet WS accepted: user_id is_admin', user_id=user_id, is_admin=is_admin)
     except Exception as e:
+        # Вкладку закрыли, пока шло рукопожатие, — это не авария: молча уходим.
+        # Иначе владельцу летел отчёт «Ошибка во время работы» по нескольку раз в день.
+        if is_client_gone(e):
+            logger.debug('Cabinet WS: client gone before accept', client_host=client_host)
+            return
         logger.error('Cabinet WS: Failed to accept from', client_host=client_host, e=e)
         return
 
@@ -217,13 +128,18 @@ async def cabinet_websocket_endpoint(websocket: WebSocket):
             except WebSocketDisconnect:
                 break
             except Exception as e:
+                if is_client_gone(e):
+                    break
                 logger.exception('Cabinet WS error for user', user_id=user_id, e=e)
                 break
 
     except WebSocketDisconnect:
         logger.debug('Cabinet WS disconnected: user_id', user_id=user_id)
     except Exception as e:
-        logger.exception('Cabinet WS error', e=e)
+        if is_client_gone(e):
+            logger.debug('Cabinet WS: client gone', user_id=user_id)
+        else:
+            logger.exception('Cabinet WS error', e=e)
     finally:
         await cabinet_ws_manager.disconnect(websocket, user_id)
 
@@ -315,9 +231,25 @@ async def notify_user_balance_change(
 # ============================================================================
 
 
+def _iso_utc(value: datetime | str | None) -> str:
+    """Дата для WebSocket-события — ISO 8601 в UTC; кабинет форматирует её для человека сам.
+
+    Раньше сюда прилетала строка ``format_email_datetime`` («27.11.2030, 12:00»),
+    и кабинет показывал «Действует до: Invalid Date». Строка допускается только
+    как уже готовый ISO (обратная совместимость), ``None`` — пустая строка.
+    """
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat()
+
+
 async def notify_user_subscription_activated(
     user_id: int,
-    expires_at: str,
+    subscription_id: int | None = None,
+    expires_at: datetime | str | None = None,
     tariff_name: str = '',
 ) -> None:
     """Уведомить пользователя об активации подписки."""
@@ -325,7 +257,8 @@ async def notify_user_subscription_activated(
         user_id,
         {
             'type': 'subscription.activated',
-            'expires_at': expires_at,
+            'subscription_id': subscription_id,
+            'expires_at': _iso_utc(expires_at),
             'tariff_name': tariff_name,
         },
     )
@@ -334,7 +267,7 @@ async def notify_user_subscription_activated(
 async def notify_user_subscription_expiring(
     user_id: int,
     days_left: int,
-    expires_at: str,
+    expires_at: datetime | str | None,
 ) -> None:
     """Уведомить пользователя о скором истечении подписки."""
     await cabinet_ws_manager.send_to_user(
@@ -342,7 +275,7 @@ async def notify_user_subscription_expiring(
         {
             'type': 'subscription.expiring',
             'days_left': days_left,
-            'expires_at': expires_at,
+            'expires_at': _iso_utc(expires_at),
         },
     )
 
@@ -359,7 +292,8 @@ async def notify_user_subscription_expired(user_id: int) -> None:
 
 async def notify_user_subscription_renewed(
     user_id: int,
-    new_expires_at: str,
+    subscription_id: int | None = None,
+    new_expires_at: datetime | str | None = None,
     amount_kopeks: int = 0,
 ) -> None:
     """Уведомить пользователя о продлении подписки."""
@@ -367,7 +301,8 @@ async def notify_user_subscription_renewed(
         user_id,
         {
             'type': 'subscription.renewed',
-            'new_expires_at': new_expires_at,
+            'subscription_id': subscription_id,
+            'new_expires_at': _iso_utc(new_expires_at),
             'amount_kopeks': amount_kopeks,
             'amount_rubles': amount_kopeks / 100,
         },
@@ -420,7 +355,7 @@ async def notify_user_traffic_purchased(
 async def notify_user_autopay_success(
     user_id: int,
     amount_kopeks: int,
-    new_expires_at: str,
+    new_expires_at: datetime | str | None,
 ) -> None:
     """Уведомить пользователя об успешном автопродлении."""
     await cabinet_ws_manager.send_to_user(
@@ -429,7 +364,7 @@ async def notify_user_autopay_success(
             'type': 'autopay.success',
             'amount_kopeks': amount_kopeks,
             'amount_rubles': amount_kopeks / 100,
-            'new_expires_at': new_expires_at,
+            'new_expires_at': _iso_utc(new_expires_at),
         },
     )
 

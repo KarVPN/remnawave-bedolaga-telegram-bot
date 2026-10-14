@@ -169,19 +169,19 @@ class Texts:
 
     def get(self, item: str, default: Any = None) -> Any:
         try:
-            return self._get_value(item)
+            return self._get_value(item, warn=False)
         except KeyError:
             return default
 
     def t(self, key: str, default: Any = None) -> Any:
         try:
-            return self._get_value(key)
+            return self._get_value(key, warn=default is None)
         except KeyError:
             if default is not None:
                 return default
             raise
 
-    def _get_value(self, item: str) -> Any:
+    def _get_value(self, item: str, warn: bool = True) -> Any:
         if item == 'RULES_TEXT':
             return _get_cached_rules_value(self.language)
 
@@ -191,12 +191,18 @@ class Texts:
         if item in self._fallback_values:
             return self._fallback_values[item]
 
-        _logger.warning("Missing localization key '' for language ''", item=item, language=self.language)
+        # Предупреждаем только когда у вызова НЕТ запасного текста. t(key, default) и
+        # get(key, default) передают warn=False: для них отсутствие ключа штатно —
+        # показывается переданный fallback (часто это динамическая строка вроде
+        # настраиваемого названия платёжки), засорять логи warning'ами не нужно.
+        # Доступ через атрибут/[] без запасного варианта по-прежнему предупреждает.
+        if warn:
+            _logger.warning('Missing localization key', item=item, language=self.language)
         raise KeyError(item)
 
     @staticmethod
-    def format_price(kopeks: int) -> str:
-        return settings.format_price(kopeks)
+    def format_price(kopeks: int, round_kopeks: bool | None = None) -> str:
+        return settings.format_price(kopeks, round_kopeks=round_kopeks)
 
     @staticmethod
     def format_traffic(gb: float, is_limit: bool = True) -> str:
@@ -211,6 +217,19 @@ class Texts:
         if gb >= 1024:
             return f'{gb / 1024:.1f} ТБ'
         return f'{gb:.0f} ГБ'
+
+    @staticmethod
+    def format_device_limit(limit: int | None) -> str:
+        """Format a device limit for display. 0/None означает «без ограничения».
+
+        При выключенном HWID RemnaWave отдаёт device_limit = 0, и
+        resolve_hwid_device_limit сам трактует <= 0 как «лимит в панель не
+        слать». Показывать это пользователю нулём нельзя: «Устройства: 3 / 0»
+        читается как «устройств не осталось», хотя ограничения нет вовсе.
+        """
+        if not limit or limit <= 0:
+            return '∞'
+        return str(limit)
 
 
 def get_texts(language: str = DEFAULT_LANGUAGE) -> Texts:
@@ -229,7 +248,7 @@ async def get_rules_from_db(language: str = DEFAULT_LANGUAGE) -> str:
                 return rules
 
     except Exception as error:  # pragma: no cover - defensive logging
-        _logger.warning('Failed to load rules from DB for', language=language, error=error)
+        _logger.warning('Failed to load rules from DB', language=language, error=error)
 
     default = _get_default_rules(language)
     _cached_rules[language] = default
@@ -256,6 +275,11 @@ def _get_default_privacy_policy(language: str = DEFAULT_LANGUAGE) -> str:
 
 def get_privacy_policy(language: str = DEFAULT_LANGUAGE) -> str:
     return _get_default_privacy_policy(language)
+
+
+def get_default_rules(language: str = DEFAULT_LANGUAGE) -> str:
+    """Правила из локали — когда в базе их нет или они пустые."""
+    return _get_default_rules(language)
 
 
 def get_rules_sync(language: str = DEFAULT_LANGUAGE) -> str:

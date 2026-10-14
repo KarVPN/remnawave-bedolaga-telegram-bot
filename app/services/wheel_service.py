@@ -25,6 +25,7 @@ from app.database.crud.wheel import (
 from app.database.models import (
     PromoCode,
     PromoCodeType,
+    Subscription,
     User,
     WheelConfig,
     WheelPrize,
@@ -55,6 +56,15 @@ class SpinResult:
 
 
 @dataclass
+class EligibleSubscription:
+    """Подписка, доступная для оплаты колеса днями."""
+
+    id: int
+    tariff_name: str | None
+    days_left: int
+
+
+@dataclass
 class SpinAvailability:
     """Доступность спина для пользователя."""
 
@@ -67,6 +77,7 @@ class SpinAvailability:
     user_subscription_days: int = 0
     user_balance_kopeks: int = 0
     required_balance_kopeks: int = 0
+    eligible_subscriptions: list[EligibleSubscription] | None = None
 
 
 class FortuneWheelService:
@@ -112,13 +123,34 @@ class FortuneWheelService:
             if user.balance_kopeks >= required_balance_kopeks:
                 can_pay_stars = True
 
+        eligible_subs: list[EligibleSubscription] = []
         if config.spin_cost_days_enabled:
-            subscription = await get_subscription_by_user_id(db, user.id)
-            if subscription and subscription.is_active:
-                user_subscription_days = subscription.days_left
-                # Нужно оставить минимум min_subscription_days_for_day_payment дней после оплаты
-                if user_subscription_days >= config.min_subscription_days_for_day_payment + config.spin_cost_days:
-                    can_pay_days = True
+            if settings.is_multi_tariff_enabled():
+                from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+                active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+            else:
+                _single = await get_subscription_by_user_id(db, user.id)
+                active_subs = [_single] if _single else []
+
+            min_days_required = config.min_subscription_days_for_day_payment + config.spin_cost_days
+            for sub in active_subs:
+                if not sub.is_active:
+                    continue
+                # Exclude daily tariffs — they can't pay with days
+                is_daily = sub.tariff and getattr(sub.tariff, 'is_daily', False)
+                if is_daily:
+                    continue
+                if sub.days_left >= min_days_required:
+                    tariff_name = sub.tariff.name if sub.tariff else None
+                    eligible_subs.append(
+                        EligibleSubscription(id=sub.id, tariff_name=tariff_name, days_left=sub.days_left)
+                    )
+
+            if eligible_subs:
+                can_pay_days = True
+                # For backward compat: use best subscription's days
+                user_subscription_days = max(s.days_left for s in eligible_subs)
 
         if not can_pay_stars and not can_pay_days:
             # Определяем причину
@@ -136,6 +168,7 @@ class FortuneWheelService:
                 user_subscription_days=user_subscription_days,
                 user_balance_kopeks=user.balance_kopeks,
                 required_balance_kopeks=required_balance_kopeks,
+                eligible_subscriptions=eligible_subs or None,
             )
 
         # Проверяем наличие призов
@@ -155,6 +188,7 @@ class FortuneWheelService:
             user_subscription_days=user_subscription_days,
             user_balance_kopeks=user.balance_kopeks,
             required_balance_kopeks=required_balance_kopeks,
+            eligible_subscriptions=eligible_subs or None,
         )
 
     def calculate_prize_probabilities(
@@ -294,12 +328,17 @@ class FortuneWheelService:
 
         return kopeks
 
-    async def _process_days_payment(self, db: AsyncSession, user: User, config: WheelConfig) -> int:
+    async def _process_days_payment(
+        self, db: AsyncSession, user: User, config: WheelConfig, subscription: Subscription | None = None
+    ) -> int:
         """
         Обработать оплату днями подписки.
         Возвращает эквивалент в копейках.
         """
-        subscription = await get_subscription_by_user_id(db, user.id)
+        if not subscription:
+            if settings.is_multi_tariff_enabled():
+                raise ValueError('Необходимо указать подписку для оплаты днями (мульти-тариф)')
+            subscription = await get_subscription_by_user_id(db, user.id)
 
         if not subscription or not subscription.is_active:
             raise ValueError('Нет активной подписки')
@@ -334,7 +373,14 @@ class FortuneWheelService:
 
         return kopeks
 
-    async def _apply_prize(self, db: AsyncSession, user: User, prize: WheelPrize, config: WheelConfig) -> str | None:
+    async def _apply_prize(
+        self,
+        db: AsyncSession,
+        user: User,
+        prize: WheelPrize,
+        config: WheelConfig,
+        subscription: Subscription | None = None,
+    ) -> str | None:
         """
         Применить приз к пользователю.
         Возвращает промокод (если приз - промокод), иначе None.
@@ -353,6 +399,7 @@ class FortuneWheelService:
                 prize.prize_value,
                 description=f'Выигрыш в колесе удачи: {prize.prize_value / 100:.2f}₽',
                 create_transaction=True,
+                commit=False,
             )
             logger.info(
                 '💰 Начислено ₽ на баланс user_id', prize_value=round(prize.prize_value / 100, 2), user_id=user.id
@@ -360,8 +407,25 @@ class FortuneWheelService:
             return None
 
         if prize_type == WheelPrizeType.SUBSCRIPTION_DAYS.value:
-            # Дни подписки
-            subscription = await get_subscription_by_user_id(db, user.id)
+            # Дни подписки — use provided subscription or fallback
+            if not subscription:
+                if settings.is_multi_tariff_enabled():
+                    # Multi-tariff: нельзя выбрать произвольную подписку, начисляем на баланс
+                    await add_user_balance(
+                        db,
+                        user,
+                        prize.prize_value_kopeks,
+                        description=f'Выигрыш в колесе удачи: {prize.prize_value} дней (на баланс, мульти-тариф)',
+                        create_transaction=True,
+                        commit=False,
+                    )
+                    logger.info(
+                        'Мульти-тариф: дни конвертированы в баланс (подписка не указана)',
+                        prize_value=prize.prize_value,
+                        user_id=user.id,
+                    )
+                    return None
+                subscription = await get_subscription_by_user_id(db, user.id)
             if subscription:
                 # Проверяем суточный тариф - для него конвертируем дни в баланс
                 is_daily = getattr(subscription, 'is_daily', False) or (
@@ -382,6 +446,7 @@ class FortuneWheelService:
                             balance_bonus,
                             description=f'Выигрыш в колесе удачи: {prize.prize_value} дней → {balance_bonus / 100:.2f}₽',
                             create_transaction=True,
+                            commit=False,
                         )
                         logger.info(
                             '💰 Суточный тариф: дней конвертированы в ₽ для user_id',
@@ -397,12 +462,21 @@ class FortuneWheelService:
                             prize.prize_value_kopeks,
                             description=f'Выигрыш в колесе удачи: {prize.prize_value} дней (на баланс)',
                             create_transaction=True,
+                            commit=False,
                         )
                         logger.info('💰 Дни конвертированы в баланс для user_id', user_id=user.id)
                 else:
+                    # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+                    from app.services.grace_access_echo import undo_grace_overlay_echo
+
+                    await undo_grace_overlay_echo(db, subscription)
                     # Обычная подписка - добавляем дни и синхронизируем с RemnaWave
                     subscription.end_date += timedelta(days=prize.prize_value)
                     subscription.updated_at = datetime.now(UTC)
+                    # Условия тарифа на новый срок: база тарифа + активные докупки.
+                    from app.database.crud.subscription import reconcile_tariff_traffic_limit
+
+                    await reconcile_tariff_traffic_limit(db, subscription)
                     logger.info('📅 Начислено дней подписки user_id', prize_value=prize.prize_value, user_id=user.id)
 
                     # Синхронизируем с RemnaWave
@@ -420,13 +494,31 @@ class FortuneWheelService:
                     prize.prize_value_kopeks,
                     description=f'Выигрыш в колесе удачи: {prize.prize_value} дней (на баланс)',
                     create_transaction=True,
+                    commit=False,
                 )
                 logger.info('💰 Дни конвертированы в баланс для user_id', user_id=user.id)
             return None
 
         if prize_type == WheelPrizeType.TRAFFIC_GB.value:
-            # Бонусный трафик
-            subscription = await get_subscription_by_user_id(db, user.id)
+            # Бонусный трафик — use provided subscription or fallback
+            if not subscription:
+                if settings.is_multi_tariff_enabled():
+                    # Multi-tariff: нельзя выбрать произвольную подписку, начисляем на баланс
+                    await add_user_balance(
+                        db,
+                        user,
+                        prize.prize_value_kopeks,
+                        description=f'Выигрыш в колесе удачи: {prize.prize_value}GB (на баланс, мульти-тариф)',
+                        create_transaction=True,
+                        commit=False,
+                    )
+                    logger.info(
+                        'Мульти-тариф: трафик конвертирован в баланс (подписка не указана)',
+                        prize_value=prize.prize_value,
+                        user_id=user.id,
+                    )
+                    return None
+                subscription = await get_subscription_by_user_id(db, user.id)
             if subscription and subscription.traffic_limit_gb > 0:
                 subscription.traffic_limit_gb += prize.prize_value
                 subscription.updated_at = datetime.now(UTC)
@@ -447,6 +539,7 @@ class FortuneWheelService:
                     prize.prize_value_kopeks,
                     description=f'Выигрыш в колесе удачи: {prize.prize_value}GB (на баланс)',
                     create_transaction=True,
+                    commit=False,
                 )
             return None
 
@@ -487,7 +580,9 @@ class FortuneWheelService:
 
         return promocode
 
-    async def spin(self, db: AsyncSession, user: User, payment_type: str) -> SpinResult:
+    async def spin(
+        self, db: AsyncSession, user: User, payment_type: str, *, subscription_id: int | None = None
+    ) -> SpinResult:
         """
         Выполнить спин колеса.
 
@@ -519,6 +614,55 @@ class FortuneWheelService:
                     message='Призы не настроены',
                 )
 
+            # Serialize all of this user's spins on the user row and re-check the
+            # daily limit *under the lock*. The up-front check in check_availability
+            # races with concurrent POST /wheel/spin requests (TOCTTOU): each request
+            # gets its own session, all read the same spins_today before any commits,
+            # and all pass. Holding this lock through create_wheel_spin — the prize
+            # grants below use commit=False so the whole spin is ONE transaction —
+            # makes a second concurrent spin block here until the first commits, then
+            # observe the updated count. It also serializes the days-payment
+            # read-modify-write on the subscription (no lost update).
+            from app.database.crud.user import lock_user_for_update
+
+            user = await lock_user_for_update(db, user)
+            if config.daily_spin_limit > 0:
+                spins_today = await get_user_spins_today(db, user.id)
+                if spins_today >= config.daily_spin_limit:
+                    return SpinResult(
+                        success=False,
+                        error='daily_limit_reached',
+                        message=self._get_error_message('daily_limit_reached'),
+                    )
+
+            # Resolve target subscription for days payment and prize application
+            target_subscription = None
+            if subscription_id:
+                from app.database.crud.subscription import get_subscription_by_id_for_user
+
+                target_subscription = await get_subscription_by_id_for_user(db, subscription_id, user.id)
+                if not target_subscription or not target_subscription.is_active:
+                    return SpinResult(
+                        success=False,
+                        error='invalid_subscription',
+                        message='Подписка не найдена или неактивна',
+                    )
+            elif not settings.is_multi_tariff_enabled():
+                # Single-tariff: auto-resolve
+                target_subscription = await get_subscription_by_user_id(db, user.id)
+
+            # Multi-tariff guard: subscription_id is required for days payment
+            if (
+                settings.is_multi_tariff_enabled()
+                and not target_subscription
+                and payment_type == WheelSpinPaymentType.SUBSCRIPTION_DAYS.value
+            ):
+                return SpinResult(
+                    success=False,
+                    error='subscription_required',
+                    message='Выберите подписку для оплаты днями',
+                )
+
             # 2. Обрабатываем оплату
             if payment_type == WheelSpinPaymentType.TELEGRAM_STARS.value:
                 if not availability.can_pay_stars:
@@ -537,7 +681,7 @@ class FortuneWheelService:
                         message='Оплата днями подписки недоступна',
                     )
                 payment_amount = config.spin_cost_days
-                payment_value_kopeks = await self._process_days_payment(db, user, config)
+                payment_value_kopeks = await self._process_days_payment(db, user, config, target_subscription)
             else:
                 return SpinResult(
                     success=False,
@@ -553,7 +697,7 @@ class FortuneWheelService:
             rotation = self._calculate_rotation(prizes, selected_prize)
 
             # 5. Применяем приз
-            generated_promocode = await self._apply_prize(db, user, selected_prize, config)
+            generated_promocode = await self._apply_prize(db, user, selected_prize, config, target_subscription)
             promocode_id = None
             if generated_promocode:
                 # Получаем ID промокода

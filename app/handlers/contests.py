@@ -8,8 +8,9 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.crud.contest import get_active_rounds, get_attempt
-from app.database.crud.subscription import get_subscription_by_user_id
+from app.database.crud.subscription import get_active_subscriptions_by_user_id
 from app.database.database import AsyncSessionLocal
 from app.database.models import SubscriptionStatus
 from app.keyboards.inline import get_back_keyboard
@@ -87,16 +88,17 @@ async def _reply_not_eligible(callback: types.CallbackQuery, language: str):
 # ---------- Handlers ----------
 
 
-@auth_required
-@error_handler
-async def show_contests_menu(callback: types.CallbackQuery, db_user, db: AsyncSession):
-    """Show menu with available contest games."""
+async def _build_contests_menu_view(db: AsyncSession, db_user) -> tuple[str, types.InlineKeyboardMarkup] | None:
+    """Build the contests menu (text, keyboard). Returns None if the user is not eligible."""
     texts = get_texts(db_user.language)
 
-    subscription = await get_subscription_by_user_id(db, db_user.id)
+    active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+    # For eligibility: pick best non-daily subscription (most days left)
+    non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+    eligible = non_daily or active_subs
+    subscription = max(eligible, key=lambda s: s.days_left) if eligible else None
     if not _user_allowed(subscription):
-        await _reply_not_eligible(callback, db_user.language)
-        return
+        return None
 
     active_rounds = await get_active_rounds(db)
 
@@ -133,10 +135,57 @@ async def show_contests_menu(callback: types.CallbackQuery, db_user, db: AsyncSe
 
     buttons.append([types.InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')])
 
-    await callback.message.edit_text(
+    return (
         texts.t('CONTEST_MENU_TITLE', '🎲 <b>Игры/Конкурсы</b>\nВыберите игру:'),
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons),
+        types.InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+async def open_contests_menu_message(message: types.Message, db_user, db: AsyncSession) -> None:
+    """Send the contests menu as a fresh message — entry point for the
+    ``/contests`` command and the ``/start contests`` deep link (the channel
+    announcement button opens the bot here, where the menu actually works)."""
+    if not db_user:
+        return
+    view = await _build_contests_menu_view(db, db_user)
+    texts = get_texts(db_user.language)
+    if view is None:
+        await message.answer(
+            texts.t('CONTEST_NOT_ELIGIBLE', 'Игры доступны только с активной или триальной подпиской.')
+        )
+        return
+    text, keyboard = view
+    await message.answer(text, reply_markup=keyboard)
+
+
+@auth_required
+@error_handler
+async def cmd_contests(message: types.Message, db_user, db: AsyncSession):
+    """`/contests` command: open the contests menu."""
+    await open_contests_menu_message(message, db_user, db)
+
+
+@auth_required
+@error_handler
+async def show_contests_menu(callback: types.CallbackQuery, db_user, db: AsyncSession):
+    """Show menu with available contest games."""
+    # Contests announced BEFORE the deep-link fix have this callback button on a
+    # channel post, where a callback can't render a personal menu. Redirect the
+    # clicker to open the bot instead — answerCallbackQuery accepts a
+    # t.me/{bot}?start=... link, which lands on the cmd_start contests handler.
+    chat = callback.message.chat if callback.message else None
+    if chat is not None and chat.type != 'private':
+        bot_username = settings.get_bot_username()
+        if bot_username:
+            await callback.answer(url=f'https://t.me/{bot_username}?start=contests')
+            return
+
+    view = await _build_contests_menu_view(db, db_user)
+    if view is None:
+        await _reply_not_eligible(callback, db_user.language)
+        return
+    text, keyboard = view
+    await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
 
@@ -146,7 +195,11 @@ async def play_contest(callback: types.CallbackQuery, state: FSMContext, db_user
     """Start playing a specific contest."""
     texts = get_texts(db_user.language)
 
-    subscription = await get_subscription_by_user_id(db, db_user.id)
+    active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+    # For eligibility: pick best non-daily subscription (most days left)
+    non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+    eligible = non_daily or active_subs
+    subscription = max(eligible, key=lambda s: s.days_left) if eligible else None
     if not _user_allowed(subscription):
         await _reply_not_eligible(callback, db_user.language)
         return
@@ -260,7 +313,11 @@ async def handle_pick(callback: types.CallbackQuery, db_user, db: AsyncSession):
         return
 
     # Re-check subscription
-    subscription = await get_subscription_by_user_id(db, db_user.id)
+    active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+    # For eligibility: pick best non-daily subscription (most days left)
+    non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+    eligible = non_daily or active_subs
+    subscription = max(eligible, key=lambda s: s.days_left) if eligible else None
     if not _user_allowed(subscription):
         await callback.answer(
             texts.t('CONTEST_NOT_ELIGIBLE', 'Игра недоступна без активной подписки.'),
@@ -339,4 +396,4 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(play_contest, F.data.startswith('contest_play_'))
     dp.callback_query.register(handle_pick, F.data.startswith('contest_pick_'))
     dp.message.register(handle_text_answer, ContestStates.waiting_for_answer)
-    dp.message.register(lambda message: None, Command('contests'))  # placeholder
+    dp.message.register(cmd_contests, Command('contests'))

@@ -1,3 +1,4 @@
+import html
 import traceback
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,9 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 
 from app.config import settings
 from app.services.startup_notification_service import _get_error_recommendations
+from app.utils.rich_admin import RICH_TEXT_LIMIT, rich_footer_now, rich_traceback_details, try_send_rich_admin_message
+from app.utils.telegram_delivery import BOT_BLOCKED_PHRASE, CHAT_NOT_FOUND_PHRASE, USER_DEACTIVATED_PHRASE
+from app.utils.telegram_errors import STALE_CALLBACK_QUERY_PHRASES
 from app.utils.timezone import format_local_datetime
 
 
@@ -27,11 +31,7 @@ DATETIME_FORMAT_FILENAME: Final[str] = '%Y%m%d_%H%M%S'
 DEVELOPER_CONTACT_URL: Final[str] = 'https://t.me/fringg'
 
 # Фразы ошибок Telegram API
-OLD_QUERY_PHRASES: Final[tuple[str, ...]] = (
-    'query is too old',
-    'query id is invalid',
-    'response timeout expired',
-)
+OLD_QUERY_PHRASES: Final[tuple[str, ...]] = STALE_CALLBACK_QUERY_PHRASES
 BAD_REQUEST_PHRASES: Final[tuple[str, ...]] = (
     'message not found',
     'chat not found',
@@ -45,9 +45,7 @@ TOPIC_ERROR_PHRASES: Final[tuple[str, ...]] = (
     'forum_closed',
 )
 MESSAGE_NOT_MODIFIED_PHRASE: Final[str] = 'message is not modified'
-BOT_BLOCKED_PHRASE: Final[str] = 'bot was blocked'
-USER_DEACTIVATED_PHRASE: Final[str] = 'user is deactivated'
-CHAT_NOT_FOUND_PHRASE: Final[str] = 'chat not found'
+# Маркеры недоступности пользователя — один источник: app.utils.telegram_delivery.
 MESSAGE_NOT_FOUND_PHRASE: Final[str] = 'message not found'
 
 # Троттлинг для предотвращения спама ошибками
@@ -73,7 +71,7 @@ class GlobalErrorMiddleware(BaseMiddleware):
             raise
         except Exception as e:
             user_info = self._get_user_info(event)
-            logger.error('Неожиданная ошибка в GlobalErrorMiddleware (user=)', user_info=user_info, e=e, exc_info=True)
+            logger.error('Неожиданная ошибка в GlobalErrorMiddleware', user_info=user_info, e=e, exc_info=True)
             raise
 
     async def _handle_telegram_error(self, event: TelegramObject, error: TelegramBadRequest, data: dict[str, Any]):
@@ -92,7 +90,7 @@ class GlobalErrorMiddleware(BaseMiddleware):
 
         # Неизвестная ошибка — логируем
         user_info = self._get_user_info(event)
-        logger.error('Неизвестная Telegram API ошибка (user=)', user_info=user_info, error=error)
+        logger.error('Неизвестная Telegram API ошибка', user_info=user_info, error=error)
         raise error
 
     def _is_old_query_error(self, error_message: str) -> bool:
@@ -111,7 +109,7 @@ class GlobalErrorMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery):
             user_info = self._get_user_info(event)
             logger.warning(
-                "[GlobalErrorMiddleware] Игнорируем устаревший callback '' от",
+                '[GlobalErrorMiddleware] Игнорируем устаревший callback',
                 event_data=event.data,
                 user_info=user_info,
             )
@@ -146,7 +144,7 @@ class GlobalErrorMiddleware(BaseMiddleware):
             logger.warning('[GlobalErrorMiddleware] Чат или сообщение не найдено', error=error)
             return
         user_info = self._get_user_info(event)
-        logger.error('[GlobalErrorMiddleware] Неизвестная bad request ошибка (user=)', user_info=user_info, error=error)
+        logger.error('[GlobalErrorMiddleware] Неизвестная bad request ошибка', user_info=user_info, error=error)
         raise error
 
     def _get_user_info(self, event: TelegramObject) -> str:
@@ -201,9 +199,49 @@ class ErrorStatisticsMiddleware(BaseMiddleware):
             self.error_counts[key] = 0
 
 
+def _looks_like_traceback(text: str) -> bool:
+    return text.lstrip().startswith('Traceback') or '\n  File ' in text
+
+
+def _build_rich_error_report(now: datetime, error_type: str, context: str) -> str | None:
+    """Rich-отчёт об ошибках: шапка + сворачиваемые трейсбеки всех ошибок буфера.
+
+    None — отчёт не влезает в лимит rich-сообщения (классический путь отправит
+    его .txt-файлом без потерь).
+    """
+    blocks = [
+        '<h6>⚠️ Ошибка во время работы</h6><hr/>',
+        f'<p><b>Тип:</b> <code>{html.escape(error_type)}</code> · <b>Ошибок в отчёте:</b> {len(_error_buffer)}</p>',
+    ]
+    if context:
+        blocks.append(f'<p><b>Контекст:</b> {context}</p>')
+
+    recommendations = _get_error_recommendations(_error_buffer[-1][1] if _error_buffer else '')
+    if recommendations:
+        blocks.append(f'<blockquote>{recommendations}</blockquote>')
+
+    # Последняя (свежая) ошибка — развёрнута, остальные из буфера — свёрнуты.
+    # Запись без трейса (ожидаемый отказ доставки, «traceback недоступен») —
+    # обычный абзац, а не блок кода с одной строкой.
+    for index, (err_type, err_msg, err_tb) in enumerate(reversed(_error_buffer)):
+        summary = f'📋 {err_type}: {err_msg[:80]}' if err_msg else f'📋 {err_type}'
+        if _looks_like_traceback(err_tb):
+            blocks.append(rich_traceback_details(summary, err_tb, open_by_default=index == 0))
+        else:
+            blocks.append(f'<p>{html.escape(summary)}<br/>{html.escape(err_tb)}</p>')
+
+    blocks.append('<hr/>')
+    blocks.append(rich_footer_now())
+
+    rich_html = ''.join(blocks)
+    if len(rich_html) > RICH_TEXT_LIMIT:
+        return None
+    return rich_html
+
+
 async def send_error_to_admin_chat(
     bot: Bot, error: Exception, context: str = '', tb_override: str | None = None
-) -> bool:
+) -> str:
     """
     Отправляет уведомление об ошибке в админский чат с троттлингом.
 
@@ -214,7 +252,12 @@ async def send_error_to_admin_chat(
         tb_override: Готовый traceback (если вызывается не из except-блока)
 
     Returns:
-        bool: True если уведомление отправлено
+        str: исход доставки — 'sent' | 'throttled' | 'skipped' | 'failed'.
+
+        Раньше возвращался bool, но False означал сразу три разных вещи:
+        уведомления выключены, сработал троттлинг, реальный провал отправки.
+        Для записи в system_error_events их надо различать — иначе штатное
+        подавление дубликата выглядит как авария.
     """
     global _last_error_notification
 
@@ -226,7 +269,7 @@ async def send_error_to_admin_chat(
     enabled = getattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', False)
 
     if not enabled or not chat_id:
-        return False
+        return 'skipped'
 
     error_type = type(error).__name__
     error_message = str(error)[:ERROR_MESSAGE_MAX_LENGTH]
@@ -243,9 +286,36 @@ async def send_error_to_admin_chat(
     now = datetime.now(tz=UTC)
     if _last_error_notification and (now - _last_error_notification) < _error_notification_cooldown:
         logger.debug('Ошибка добавлена в буфер, троттлинг активен', error_type=error_type)
-        return False
+        return 'throttled'
 
     _last_error_notification = now
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text='💬 Сообщить разработчику',
+                    url=DEVELOPER_CONTACT_URL,
+                ),
+            ],
+        ]
+    )
+
+    # Rich-вид (Bot API 10.1): трейсбеки инлайн в сворачиваемых блоках с
+    # подсветкой — лимит rich-сообщения 32768 символов против 1024 у caption,
+    # так что .txt-файл не нужен. При недоступности/переполнении — классический
+    # путь с файлом ниже.
+    try:
+        rich_html = _build_rich_error_report(now, error_type, context)
+        if rich_html and await try_send_rich_admin_message(
+            bot, chat_id, rich_html, thread_id=topic_id, reply_markup=keyboard
+        ):
+            _error_buffer.clear()
+            logger.info('Rich-уведомление об ошибке отправлено в чат', chat_id=chat_id)
+            return 'sent'
+    except Exception as rich_error:
+        # warning + строка: error-уровень отсюда сам бы ушёл в этот конвейер
+        logger.warning('Сбой rich-рендера отчёта об ошибке', error=str(rich_error))
 
     try:
         timestamp = format_local_datetime(now, DATETIME_FORMAT)
@@ -287,7 +357,7 @@ async def send_error_to_admin_chat(
         message_text = (
             f'<b>Remnawave Bedolaga Bot</b>\n\n'
             f'⚠️ Ошибка во время работы\n\n'
-            f'<b>Тип:</b> <code>{error_type}</code>\n'
+            f'<b>Тип:</b> <code>{html.escape(error_type)}</code>\n'
             f'<b>Ошибок в отчёте:</b> {errors_count}\n'
         )
         if context:
@@ -299,17 +369,6 @@ async def send_error_to_admin_chat(
             message_text += f'\n{recommendations}\n'
 
         message_text += f'\n<i>{timestamp}</i>'
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text='💬 Сообщить разработчику',
-                        url=DEVELOPER_CONTACT_URL,
-                    ),
-                ],
-            ]
-        )
 
         message_kwargs: dict = {
             'chat_id': chat_id,
@@ -325,8 +384,8 @@ async def send_error_to_admin_chat(
         await bot.send_document(**message_kwargs)
         _error_buffer.clear()  # Clear only after successful send
         logger.info('Уведомление об ошибке отправлено в чат', chat_id=chat_id)
-        return True
+        return 'sent'
 
     except Exception as e:
         logger.error('Ошибка отправки уведомления об ошибке', e=e, _admin_notified=True)
-        return False
+        return 'failed'

@@ -4,6 +4,7 @@ from typing import Any
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.crud.promo_group import get_promo_group_by_id
 from app.database.crud.promocode import (
     check_user_promocode_usage,
@@ -14,12 +15,21 @@ from app.database.crud.promocode import (
 from app.database.crud.subscription import extend_subscription, get_subscription_by_user_id
 from app.database.crud.user import add_user_balance, get_user_by_id
 from app.database.crud.user_promo_group import add_user_to_promo_group, has_user_promo_group
-from app.database.models import PromoCode, PromoCodeType, SubscriptionStatus, User
+from app.database.models import PromoCode, PromoCodeType, Subscription, SubscriptionStatus, User
 from app.services.remnawave_service import RemnaWaveService
 from app.services.subscription_service import SubscriptionService
 
 
 logger = structlog.get_logger(__name__)
+
+
+class _SelectSubscriptionRequired(Exception):
+    """Raised when multi-tariff promo requires user to select a subscription."""
+
+    def __init__(self, eligible_subscriptions: list[dict], code: str):
+        self.eligible_subscriptions = eligible_subscriptions
+        self.code = code
+        super().__init__('select_subscription')
 
 
 class PromoCodeService:
@@ -36,7 +46,28 @@ class PromoCodeService:
             return f'{user.id} ({user.email})'
         return f'#{user.id}'
 
-    async def activate_promocode(self, db: AsyncSession, user_id: int, code: str) -> dict[str, Any]:
+    @staticmethod
+    async def _rollback_keeping_user_usable(db: AsyncSession, user: User | None) -> None:
+        """Rollback, после которого ORM-объект юзера остаётся пригодным для вызывающего.
+
+        ``rollback()`` экспирирует все объекты сессии — включая ``db_user`` хендлера
+        (та же сессия → identity map → тот же инстанс). Без refresh последующий доступ
+        к атрибутам (``db_user.language`` в error-ветке) запускает ленивую догрузку вне
+        greenlet-моста и падает ``MissingGreenlet`` вместо сообщения об ошибке.
+        """
+        await db.rollback()
+        if user is None:
+            return
+        try:
+            await db.refresh(user)
+        except Exception as refresh_error:
+            # Best-effort: недоступная БД не должна маскировать исходную ошибку активации
+            logger.warning('Не удалось перечитать пользователя после rollback', error=refresh_error)
+
+    async def activate_promocode(
+        self, db: AsyncSession, user_id: int, code: str, *, subscription_id: int | None = None
+    ) -> dict[str, Any]:
+        user: User | None = None
         try:
             user = await get_user_by_id(db, user_id)
             if not user:
@@ -49,6 +80,14 @@ class PromoCodeService:
             if not promocode.is_valid:
                 if promocode.current_uses >= promocode.max_uses:
                     return {'success': False, 'error': 'used'}
+                if not promocode.is_active:
+                    return {'success': False, 'error': 'inactive'}
+                from app.database.models import _aware
+
+                now = datetime.now(UTC)
+                aware_from = _aware(promocode.valid_from)
+                if aware_from is not None and aware_from > now:
+                    return {'success': False, 'error': 'not_yet_valid'}
                 return {'success': False, 'error': 'expired'}
 
             existing_use = await check_user_promocode_usage(db, user_id, promocode.id)
@@ -79,23 +118,60 @@ class PromoCodeService:
             if promo_use is None:
                 return {'success': False, 'error': 'already_used_by_user'}
 
+            # Atomically CLAIM a usage slot before applying any effect. The conditional
+            # UPDATE (current_uses < max_uses) takes a row lock, so concurrent activations
+            # by DIFFERENT users can never push current_uses past max_uses (cross-user
+            # TOCTOU). Claiming up-front (rather than after effects) also guarantees the
+            # counter and the effect are committed together: the effect helpers below
+            # commit internally, flushing this increment in the same transaction, so the
+            # counter can never be skipped after an effect already landed.
+            from sqlalchemy import update as sql_update
+
+            claim = await db.execute(
+                sql_update(PromoCode)
+                .where(PromoCode.id == promocode.id, PromoCode.current_uses < PromoCode.max_uses)
+                .values(current_uses=PromoCode.current_uses + 1)
+            )
+            if claim.rowcount == 0:
+                # Lost the race / fully used between the is_valid read and now.
+                await self._rollback_keeping_user_usable(db, user)
+                return {'success': False, 'error': 'used'}
+
             try:
-                result_description = await self._apply_promocode_effects(db, user, promocode)
+                result_description = await self._apply_promocode_effects(
+                    db, user, promocode, subscription_id=subscription_id
+                )
+            except _SelectSubscriptionRequired as e:
+                # Мульти-тариф: нужен выбор подписки — откатываем резерв И claim инкремента.
+                await self._rollback_keeping_user_usable(db, user)
+                return {
+                    'success': False,
+                    'error': 'select_subscription',
+                    'eligible_subscriptions': e.eligible_subscriptions,
+                    'code': e.code,
+                }
             except ValueError as e:
-                # Эффекты не применены — удаляем зарезервированную запись использования
-                async with db.begin_nested():
-                    await db.delete(promo_use)
-                    await db.flush()
+                # Эффект не применён — откатываем резерв использования И claim инкремента.
+                # (trial_provisioning_failed уже сделал свою компенсацию + commit до raise,
+                # поэтому здесь rollback для него — no-op, что и требуется.)
+                await self._rollback_keeping_user_usable(db, user)
                 error_key = str(e)
                 if error_key in (
                     'active_discount_exists',
                     'no_subscription_for_days',
+                    'subscription_not_found',
+                    'trial_subscription_exists',
+                    'trial_provisioning_failed',
+                    'traffic_not_applicable',
                 ):
                     return {'success': False, 'error': error_key}
                 raise
             balance_after_kopeks = user.balance_kopeks
 
-            if promocode.type == PromoCodeType.SUBSCRIPTION_DAYS.value and promocode.subscription_days > 0:
+            if (
+                promocode.type in (PromoCodeType.SUBSCRIPTION_DAYS.value, PromoCodeType.BALANCE_AND_DAYS.value)
+                and promocode.subscription_days > 0
+            ):
                 from app.utils.user_utils import mark_user_as_had_paid_subscription
 
                 await mark_user_as_had_paid_subscription(db, user)
@@ -123,7 +199,7 @@ class PromoCodeService:
                             )
 
                             logger.info(
-                                '🎯 Пользователю назначена промогруппа (приоритет: ) через промокод',
+                                '🎯 Пользователю назначена промогруппа через промокод',
                                 _format_user_log=self._format_user_log(user),
                                 promo_group_name=promo_group.name,
                                 priority=promo_group.priority,
@@ -140,7 +216,7 @@ class PromoCodeService:
                             )
                     else:
                         logger.info(
-                            'ℹ️ Пользователь уже имеет промогруппу ID',
+                            'ℹ️ Пользователь уже состоит в промогруппе',
                             _format_user_log=self._format_user_log(user),
                             promo_group_id=promocode.promo_group_id,
                         )
@@ -153,13 +229,10 @@ class PromoCodeService:
                     )
                     # Don't fail the whole promocode activation if promo group assignment fails
 
-            from sqlalchemy import update as sql_update
-
-            await db.execute(
-                sql_update(PromoCode)
-                .where(PromoCode.id == promocode.id)
-                .values(current_uses=PromoCode.current_uses + 1)
-            )
+            # The usage slot was already claimed atomically up-front (see above); just
+            # commit whatever is still staged (effects that used commit=False, promo-group
+            # assignment, the paid-subscription flag). The effect helpers may have already
+            # committed, in which case this is a harmless no-op.
             await db.commit()
 
             logger.info('✅ Пользователь активировал промокод', _format_user_log=self._format_user_log(user), code=code)
@@ -170,7 +243,7 @@ class PromoCodeService:
                 'balance_bonus_kopeks': promocode.balance_bonus_kopeks,
                 'subscription_days': promocode.subscription_days,
                 'max_uses': promocode.max_uses,
-                'current_uses': promocode.current_uses,
+                'current_uses': promocode.current_uses + 1,  # +1 because we just incremented atomically
                 'valid_until': promocode.valid_until,
                 'promo_group_id': promocode.promo_group_id,
             }
@@ -185,10 +258,82 @@ class PromoCodeService:
 
         except Exception as e:
             logger.error('Ошибка активации промокода для пользователя', code=code, user_id=user_id, error=e)
-            await db.rollback()
+            await self._rollback_keeping_user_usable(db, user)
             return {'success': False, 'error': 'server_error'}
 
-    async def _apply_promocode_effects(self, db: AsyncSession, user: User, promocode: PromoCode) -> str:
+    async def _pick_target_subscription(
+        self,
+        db: AsyncSession,
+        user: User,
+        promocode: PromoCode,
+        subscription_id: int | None,
+    ) -> Subscription:
+        """Подписка, к которой применяются бонусы промокода: дни и трафик.
+
+        В мультитарифе подходящих может быть несколько — тогда просим
+        пользователя выбрать: угадывать нельзя, бонус уйдёт не туда.
+        Код ошибки общий с днями — снаружи он уже переведён как
+        «нужна активная или истёкшая подписка», что верно и для трафика.
+        """
+        if settings.is_multi_tariff_enabled():
+            from app.database.crud.subscription import (
+                get_active_subscriptions_by_user_id,
+                get_all_subscriptions_by_user_id,
+            )
+
+            active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+            if not active_subs:
+                # Parity with classic/single mode, which extend the primary sub
+                # via get_subscription_by_user_id (ANY status — incl. EXPIRED and
+                # DISABLED). get_active_* excludes both, so a lapsed multi-tariff
+                # user would hit no_subscription_for_days despite the explicit
+                # "active or expired" promise. extend_subscription revives
+                # EXPIRED/DISABLED→ACTIVE, so fall back to those here too (full
+                # parity with classic/single, which already revive DISABLED).
+                all_subs = await get_all_subscriptions_by_user_id(db, user.id)
+                active_subs = [
+                    s
+                    for s in all_subs
+                    if s.status in (SubscriptionStatus.EXPIRED.value, SubscriptionStatus.DISABLED.value)
+                ]
+        else:
+            single_sub = await get_subscription_by_user_id(db, user.id)
+            active_subs = [single_sub] if single_sub else []
+
+        if not active_subs:
+            raise ValueError('no_subscription_for_days')
+
+        # Multi-tariff: require subscription selection if >1 non-daily subscriptions
+        non_daily = [s for s in active_subs if not (s.tariff and getattr(s.tariff, 'is_daily', False))]
+        eligible = non_daily or active_subs
+
+        if subscription_id:
+            target_sub = next((s for s in eligible if s.id == subscription_id), None)
+            if not target_sub:
+                raise ValueError('subscription_not_found')
+        elif len(eligible) == 1:
+            target_sub = eligible[0]
+        elif len(eligible) > 1 and settings.is_multi_tariff_enabled():
+            # Need user to choose — raise with eligible subscriptions list
+            raise _SelectSubscriptionRequired(
+                eligible_subscriptions=[
+                    {'id': s.id, 'tariff_name': s.tariff.name if s.tariff else f'#{s.id}', 'days_left': s.days_left}
+                    for s in eligible
+                ],
+                code=promocode.code,
+            )
+        # Prefer non-daily subscription with most days remaining
+        elif eligible:
+            target_sub = max(eligible, key=lambda s: s.days_left)
+        else:
+            # eligible = non_daily or active_subs, active_subs is guaranteed non-empty (guard above)
+            # This branch is unreachable, but defend against future changes
+            raise ValueError('no_subscription_for_days')
+        return target_sub
+
+    async def _apply_promocode_effects(
+        self, db: AsyncSession, user: User, promocode: PromoCode, *, subscription_id: int | None = None
+    ) -> str:
         """
         Применяет эффекты промокода к пользователю.
 
@@ -215,7 +360,7 @@ class PromoCodeService:
             if current_discount > 0:
                 if expires_at is None or expires_at > datetime.now(UTC):
                     logger.warning(
-                        '⚠️ Пользователь попытался активировать промокод но у него уже есть активная скидка до',
+                        '⚠️ Пользователь попытался активировать промокод, но у него уже есть активная скидка',
                         _format_user_log=self._format_user_log(user),
                         code=promocode.code,
                         current_discount=current_discount,
@@ -244,80 +389,257 @@ class PromoCodeService:
             await db.flush()
 
             logger.info(
-                '✅ Пользователю назначена скидка (срок: ч.) по промокоду',
+                '✅ Пользователю назначена скидка по промокоду',
                 _format_user_log=self._format_user_log(user),
                 discount_percent=discount_percent,
                 discount_hours=discount_hours,
                 code=promocode.code,
             )
 
-        if promocode.type == PromoCodeType.BALANCE.value and promocode.balance_bonus_kopeks > 0:
+        # Блок дней идёт ПЕРЕД балансом: дни могут прерваться исключением (нет
+        # подписки, выбор подписки в мульти-тарифе) с rollback'ом всей активации,
+        # а add_user_balance коммитит внутри себя. Для комбинированного
+        # BALANCE_AND_DAYS обратный порядок дарил бы баланс при откате записи
+        # использования — повторная активация задваивала бы бонус. Для одиночных
+        # типов порядок безразличен (типы взаимоисключающие).
+        # Подписку выбираем один раз на активацию: её делят дни и трафик.
+        target_sub: Subscription | None = None
+
+        if (
+            promocode.type in (PromoCodeType.SUBSCRIPTION_DAYS.value, PromoCodeType.BALANCE_AND_DAYS.value)
+            and promocode.subscription_days > 0
+        ):
+            target_sub = await self._pick_target_subscription(db, user, promocode, subscription_id)
+            # NB: a days-promocode is a FREE grant, not a purchase — do NOT flip
+            # is_trial here (bug #629889 class). Converting a trial to is_trial=False
+            # without a charge un-gated it from try_auto_extend_expired_after_topup,
+            # so once the promo days lapsed the trial silently became a self-renewing
+            # paid subscription. extend_subscription already promotes TRIAL→ACTIVE
+            # status on its own (and never touches is_trial when called without a
+            # tariff_id), so the promo days still apply while the subscription
+            # correctly stays a trial and remains gated out of auto-renewal.
+            await extend_subscription(db, target_sub, promocode.subscription_days)
+            await self.subscription_service.update_remnawave_user(db, target_sub)
+
+            tariff_label = ''
+            if settings.is_multi_tariff_enabled() and getattr(target_sub, 'tariff', None):
+                tariff_label = f' «{target_sub.tariff.name}»'
+            effects.append(f'⏰ Подписка{tariff_label} продлена на {promocode.subscription_days} дней')
+            logger.info(
+                '✅ Подписка пользователя продлена на дней в RemnaWave',
+                _format_user_log=self._format_user_log(user),
+                subscription_days=promocode.subscription_days,
+                subscription_id=target_sub.id,
+            )
+
+        # Трафик — часть набора бонусов, поэтому идёт рядом с днями и до
+        # баланса: add_user_balance коммитит внутри себя, а всё, что трогает
+        # подписку, может прерваться исключением с откатом активации.
+        # Целевая подписка та же, что у дней, — второй раз не выбираем,
+        # иначе в мультитарифе можно попасть в разные подписки одним кодом.
+        traffic_gb = getattr(promocode, 'traffic_gb', 0) or 0
+        traffic_skipped_unlimited = False
+        if promocode.type == PromoCodeType.BALANCE_AND_DAYS.value and traffic_gb > 0:
+            from app.database.crud.subscription import add_subscription_traffic, reactivate_subscription
+
+            if target_sub is None:
+                target_sub = await self._pick_target_subscription(db, user, promocode, subscription_id)
+
+            if target_sub.traffic_limit_gb == 0:
+                # Subscription.add_traffic на безлимите ничего не делает. Молча
+                # дописать «пополнен на N ГБ» значит соврать: код сгорит, а
+                # пользователь ничего не получит.
+                traffic_skipped_unlimited = True
+                logger.info(
+                    'Трафик по промокоду не начислен: у подписки безлимит',
+                    _format_user_log=self._format_user_log(user),
+                    traffic_gb=traffic_gb,
+                    subscription_id=target_sub.id,
+                )
+            else:
+                await add_subscription_traffic(db, target_sub, traffic_gb)
+
+                # Трафик чаще всего дарят как раз тому, у кого он кончился, —
+                # такая подписка стоит в LIMITED. Без реактивации гигабайты
+                # лягут в базу, а update_remnawave_user отправит в панель тот же
+                # LIMITED, и доступ не вернётся. Тот же порядок, что во всех
+                # остальных начислениях трафика (handlers/subscription/traffic.py,
+                # handlers/admin/users.py, cabinet/routes/admin_users.py).
+                await reactivate_subscription(db, target_sub)
+                await self.subscription_service.update_remnawave_user(db, target_sub)
+
+                # PATCH не всегда снимает LIMITED — включаем явно.
+                panel_user_id = (
+                    target_sub.remnawave_id
+                    if settings.is_multi_tariff_enabled() and target_sub.remnawave_id
+                    else getattr(user, 'remnawave_id', None)
+                )
+                if panel_user_id and target_sub.status == SubscriptionStatus.ACTIVE.value:
+                    await self.subscription_service.enable_remnawave_user(panel_user_id)
+
+                effects.append(f'📦 Трафик пополнен на {traffic_gb} ГБ')
+                logger.info(
+                    '✅ Пользователю начислен трафик по промокоду',
+                    _format_user_log=self._format_user_log(user),
+                    traffic_gb=traffic_gb,
+                    subscription_id=target_sub.id,
+                )
+
+        if (
+            promocode.type in (PromoCodeType.BALANCE.value, PromoCodeType.BALANCE_AND_DAYS.value)
+            and promocode.balance_bonus_kopeks > 0
+        ):
             await add_user_balance(db, user, promocode.balance_bonus_kopeks, f'Бонус по промокоду {promocode.code}')
 
             balance_bonus_rubles = promocode.balance_bonus_kopeks / 100
             effects.append(f'💰 Баланс пополнен на {balance_bonus_rubles}₽')
 
-        if promocode.type == PromoCodeType.SUBSCRIPTION_DAYS.value and promocode.subscription_days > 0:
-            subscription = await get_subscription_by_user_id(db, user.id)
-
-            if not subscription:
-                raise ValueError('no_subscription_for_days')
-
-            # Конвертация триала в платную подписку при активации промокода на дни
-            if subscription.is_trial:
-                subscription.is_trial = False
-                if subscription.status == SubscriptionStatus.TRIAL.value:
-                    subscription.status = SubscriptionStatus.ACTIVE.value
-                subscription.updated_at = datetime.now(UTC)
-                logger.info(
-                    '🎓 Промокод: конвертация триала в платную подписку',
-                    subscription_id=subscription.id,
-                    code=promocode.code,
-                )
-
-            await extend_subscription(db, subscription, promocode.subscription_days)
-
-            await self.subscription_service.update_remnawave_user(db, subscription)
-
-            effects.append(f'⏰ Подписка продлена на {promocode.subscription_days} дней')
-            logger.info(
-                '✅ Подписка пользователя продлена на дней в RemnaWave с текущими сквадами',
-                _format_user_log=self._format_user_log(user),
-                subscription_days=promocode.subscription_days,
-            )
-
         if promocode.type == PromoCodeType.TRIAL_SUBSCRIPTION.value:
-            from app.config import settings
             from app.database.crud.subscription import create_trial_subscription
 
-            subscription = await get_subscription_by_user_id(db, user.id)
+            # Determine trial tariff — use promocode.tariff_id if set, else system default
+            trial_tariff = None
+            tariff_id_for_trial = None
+            trial_traffic_limit = None
+            trial_device_limit = None
+            trial_squads: list[str] = []
 
-            if not subscription:
-                trial_days = (
-                    promocode.subscription_days if promocode.subscription_days > 0 else settings.TRIAL_DURATION_DAYS
+            try:
+                from app.database.crud.tariff import get_tariff_by_id as get_tariff, get_trial_tariff
+
+                if promocode.tariff_id:
+                    trial_tariff = await get_tariff(db, promocode.tariff_id)
+                else:
+                    trial_tariff = await get_trial_tariff(db)
+                    if not trial_tariff:
+                        trial_tariff_id = settings.get_trial_tariff_id()
+                        if trial_tariff_id > 0:
+                            trial_tariff = await get_tariff(db, trial_tariff_id)
+
+                if trial_tariff:
+                    from app.database.crud.server_squad import get_effective_tariff_squad_uuids
+
+                    trial_traffic_limit = trial_tariff.traffic_limit_gb
+                    trial_device_limit = trial_tariff.device_limit
+                    tariff_id_for_trial = trial_tariff.id
+                    trial_squads = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+            except Exception as e:
+                logger.error('Ошибка получения тарифа для триального промокода', error=e)
+
+            # Check if user already has a subscription with the same tariff
+            existing_same_tariff_sub = None
+            can_create_new = True
+            if settings.is_multi_tariff_enabled():
+                from app.database.crud.subscription import (
+                    get_active_subscriptions_by_user_id,
+                    get_all_subscriptions_by_user_id,
                 )
 
-                forced_devices = None
-                if not settings.is_devices_selection_enabled():
-                    forced_devices = settings.get_disabled_mode_device_limit()
+                active_subs = await get_active_subscriptions_by_user_id(db, user.id)
+                if tariff_id_for_trial:
+                    existing_same_tariff_sub = next(
+                        (s for s in active_subs if s.tariff_id == tariff_id_for_trial), None
+                    )
+                    if existing_same_tariff_sub is None:
+                        # Revive an EXPIRED/DISABLED same-tariff subscription in place
+                        # instead of inserting a duplicate row. The partial unique index
+                        # uq_subscriptions_user_tariff_active only covers active/trial/
+                        # limited, so a dup wouldn't error but would litter the table and
+                        # break the one-sub-per-(user,tariff) invariant.
+                        all_subs = await get_all_subscriptions_by_user_id(db, user.id)
+                        existing_same_tariff_sub = next(
+                            (
+                                s
+                                for s in all_subs
+                                if s.tariff_id == tariff_id_for_trial
+                                and s.status in (SubscriptionStatus.EXPIRED.value, SubscriptionStatus.DISABLED.value)
+                            ),
+                            None,
+                        )
+                else:
+                    # No tariff configured — block if any subscription exists
+                    can_create_new = len(active_subs) == 0
+            else:
+                existing_sub = await get_subscription_by_user_id(db, user.id)
+                if existing_sub:
+                    if tariff_id_for_trial and existing_sub.tariff_id == tariff_id_for_trial:
+                        existing_same_tariff_sub = existing_sub
+                    else:
+                        can_create_new = False
+
+            trial_days = (
+                promocode.subscription_days if promocode.subscription_days > 0 else settings.TRIAL_DURATION_DAYS
+            )
+            # Override with tariff trial_duration_days if available
+            tariff_trial_days = getattr(trial_tariff, 'trial_duration_days', None) if trial_tariff else None
+            if tariff_trial_days and promocode.subscription_days <= 0:
+                trial_days = tariff_trial_days
+
+            if existing_same_tariff_sub:
+                # User already has this tariff — extend it
+                await extend_subscription(db, existing_same_tariff_sub, trial_days)
+                await self.subscription_service.update_remnawave_user(db, existing_same_tariff_sub)
+
+                effects.append(
+                    f'⏰ Подписка «{trial_tariff.name if trial_tariff else ""}» продлена на {trial_days} дней'
+                )
+                logger.info(
+                    '✅ Триал промокод: продлена существующая подписка',
+                    _format_user_log=self._format_user_log(user),
+                    trial_days=trial_days,
+                    subscription_id=existing_same_tariff_sub.id,
+                )
+            elif can_create_new:
+                if trial_device_limit is None and not settings.is_devices_selection_enabled():
+                    trial_device_limit = settings.get_disabled_mode_device_limit()
 
                 trial_subscription = await create_trial_subscription(
                     db,
                     user.id,
                     duration_days=trial_days,
-                    device_limit=forced_devices,
+                    traffic_limit_gb=trial_traffic_limit,
+                    device_limit=trial_device_limit,
+                    connected_squads=trial_squads or None,
+                    tariff_id=tariff_id_for_trial,
                 )
 
-                await self.subscription_service.create_remnawave_user(db, trial_subscription)
+                remnawave_user = await self.subscription_service.create_remnawave_user(db, trial_subscription)
+                if remnawave_user is None:
+                    # Provisioning failed (create_remnawave_user swallows errors and
+                    # returns None). Don't report a fake success that grants a subscription
+                    # with no working config — delete the just-created orphan row and raise
+                    # so the user gets an honest, mapped error instead.
+                    logger.error(
+                        '❌ Триал промокод: не удалось создать пользователя в RemnaWave — откатываем подписку',
+                        _format_user_log=self._format_user_log(user),
+                        subscription_id=trial_subscription.id,
+                        code=promocode.code,
+                    )
+                    await db.delete(trial_subscription)
+                    await db.commit()
+                    raise ValueError('trial_provisioning_failed')
 
                 effects.append(f'🎁 Активирована тестовая подписка на {trial_days} дней')
                 logger.info(
                     '✅ Создана триал подписка для пользователя на дней',
                     _format_user_log=self._format_user_log(user),
                     trial_days=trial_days,
+                    tariff_id=tariff_id_for_trial,
                 )
             else:
-                effects.append('ℹ️ У вас уже есть активная подписка')
+                # No matching tariff to extend and a (different/existing) subscription
+                # blocks creating a new trial. Raising (instead of appending an info line
+                # and returning success) refunds the reserved use + claimed increment, so
+                # the code is not silently burned and stays retryable.
+                raise ValueError('trial_subscription_exists')
+
+        if not effects and traffic_skipped_unlimited:
+            # Трафик был единственной составляющей, а подписка безлимитная —
+            # начислять нечего. Вернуть общий успех значит сжечь попытку: запись
+            # использования и инкремент счётчика сделаны ДО эффектов и
+            # откатываются только через исключение (тот же приём, что и у
+            # trial_subscription_exists выше).
+            raise ValueError('traffic_not_applicable')
 
         return '\n'.join(effects) if effects else '✅ Промокод активирован'
 
@@ -345,6 +667,7 @@ class PromoCodeService:
         Returns:
             dict с ключами success, error (опционально), deactivated_code (опционально)
         """
+        user: User | None = None
         try:
             user = await get_user_by_id(db, user_id)
             if not user:
@@ -405,7 +728,7 @@ class PromoCodeService:
 
             initiator = 'администратором' if admin_initiated else 'пользователем'
             logger.info(
-                'Промокод (скидка %) деактивирован для пользователя',
+                'Промокод деактивирован',
                 deactivated_code=deactivated_code,
                 current_discount=current_discount,
                 initiator=initiator,
@@ -420,5 +743,5 @@ class PromoCodeService:
 
         except Exception as e:
             logger.error('Ошибка деактивации промокода для пользователя', user_id=user_id, error=e)
-            await db.rollback()
+            await self._rollback_keeping_user_usable(db, user)
             return {'success': False, 'error': 'server_error'}

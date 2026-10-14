@@ -57,6 +57,11 @@ class PaymentMethodResponse(BaseModel):
     max_amount_kopeks: int
     is_available: bool = True
     options: list[dict[str, Any]] | None = None
+    quick_amounts: list[int] = Field(default_factory=list)
+    # Если True — кабинет, получив payment_url от провайдера, делает window.location.href
+    # сразу (seamless flow внутри MiniApp WebView). Если False — показывает панель
+    # "Открыть страницу оплаты" с кнопкой.
+    open_url_direct: bool = False
 
 
 class TopUpRequest(BaseModel):
@@ -79,6 +84,9 @@ class TopUpResponse(BaseModel):
     amount_rubles: float
     status: str
     expires_at: datetime | None = None
+    # Свой экран оплаты (Cashera H2H): строка QR СБП или платёжная ссылка — кабинет
+    # рисует QR рядом с кнопкой оплаты. None — обычный переход по payment_url.
+    qr_payload: str | None = None
 
 
 class StarsInvoiceRequest(BaseModel):

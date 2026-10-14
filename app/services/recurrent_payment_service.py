@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -24,6 +24,7 @@ from app.database.models import (
     User,
     UserPromoGroup,
 )
+from app.utils.miniapp_buttons import build_subscription_extend_button
 
 
 logger = structlog.get_logger(__name__)
@@ -52,16 +53,11 @@ class _DailyGuard:
 _daily_guard = _DailyGuard()
 
 
-def _build_extend_keyboard(texts) -> InlineKeyboardMarkup:
+def _build_extend_keyboard(texts, subscription_id: int | None = None) -> InlineKeyboardMarkup:
     """Клавиатура с кнопкой продления подписки для уведомлений."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'),
-                    callback_data='subscription_extend',
-                )
-            ],
+            [build_subscription_extend_button(texts.t('SUBSCRIPTION_EXTEND', '💎 Продлить подписку'), subscription_id)],
         ]
     )
 
@@ -109,7 +105,17 @@ async def process_recurrent_payments(db: AsyncSession, bot: Bot | None = None) -
         subscriptions = await _find_subscriptions_needing_topup(db)
         stats['checked'] = len(subscriptions)
 
-        for subscription in subscriptions:
+        # _process_single_subscription внутри может flush/commit/savepoint rollback,
+        # после чего subscription.user может стать недоступным (MissingGreenlet при
+        # попытке lazy load вне greenlet'а). Снимаем id-снимок и в каждой итерации
+        # перезагружаем подписку с eager-loaded relationships — N+1, но reliable
+        # и не зависит от состояния сессии.
+        subscription_ids = [sub.id for sub in subscriptions]
+
+        for sub_id in subscription_ids:
+            subscription = await _reload_subscription_with_user(db, sub_id)
+            if not subscription:
+                continue
             user = subscription.user
             if not user:
                 continue
@@ -156,6 +162,26 @@ async def process_recurrent_payments(db: AsyncSession, bot: Bot | None = None) -
         logger.info('Рекуррентные платежи: итоги', **stats)
 
     return stats
+
+
+async def _reload_subscription_with_user(db: AsyncSession, subscription_id: int) -> Subscription | None:
+    """Получить подписку с eager-loaded user/promo_groups/tariff по id.
+
+    Используется в loop'е process_recurrent_payments чтобы избежать MissingGreenlet
+    при доступе к subscription.user после flush/commit/rollback внутри обработчика.
+    """
+    result = await db.execute(
+        select(Subscription)
+        .options(
+            selectinload(Subscription.user).options(
+                selectinload(User.promo_group),
+                selectinload(User.user_promo_groups).selectinload(UserPromoGroup.promo_group),
+            ),
+            selectinload(Subscription.tariff),
+        )
+        .where(Subscription.id == subscription_id)
+    )
+    return result.scalar_one_or_none()
 
 
 async def _find_subscriptions_needing_topup(db: AsyncSession) -> list:
@@ -348,18 +374,20 @@ async def _process_single_subscription(
             logger.warning('Ошибка создания локальной записи рекуррентного платежа', error=e)
 
         # Уведомляем пользователя
-        if bot and user.telegram_id:
+        if bot and user.telegram_id and settings.is_notifications_enabled():
             try:
                 from app.localization.texts import get_texts
 
                 texts = get_texts(user.language)
                 payment_status = result.get('status', '')
                 if result.get('paid'):
-                    keyboard = _build_extend_keyboard(texts)
+                    keyboard = _build_extend_keyboard(texts, subscription.id)
                     msg = texts.t(
                         'RECURRENT_TOPUP_SUCCESS',
                         '✅ <b>Автоплатёж выполнен</b>\n\nБаланс пополнен на {amount} для продления подписки.',
                     ).format(amount=settings.format_price(topup_amount_kopeks))
+                    if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
+                        msg += f'\n📦 Тариф: «{subscription.tariff.name}»'
                     await bot.send_message(
                         chat_id=user.telegram_id,
                         text=msg,
@@ -375,19 +403,44 @@ async def _process_single_subscription(
             except Exception as notify_error:
                 logger.warning('Ошибка уведомления об автоплатеже', notify_error=notify_error)
 
+        if not user.telegram_id and result.get('paid') and user.email and getattr(user, 'email_verified', False):
+            try:
+                from app.services.notification_delivery_service import (
+                    NotificationType,
+                    notification_delivery_service,
+                )
+
+                # Не AUTOPAY_SUCCESS: его шаблон пишет «подписка продлена до X»,
+                # а этот шаг лишь пополняет баланс картой — продление сделает
+                # отдельный джоб, и end_date здесь ещё старый. PAYMENT_RECEIVED
+                # честно сообщает «платёж получен, баланс пополнен».
+                await notification_delivery_service.send_notification(
+                    user=user,
+                    notification_type=NotificationType.PAYMENT_RECEIVED,
+                    context={
+                        'amount_kopeks': topup_amount_kopeks,
+                        'amount_rubles': topup_amount_kopeks / 100,
+                        'formatted_amount': settings.format_price(topup_amount_kopeks),
+                    },
+                )
+            except Exception as email_error:
+                logger.warning('Ошибка email-уведомления об автоплатеже', email_error=email_error)
+
         return 'created'
 
     # Все карты не сработали — уведомляем пользователя
-    if bot and user.telegram_id:
+    if bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             from app.localization.texts import get_texts
 
             texts = get_texts(user.language)
-            keyboard = _build_extend_keyboard(texts)
+            keyboard = _build_extend_keyboard(texts, subscription.id)
             msg = texts.t(
                 'RECURRENT_TOPUP_FAILED',
                 '❌ <b>Автоплатёж не удался</b>\n\nНе удалось списать {amount} ни с одной сохранённой карты для продления подписки.\n\nПополните баланс вручную, чтобы подписка не прервалась.',
             ).format(amount=settings.format_price(topup_amount_kopeks))
+            if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
+                msg += f'\n📦 Тариф: «{subscription.tariff.name}»'
             await bot.send_message(
                 chat_id=user.telegram_id,
                 text=msg,
@@ -396,5 +449,18 @@ async def _process_single_subscription(
             )
         except Exception as notify_error:
             logger.warning('Ошибка уведомления о неудачном автоплатеже', notify_error=notify_error)
+
+    if not user.telegram_id and user.email and getattr(user, 'email_verified', False):
+        try:
+            from app.services.notification_delivery_service import (
+                notification_delivery_service,
+            )
+
+            await notification_delivery_service.notify_autopay_failed(
+                user=user,
+                reason='',
+            )
+        except Exception as email_error:
+            logger.warning('Ошибка email-уведомления о неудачном автоплатеже', email_error=email_error)
 
     return 'all_cards_failed'

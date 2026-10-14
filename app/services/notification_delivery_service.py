@@ -7,7 +7,6 @@ This service handles notification delivery through appropriate channels:
 """
 
 import asyncio
-from enum import Enum
 from typing import Any
 
 import structlog
@@ -15,80 +14,14 @@ from aiogram import Bot
 
 from app.config import settings
 from app.database.models import User, UserStatus
+from app.services.notification_types import (
+    MARKETING_NOTIFICATION_TYPES,
+    NotificationType,
+)
+from app.utils.timezone import format_email_datetime
 
 
 logger = structlog.get_logger(__name__)
-
-
-class NotificationType(Enum):
-    """Types of notifications that can be sent to users."""
-
-    # Balance notifications
-    BALANCE_TOPUP = 'balance_topup'
-    BALANCE_CHANGE = 'balance_change'
-    BALANCE_LOW = 'balance_low'
-
-    # Subscription notifications
-    SUBSCRIPTION_ACTIVATED = 'subscription_activated'
-    SUBSCRIPTION_EXPIRING = 'subscription_expiring'
-    SUBSCRIPTION_EXPIRED = 'subscription_expired'
-    SUBSCRIPTION_RENEWED = 'subscription_renewed'
-
-    # Autopay notifications
-    AUTOPAY_SUCCESS = 'autopay_success'
-    AUTOPAY_FAILED = 'autopay_failed'
-    AUTOPAY_INSUFFICIENT_FUNDS = 'autopay_insufficient_funds'
-
-    # Daily subscription notifications
-    DAILY_DEBIT = 'daily_debit'
-    DAILY_INSUFFICIENT_FUNDS = 'daily_insufficient_funds'
-    TRAFFIC_RESET = 'traffic_reset'
-
-    # Account notifications
-    BAN_NOTIFICATION = 'ban_notification'
-    UNBAN_NOTIFICATION = 'unban_notification'
-    WARNING_NOTIFICATION = 'warning_notification'
-
-    # Referral notifications
-    REFERRAL_BONUS = 'referral_bonus'
-    REFERRAL_REGISTERED = 'referral_registered'
-
-    # Partner notifications
-    PARTNER_APPLICATION_APPROVED = 'partner_application_approved'
-    PARTNER_APPLICATION_REJECTED = 'partner_application_rejected'
-
-    # Withdrawal notifications
-    WITHDRAWAL_APPROVED = 'withdrawal_approved'
-    WITHDRAWAL_REJECTED = 'withdrawal_rejected'
-
-    # Auth emails
-    EMAIL_VERIFICATION = 'email_verification'
-    PASSWORD_RESET = 'password_reset'
-
-    # Webhook subscription events
-    WEBHOOK_SUB_EXPIRED = 'webhook_sub_expired'
-    WEBHOOK_SUB_DISABLED = 'webhook_sub_disabled'
-    WEBHOOK_SUB_ENABLED = 'webhook_sub_enabled'
-    WEBHOOK_SUB_LIMITED = 'webhook_sub_limited'
-    WEBHOOK_SUB_TRAFFIC_RESET = 'webhook_sub_traffic_reset'
-    WEBHOOK_SUB_DELETED = 'webhook_sub_deleted'
-    WEBHOOK_SUB_REVOKED = 'webhook_sub_revoked'
-    WEBHOOK_SUB_EXPIRING = 'webhook_sub_expiring'
-    WEBHOOK_SUB_FIRST_CONNECTED = 'webhook_sub_first_connected'
-    WEBHOOK_SUB_BANDWIDTH_THRESHOLD = 'webhook_sub_bandwidth_threshold'
-    WEBHOOK_USER_NOT_CONNECTED = 'webhook_user_not_connected'
-    WEBHOOK_DEVICE_ADDED = 'webhook_device_added'
-    WEBHOOK_DEVICE_DELETED = 'webhook_device_deleted'
-
-    # Other
-    BROADCAST = 'broadcast'
-    PAYMENT_RECEIVED = 'payment_received'
-
-    # Guest purchase notifications
-    GUEST_SUBSCRIPTION_DELIVERED = 'guest_subscription_delivered'
-    GUEST_ACTIVATION_REQUIRED = 'guest_activation_required'
-    GUEST_GIFT_RECEIVED = 'guest_gift_received'
-    GUEST_CABINET_CREDENTIALS = 'guest_cabinet_credentials'
 
 
 class NotificationDeliveryService:
@@ -103,6 +36,74 @@ class NotificationDeliveryService:
         self._email_service = None
         self._email_templates = None
         self._ws_manager = None
+
+    @staticmethod
+    def _is_allowed_by_preferences(user: User, notification_type: NotificationType) -> bool:
+        """Apply global, category and per-user notification switches centrally."""
+        global_switch_exempt_types = {
+            # Ответ поддержки — реакция на обращение самого пользователя, а не
+            # рассылка: Telegram-канал шлёт его мимо роутера и ENABLE_NOTIFICATIONS
+            # не смотрит, гейт у него один — user_ticket_notifications_enabled.
+            # Без исключения email-юзер молча остаётся без ответа там, где
+            # Telegram-юзер его получает.
+            NotificationType.TICKET_REPLY,
+            NotificationType.EMAIL_VERIFICATION,
+            NotificationType.PASSWORD_RESET,
+            NotificationType.EMAIL_CHANGE_CODE,
+            NotificationType.GUEST_SUBSCRIPTION_DELIVERED,
+            NotificationType.GUEST_ACTIVATION_REQUIRED,
+            NotificationType.GUEST_GIFT_RECEIVED,
+            NotificationType.GUEST_CABINET_CREDENTIALS,
+        }
+        if notification_type not in global_switch_exempt_types and not settings.is_notifications_enabled():
+            logger.debug(
+                'Уведомление отключено глобальным переключателем',
+                user_id=user.id,
+                notification_type_value=notification_type.value,
+            )
+            return False
+
+        referral_types = {
+            NotificationType.REFERRAL_BONUS,
+            NotificationType.REFERRAL_REGISTERED,
+            NotificationType.REFERRAL_WELCOME,
+        }
+        if notification_type in referral_types and not settings.is_referral_notifications_enabled():
+            logger.debug(
+                'Реферальное уведомление отключено',
+                user_id=user.id,
+                notification_type_value=notification_type.value,
+            )
+            return False
+
+        from app.utils.notification_prefs import (
+            is_balance_low_enabled,
+            is_promo_offers_enabled,
+            is_subscription_expiry_enabled,
+            is_traffic_warning_enabled,
+        )
+
+        expiry_types = {
+            NotificationType.SUBSCRIPTION_EXPIRING,
+            NotificationType.SUBSCRIPTION_EXPIRED,
+            NotificationType.WINBACK_EXPIRED_1D,
+            NotificationType.WINBACK_DISCOUNT,
+            NotificationType.WINBACK_TRIAL_ENDING,
+            NotificationType.WEBHOOK_SUB_EXPIRING,
+            NotificationType.WEBHOOK_SUB_EXPIRED,
+        }
+        if notification_type in expiry_types and not is_subscription_expiry_enabled(user):
+            return False
+        if notification_type is NotificationType.BALANCE_LOW and not is_balance_low_enabled(user):
+            return False
+        if notification_type is NotificationType.WEBHOOK_SUB_BANDWIDTH_THRESHOLD and not is_traffic_warning_enabled(
+            user
+        ):
+            return False
+        if notification_type is NotificationType.PROMO_OFFER and not is_promo_offers_enabled(user):
+            return False
+
+        return True
 
     @property
     def email_service(self):
@@ -139,6 +140,7 @@ class NotificationDeliveryService:
         bot: Bot | None = None,
         telegram_message: str | None = None,
         telegram_markup: Any | None = None,
+        use_websocket: bool = True,
     ) -> bool:
         """
         Send notification to user through appropriate channel.
@@ -150,12 +152,27 @@ class NotificationDeliveryService:
             bot: Telegram bot instance (required for Telegram users)
             telegram_message: Pre-formatted Telegram message (optional)
             telegram_markup: Telegram keyboard markup (optional)
+            use_websocket: Send the cabinet WebSocket event alongside the email.
+                Pass False when the caller already emits its own WebSocket event
+                for this notification, to avoid delivering it twice.
 
         Returns:
             True if notification was sent successfully through at least one channel
         """
-        if user.status in (UserStatus.BLOCKED.value, UserStatus.DELETED.value):
+        is_deleted = user.status == UserStatus.DELETED.value
+        is_blocked_without_ban_notice = (
+            user.status == UserStatus.BLOCKED.value and notification_type is not NotificationType.BAN_NOTIFICATION
+        )
+        if is_deleted or is_blocked_without_ban_notice:
             logger.debug('Пропускаем уведомление для неактивного пользователя', user_id=user.id, status=user.status)
+            return False
+
+        if not self._is_allowed_by_preferences(user, notification_type):
+            logger.debug(
+                'Уведомление отключено настройками пользователя',
+                user_id=user.id,
+                notification_type_value=notification_type.value,
+            )
             return False
 
         if user.telegram_id:
@@ -170,24 +187,34 @@ class NotificationDeliveryService:
             )
         if user.email and user.email_verified:
             # Email-only user - send via email and WebSocket
-            results = await asyncio.gather(
-                self._send_email_notification(user, notification_type, context),
-                self._send_websocket_notification(user, notification_type, context),
-                return_exceptions=True,
-            )
+            channels = [self._send_email_notification(user, notification_type, context)]
+            if use_websocket:
+                channels.append(self._send_websocket_notification(user, notification_type, context))
+
+            results = await asyncio.gather(*channels, return_exceptions=True)
 
             email_sent = results[0] is True
-            ws_sent = results[1] is True
+            ws_sent = len(results) > 1 and results[1] is True
 
             if email_sent or ws_sent:
                 logger.info(
-                    'Уведомление отправлено email-пользователю (email ws=)',
+                    'Уведомление отправлено email-пользователю',
                     notification_type_value=notification_type.value,
                     user_id=user.id,
                     email_sent=email_sent,
                     ws_sent=ws_sent,
                 )
                 return True
+            from app.cabinet.services.email_type_switch import is_email_type_enabled
+
+            if not is_email_type_enabled(notification_type.value):
+                # Письмо выключено админом — это не сбой доставки.
+                logger.debug(
+                    'Уведомление email-пользователю пропущено: тип письма отключён',
+                    notification_type_value=notification_type.value,
+                    user_id=user.id,
+                )
+                return False
             logger.warning(
                 'Не удалось отправить уведомление email-пользователю',
                 notification_type_value=notification_type.value,
@@ -219,35 +246,118 @@ class NotificationDeliveryService:
             )
             return False
 
-        try:
-            from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+        from aiogram.exceptions import (
+            TelegramBadRequest,
+            TelegramForbiddenError,
+            TelegramNetworkError,
+            TelegramRetryAfter,
+            TelegramServerError,
+        )
 
-            await asyncio.wait_for(
-                bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=message,
-                    reply_markup=markup,
-                    parse_mode='HTML',
-                ),
-                timeout=15.0,
-            )
+        # В rich-режиме уведомление отправляется тем же полотном, что и меню, — иначе
+        # оно выбивается из общего вида. Ровно одна попытка: любой отказ (включая
+        # разметку, которую rich не воспроизводит дословно) отдаёт False, и ниже
+        # отрабатывает классический путь со своими ретраями, учётом и метриками.
+        from app.utils.rich_notify import try_send_rich_notification
+
+        if await try_send_rich_notification(
+            bot, user.telegram_id, message, keyboard=markup, with_logo=settings.ENABLE_LOGO_MODE
+        ):
             return True
 
-        except TimeoutError:
-            logger.warning('Timeout при отправке Telegram уведомления пользователю', telegram_id=user.telegram_id)
-            return False
+        # Retry transient Telegram-side ошибки (network/5xx/flood) с экспоненциальным
+        # бэк-оффом. До этого ConnectionReset уходил в `except Exception` и логировался
+        # как ERROR → летел в админ-чат через TelegramNotifierProcessor каждый раз,
+        # хотя это ожидаемая сетевая транзиент-ошибка.
+        max_attempts = 3
+        last_transient_error: Exception | None = None
 
-        except TelegramForbiddenError:
-            logger.warning('Telegram user заблокировал бота', telegram_id=user.telegram_id)
-            return False
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await asyncio.wait_for(
+                    bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=message,
+                        reply_markup=markup,
+                        parse_mode='HTML',
+                    ),
+                    timeout=15.0,
+                )
+                return True
 
-        except TelegramBadRequest as e:
-            logger.warning('Ошибка отправки Telegram уведомления пользователю', telegram_id=user.telegram_id, e=e)
-            return False
+            except TimeoutError:
+                logger.warning(
+                    'Timeout при отправке Telegram уведомления пользователю',
+                    telegram_id=user.telegram_id,
+                    attempt=attempt,
+                )
+                last_transient_error = TimeoutError('asyncio.wait_for timeout')
+                if attempt < max_attempts:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                break  # exhausted retries → summary log ниже
 
-        except Exception as e:
-            logger.error('Неожиданная ошибка при отправке Telegram уведомления', e=e)
-            return False
+            except TelegramForbiddenError:
+                logger.warning('Telegram user заблокировал бота', telegram_id=user.telegram_id)
+                return False
+
+            except TelegramBadRequest as e:
+                logger.warning(
+                    'Ошибка отправки Telegram уведомления пользователю',
+                    telegram_id=user.telegram_id,
+                    error=str(e),
+                )
+                return False
+
+            except TelegramRetryAfter as e:
+                # Flood control — ждём, потом ретраим. Cap retry_after, чтобы
+                # не блочить очередь на минуты.
+                retry_after = min(max(1, int(getattr(e, 'retry_after', 1))), 30)
+                logger.warning(
+                    'Telegram flood control при отправке уведомления',
+                    telegram_id=user.telegram_id,
+                    retry_after=retry_after,
+                    attempt=attempt,
+                )
+                last_transient_error = e
+                if attempt < max_attempts:
+                    await asyncio.sleep(retry_after)
+                    continue
+                break
+
+            except (TelegramNetworkError, TelegramServerError) as e:
+                # Транзиентные сетевые/5xx — логируем как warning, не спамим админ-чат
+                last_transient_error = e
+                logger.warning(
+                    'Сетевая ошибка отправки Telegram уведомления (retry)',
+                    telegram_id=user.telegram_id,
+                    error=str(e)[:200],
+                    error_type=type(e).__name__,
+                    attempt=attempt,
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                break
+
+            except Exception as e:
+                logger.error(
+                    'Неожиданная ошибка при отправке Telegram уведомления',
+                    telegram_id=user.telegram_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                return False
+
+        # Все попытки исчерпаны — итоговый warning без error-уровня
+        if last_transient_error is not None:
+            logger.warning(
+                'Не удалось доставить Telegram уведомление после ретраев',
+                telegram_id=user.telegram_id,
+                attempts=max_attempts,
+                final_error=type(last_transient_error).__name__,
+            )
+        return False
 
     async def _send_email_notification(
         self,
@@ -264,9 +374,56 @@ class NotificationDeliveryService:
             logger.debug('У пользователя нет подтверждённого email', user_id=user.id)
             return False
 
+        from app.cabinet.services.email_type_switch import is_email_type_enabled
+
+        if not is_email_type_enabled(notification_type.value):
+            logger.debug('Письмо этого типа отключено админом', notification_type=notification_type.value)
+            return False
+
+        # Маркетинг уважает отписку; транзакционные письма — нет (иначе человек
+        # перестал бы узнавать об оплате и окончании собственной подписки).
+        unsubscribe_url = ''
+        if notification_type in MARKETING_NOTIFICATION_TYPES:
+            from app.utils.notification_prefs import is_promo_offers_enabled
+
+            if not is_promo_offers_enabled(user):
+                logger.debug('Пользователь отписан от промо-писем', user_id=user.id)
+                return False
+
+            from app.cabinet.services.email_unsubscribe import build_unsubscribe_url
+
+            unsubscribe_url = build_unsubscribe_url(user.id, user.email)
+
         try:
             # Get email template (check DB override first, then fall back to hardcoded)
             language = user.language or 'ru'
+
+            # Inject common context values used across all email templates
+            context = {
+                'cabinet_url': getattr(settings, 'CABINET_URL', '') or '',
+                'username': user.first_name or user.username or '',
+                'email': user.email or '',
+                'unsubscribe_url': unsubscribe_url,
+                **context,
+            }
+
+            # Backwards-compat aliases for DB templates that use shorter
+            # placeholder names than the corresponding notify_* method ships.
+            # E.g. {amount} vs amount_kopeks, {reason} vs comment, {balance}.
+            if 'amount' not in context:
+                if context.get('formatted_amount'):
+                    context['amount'] = context['formatted_amount']
+                elif 'amount_kopeks' in context:
+                    context['amount'] = settings.format_price(context['amount_kopeks'])
+                elif 'bonus_kopeks' in context:
+                    context['amount'] = settings.format_price(context['bonus_kopeks'])
+            if 'balance' not in context:
+                if context.get('formatted_balance'):
+                    context['balance'] = context['formatted_balance']
+                elif 'new_balance_kopeks' in context:
+                    context['balance'] = settings.format_price(context['new_balance_kopeks'])
+            if 'reason' not in context and context.get('comment'):
+                context['reason'] = context['comment']
 
             # Try DB override (get_rendered_override substitutes context vars and wraps in base template)
             template = None
@@ -287,7 +444,9 @@ class NotificationDeliveryService:
                 template = self.email_templates.get_template(notification_type, language, context)
 
             if not template:
-                logger.warning('Не найден email шаблон для', notification_type_value=notification_type.value)
+                logger.warning(
+                    'Не найден email шаблон для типа уведомления', notification_type_value=notification_type.value
+                )
                 return False
 
             # Send email (sync smtplib — run in thread to avoid blocking event loop)
@@ -297,6 +456,7 @@ class NotificationDeliveryService:
                 subject=template['subject'],
                 body_html=template['body_html'],
                 body_text=template.get('body_text'),
+                unsubscribe_url=unsubscribe_url or None,
             )
 
             if success:
@@ -377,7 +537,10 @@ class NotificationDeliveryService:
         """Notify user about expiring subscription."""
         context = {
             'days_left': days_left,
-            'expires_at': str(expires_at),
+            # Localize + humanize: ``str(datetime)`` used to leak raw
+            # ISO with microseconds and tz offset into the rendered
+            # template body. See app/utils/timezone.py::format_email_datetime.
+            'expires_at': format_email_datetime(expires_at),
         }
 
         return await self.send_notification(
@@ -420,7 +583,8 @@ class NotificationDeliveryService:
             'amount_kopeks': amount_kopeks,
             'amount_rubles': amount_kopeks / 100,
             'formatted_amount': settings.format_price(amount_kopeks),
-            'new_expires_at': str(new_expires_at),
+            # Localize + humanize (see expiring branch above).
+            'new_expires_at': format_email_datetime(new_expires_at),
         }
 
         return await self.send_notification(
@@ -501,12 +665,33 @@ class NotificationDeliveryService:
         bot: Bot | None = None,
         telegram_message: str | None = None,
         telegram_markup: Any | None = None,
+        bonus_days: int = 0,
+        tariff_name: str = '',
+        level: int = 1,
     ) -> bool:
-        """Notify user about referral bonus."""
+        """Notify user about referral bonus.
+
+        Награда может быть выдана днями подписки, а не деньгами. Без ``bonus_days``
+        такое начисление уходит в письмо как «Реферальный бонус: +0.00 ₽» — сумма
+        честно нулевая, потому что дни в неё и не должны попадать, а выданные дни
+        назвать нечем. ``formatted_reward`` поэтому описывает награду целиком.
+        """
+        reward_parts = []
+        if bonus_kopeks > 0:
+            reward_parts.append(settings.format_price(bonus_kopeks))
+        if bonus_days > 0:
+            tariff_suffix = f' тарифа «{tariff_name}»' if tariff_name else ''
+            reward_parts.append(f'{bonus_days} дн. подписки{tariff_suffix}')
+
         context = {
             'bonus_kopeks': bonus_kopeks,
             'bonus_rubles': bonus_kopeks / 100,
             'formatted_bonus': settings.format_price(bonus_kopeks),
+            'bonus_days': bonus_days,
+            'tariff_name': tariff_name,
+            'level': level,
+            # Единственное поле, которое верно и для денег, и для дней, и для обоих.
+            'formatted_reward': ' + '.join(reward_parts) or settings.format_price(bonus_kopeks),
             'referral_name': referral_name,
         }
 
@@ -527,15 +712,39 @@ class NotificationDeliveryService:
         telegram_message: str | None = None,
         telegram_markup: Any | None = None,
     ) -> bool:
-        """Notify user about a newly registered referral."""
-        context = {
-            'referral_name': referral_name,
-        }
+        """Notify the inviter that a new referral has registered.
 
+        Регистрация — не награда: денег и дней здесь нет, и шаблон бонуса для
+        неё не годится (уходило «Реферальный бонус: +0 ₽»).
+        """
         return await self.send_notification(
             user=user,
             notification_type=NotificationType.REFERRAL_REGISTERED,
-            context=context,
+            context={'referral_name': referral_name},
+            bot=bot,
+            telegram_message=telegram_message,
+            telegram_markup=telegram_markup,
+        )
+
+    async def notify_referral_welcome(
+        self,
+        user: User,
+        referrer_name: str,
+        bonus_promise: str = '',
+        bot: Bot | None = None,
+        telegram_message: str | None = None,
+        telegram_markup: Any | None = None,
+    ) -> bool:
+        """Welcome the newcomer who registered by a referral link.
+
+        ``bonus_promise`` — что приглашённому обещано, готовой фразой
+        («7 дн. подписки», «100 ₽ при первом пополнении от 500 ₽»);
+        пусто — обещать нечего, блок бонуса в письме не показывается.
+        """
+        return await self.send_notification(
+            user=user,
+            notification_type=NotificationType.REFERRAL_WELCOME,
+            context={'referrer_name': referrer_name, 'bonus_promise': bonus_promise},
             bot=bot,
             telegram_message=telegram_message,
             telegram_markup=telegram_markup,
@@ -657,6 +866,39 @@ class NotificationDeliveryService:
             bot=bot,
             telegram_message=telegram_message,
             telegram_markup=telegram_markup,
+        )
+
+    async def notify_ticket_reply(
+        self,
+        user: User,
+        ticket_id: int,
+        reply_preview: str,
+        has_photo: bool = False,
+        bot: Bot | None = None,
+        telegram_message: str | None = None,
+        telegram_markup: Any | None = None,
+    ) -> bool:
+        """Notify user about a support reply in their ticket.
+
+        Пользователь без ``telegram_id`` (регистрация по email) иначе узнаёт об
+        ответе поддержки, только если сам зайдёт в кабинет.
+        """
+        context = {
+            'ticket_id': ticket_id,
+            'reply_preview': reply_preview or '',
+            'has_photo': has_photo,
+        }
+
+        # WebSocket-событие об ответе кабинет шлёт сам (``ticket.admin_reply``),
+        # второе здесь дало бы дубль уведомления в интерфейсе.
+        return await self.send_notification(
+            user=user,
+            notification_type=NotificationType.TICKET_REPLY,
+            context=context,
+            bot=bot,
+            telegram_message=telegram_message,
+            telegram_markup=telegram_markup,
+            use_websocket=False,
         )
 
 

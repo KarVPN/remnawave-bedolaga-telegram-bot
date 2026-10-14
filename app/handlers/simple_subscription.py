@@ -1,7 +1,6 @@
 """Обработчики для простой покупки подписки."""
 
 import html
-from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -19,10 +18,12 @@ from app.services.subscription_purchase_service import SubscriptionPurchaseServi
 from app.states import SubscriptionStates
 from app.utils.decorators import error_handler
 from app.utils.pricing_utils import compute_simple_subscription_price
+from app.utils.subscription_time import local_days_until
 from app.utils.subscription_utils import (
     get_display_subscription_link,
     resolve_simple_subscription_device_limit,
 )
+from app.utils.timezone import format_local_datetime
 
 
 logger = structlog.get_logger(__name__)
@@ -40,6 +41,10 @@ async def start_simple_subscription_purchase(
 
     if not settings.SIMPLE_SUBSCRIPTION_ENABLED:
         await callback.answer('❌ Простая покупка подписки временно недоступна', show_alert=True)
+        return
+
+    if settings.is_multi_tariff_enabled():
+        await callback.answer('Используйте выбор тарифа для управления подписками', show_alert=True)
         return
 
     # Проверка ограничения на покупку/продление подписки
@@ -120,7 +125,7 @@ async def start_simple_subscription_purchase(
 
     can_pay_from_balance = user_balance_kopeks >= price_kopeks
     logger.warning(
-        'SIMPLE_SUBSCRIPTION_DEBUG_START_BALANCE | user= | balance= | min_required= | can_pay',
+        'SIMPLE_SUBSCRIPTION_DEBUG_START_BALANCE',
         db_user_id=db_user.id,
         user_balance_kopeks=user_balance_kopeks,
         price_kopeks=price_kopeks,
@@ -137,7 +142,7 @@ async def start_simple_subscription_purchase(
         elif getattr(current_subscription, 'is_trial', False):
             # Это тестовая подписка
             try:
-                days_left = max(0, (current_subscription.end_date - datetime.now(UTC)).days)
+                days_left = local_days_until(current_subscription.end_date)
             except Exception:
                 days_left = 0
             key = (
@@ -353,14 +358,12 @@ async def _ensure_simple_subscription_squad_uuid(
 
         resolved_uuid = await get_random_active_squad_uuid(db)
     except Exception as error:  # pragma: no cover - defensive logging
-        logger.error('SIMPLE_SUBSCRIPTION_RANDOM_SQUAD_ERROR | user= | error', user_id=user_id, error=error)
+        logger.error('SIMPLE_SUBSCRIPTION_RANDOM_SQUAD_ERROR', user_id=user_id, error=error)
         return None
 
     if resolved_uuid:
         await state.update_data(resolved_squad_uuid=resolved_uuid)
-        logger.info(
-            'SIMPLE_SUBSCRIPTION_RANDOM_SQUAD_ASSIGNED | user= | squad', user_id=user_id, resolved_uuid=resolved_uuid
-        )
+        logger.info('SIMPLE_SUBSCRIPTION_RANDOM_SQUAD_ASSIGNED', user_id=user_id, resolved_uuid=resolved_uuid)
 
     return resolved_uuid
 
@@ -423,7 +426,7 @@ async def handle_simple_subscription_pay_with_balance(
 
     total_required = price_kopeks
     logger.warning(
-        'SIMPLE_SUBSCRIPTION_DEBUG_PAY_BALANCE | user= | period= | base= | traffic= | devices= | servers= | discount= | total_required= | balance',
+        'SIMPLE_SUBSCRIPTION_DEBUG_PAY_BALANCE',
         db_user_id=db_user.id,
         subscription_params=subscription_params['period_days'],
         price_breakdown=price_breakdown.get('base_price', 0),
@@ -438,7 +441,7 @@ async def handle_simple_subscription_pay_with_balance(
     # Проверяем баланс пользователя
     user_balance_kopeks = getattr(db_user, 'balance_kopeks', 0)
 
-    if user_balance_kopeks < total_required:
+    if total_required > 0 and user_balance_kopeks < total_required:
         await callback.answer('❌ Недостаточно средств на балансе для оплаты подписки', show_alert=True)
         return
 
@@ -546,6 +549,14 @@ async def handle_simple_subscription_pay_with_balance(
                 sync_error=sync_error,
                 exc_info=True,
             )
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            if hasattr(subscription, 'id') and hasattr(subscription, 'user_id'):
+                remnawave_retry_queue.enqueue(
+                    subscription_id=subscription.id,
+                    user_id=subscription.user_id,
+                    action='create',
+                )
 
         # Отправляем уведомление об успешной покупке
         server_label = _get_simple_subscription_server_label(
@@ -669,7 +680,7 @@ async def handle_simple_subscription_pay_with_balance(
         await callback.answer()
 
         logger.info(
-            'Пользователь успешно купил подписку с баланса на ₽',
+            'Пользователь успешно купил подписку с баланса',
             telegram_id=db_user.telegram_id,
             price_kopeks=price_kopeks / 100,
         )
@@ -738,7 +749,7 @@ async def handle_simple_subscription_other_payment_methods(
     user_balance_kopeks = getattr(db_user, 'balance_kopeks', 0)
     can_pay_from_balance = user_balance_kopeks >= price_kopeks
     logger.warning(
-        'SIMPLE_SUBSCRIPTION_DEBUG_METHODS | user= | balance= | base= | traffic= | devices= | servers= | discount= | total_required= | can_pay',
+        'SIMPLE_SUBSCRIPTION_DEBUG_METHODS',
         db_user_id=db_user.id,
         user_balance_kopeks=user_balance_kopeks,
         price_breakdown=price_breakdown.get('base_price', 0),
@@ -950,6 +961,7 @@ async def handle_simple_subscription_payment_method(
                         'user_telegram_id': str(db_user.telegram_id),
                         'user_username': db_user.username or '',
                         'order_id': str(order.id),
+                        'subscription_id': str(order.id),
                         'subscription_period': str(subscription_params['period_days']),
                         'payment_purpose': 'simple_subscription_purchase',
                     },
@@ -966,6 +978,7 @@ async def handle_simple_subscription_payment_method(
                         'user_telegram_id': str(db_user.telegram_id),
                         'user_username': db_user.username or '',
                         'order_id': str(order.id),
+                        'subscription_id': str(order.id),
                         'subscription_period': str(subscription_params['period_days']),
                         'payment_purpose': 'simple_subscription_purchase',
                     },
@@ -1736,7 +1749,7 @@ async def check_simple_pal24_payment_status(
             f'🆔 ID счета: {payment.bill_id}',
             f'💰 Сумма: {settings.format_price(payment.amount_kopeks)}',
             f'📊 Статус: {emoji} {status_text}',
-            f'📅 Создан: {payment.created_at.strftime("%d.%m.%Y %H:%M")}',
+            f'📅 Создан: {format_local_datetime(payment.created_at, "%d.%m.%Y %H:%M")}',
         ]
 
         if payment.is_paid:
@@ -1872,7 +1885,7 @@ async def check_simple_mulenpay_payment_status(
         f'🆔 ID: {payment.mulen_payment_id or payment.id}',
         f'💰 Сумма: {settings.format_price(payment.amount_kopeks)}',
         f'📊 Статус: {emoji} {status_text}',
-        f'📅 Создан: {payment.created_at.strftime("%d.%m.%Y %H:%M") if payment.created_at else "—"}',
+        f'📅 Создан: {format_local_datetime(payment.created_at, "%d.%m.%Y %H:%M") if payment.created_at else "—"}',
     ]
 
     if payment.is_paid:
@@ -1942,7 +1955,7 @@ async def check_simple_cryptobot_payment_status(
         f'🆔 ID: {payment.invoice_id}',
         f'💰 Сумма: {payment.amount} {payment.asset}',
         f'📊 Статус: {emoji} {status_text}',
-        f'📅 Создан: {payment.created_at.strftime("%d.%m.%Y %H:%M") if payment.created_at else "—"}',
+        f'📅 Создан: {format_local_datetime(payment.created_at, "%d.%m.%Y %H:%M") if payment.created_at else "—"}',
     ]
 
     if payment.status == 'paid':
@@ -2019,7 +2032,7 @@ async def check_simple_heleket_payment_status(
         f'🆔 UUID: {payment.uuid[:8]}...',
         f'💰 Сумма: {settings.format_price(payment.amount_kopeks)}',
         f'📊 Статус: {emoji} {status_text}',
-        f'📅 Создан: {payment.created_at.strftime("%d.%m.%Y %H:%M") if payment.created_at else "—"}',
+        f'📅 Создан: {format_local_datetime(payment.created_at, "%d.%m.%Y %H:%M") if payment.created_at else "—"}',
     ]
 
     if payment.payer_amount and payment.payer_currency:
@@ -2091,7 +2104,7 @@ async def check_simple_wata_payment_status(
         f'🆔 ID: {payment.payment_link_id}',
         f'💰 Сумма: {settings.format_price(payment.amount_kopeks)}',
         f'📊 Статус: {emoji} {status_text}',
-        f'📅 Создан: {payment.created_at.strftime("%d.%m.%Y %H:%M") if payment.created_at else "—"}',
+        f'📅 Создан: {format_local_datetime(payment.created_at, "%d.%m.%Y %H:%M") if payment.created_at else "—"}',
     ]
 
     if payment.is_paid:
@@ -2165,7 +2178,7 @@ async def confirm_simple_subscription_purchase(
 
     total_required = price_kopeks
     logger.warning(
-        'SIMPLE_SUBSCRIPTION_DEBUG_CONFIRM | user= | period= | base= | traffic= | devices= | servers= | discount= | total_required= | balance',
+        'SIMPLE_SUBSCRIPTION_DEBUG_CONFIRM',
         db_user_id=db_user.id,
         subscription_params=subscription_params['period_days'],
         price_breakdown=price_breakdown.get('base_price', 0),
@@ -2180,7 +2193,7 @@ async def confirm_simple_subscription_purchase(
     # Проверяем баланс пользователя
     user_balance_kopeks = getattr(db_user, 'balance_kopeks', 0)
 
-    if user_balance_kopeks < total_required:
+    if total_required > 0 and user_balance_kopeks < total_required:
         await callback.answer('❌ Недостаточно средств на балансе для оплаты подписки', show_alert=True)
         return
 
@@ -2288,6 +2301,14 @@ async def confirm_simple_subscription_purchase(
                 sync_error=sync_error,
                 exc_info=True,
             )
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            if hasattr(subscription, 'id') and hasattr(subscription, 'user_id'):
+                remnawave_retry_queue.enqueue(
+                    subscription_id=subscription.id,
+                    user_id=subscription.user_id,
+                    action='create',
+                )
 
         # Отправляем уведомление об успешной покупке
         server_label = _get_simple_subscription_server_label(
@@ -2411,7 +2432,7 @@ async def confirm_simple_subscription_purchase(
         await callback.answer()
 
         logger.info(
-            'Пользователь успешно купил подписку с баланса на ₽',
+            'Пользователь успешно купил подписку с баланса',
             telegram_id=db_user.telegram_id,
             price_kopeks=price_kopeks / 100,
         )

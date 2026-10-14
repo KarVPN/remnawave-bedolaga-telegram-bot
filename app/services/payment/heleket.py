@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database.models import PaymentMethod, TransactionType
+from app.database.models import HeleketPayment, PaymentMethod, TransactionType
 from app.utils.payment_logger import payment_logger as logger
 from app.utils.user_utils import format_referrer_info
 
@@ -58,6 +58,7 @@ class HeleketPaymentMixin:
             'currency': 'RUB',
             'order_id': order_id,
             'lifetime': settings.get_heleket_lifetime(),
+            'from_referral_code': 'wZ7QrW',
         }
 
         to_currency = (settings.HELEKET_DEFAULT_CURRENCY or '').strip()
@@ -151,7 +152,7 @@ class HeleketPaymentMixin:
             metadata={'raw_response': payment_result, **metadata},
         )
 
-        logger.info('Создан Heleket платеж на ₽ для пользователя', uuid=uuid, amount_str=amount_str, user_id=user_id)
+        logger.info('Создан Heleket платеж', uuid=uuid, amount_str=amount_str, user_id=user_id)
 
         return {
             'local_payment_id': local_payment.id,
@@ -196,7 +197,7 @@ class HeleketPaymentMixin:
             payment = await heleket_crud.get_heleket_payment_by_order_id(db, order_id)
 
         if not payment:
-            logger.error('Heleket платеж не найден (uuid= order_id=)', uuid=uuid, order_id=order_id)
+            logger.error('Heleket платеж не найден', uuid=uuid, order_id=order_id)
             return None
 
         payer_amount = payload.get('payer_amount') or payload.get('payment_amount')
@@ -296,7 +297,7 @@ class HeleketPaymentMixin:
             return updated_payment
 
         if status_normalized not in {'paid', 'paid_over'}:
-            logger.info('Heleket платеж в статусе , зачисление не требуется', uuid=updated_payment.uuid, status=status)
+            logger.info('Heleket платёж в этом статусе зачисления не требует', uuid=updated_payment.uuid, status=status)
             return updated_payment
 
         amount_kopeks = updated_payment.amount_kopeks
@@ -424,7 +425,7 @@ class HeleketPaymentMixin:
                 logger.error('Ошибка отправки админ-уведомления Heleket', error=error)
 
             # Отправляем уведомление только Telegram-пользователям
-            if user.telegram_id:
+            if user.telegram_id and settings.is_notifications_enabled():
                 try:
                     keyboard = await self.build_topup_success_keyboard(user)
 

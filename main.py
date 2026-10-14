@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -16,13 +17,14 @@ from app.database.database import sync_postgres_sequences
 from app.database.migrations import run_alembic_upgrade
 from app.database.models import PaymentMethod
 from app.localization.loader import ensure_locale_templates
-from app.logging_config import setup_logging
+from app.logging_config import _resolve_log_level, setup_logging
 from app.services.backup_service import backup_service
 from app.services.ban_notification_service import ban_notification_service
 from app.services.broadcast_service import broadcast_service
 from app.services.contest_rotation_service import contest_rotation_service
 from app.services.daily_subscription_service import daily_subscription_service
-from app.services.external_admin_service import ensure_external_admin_token
+from app.services.dpichecker.service import dpichecker_service
+from app.services.grace_access_runtime import grace_access_runtime
 from app.services.log_rotation_service import log_rotation_service
 from app.services.maintenance_service import maintenance_service
 from app.services.monitoring_service import monitoring_service
@@ -35,6 +37,7 @@ from app.services.payment_verification_service import (
     get_enabled_auto_methods,
     method_display_name,
 )
+from app.services.reachability.service import reachability_service
 from app.services.referral_contest_service import referral_contest_service
 from app.services.remnawave_sync_service import remnawave_sync_service
 from app.services.reporting_service import reporting_service
@@ -50,13 +53,33 @@ from app.webapi.server import WebAPIServer
 from app.webserver.unified_app import create_unified_app
 
 
+# Уведомление об остановке не должно съесть время остального завершения.
+SHUTDOWN_NOTIFICATION_TIMEOUT_SECONDS = 5
+
+
 class GracefulExit:
     def __init__(self):
         self.exit = False
+        # Каким сигналом остановили — для уведомления об остановке.
+        self.signum: int | None = None
 
     def exit_gracefully(self, signum, frame):
         structlog.get_logger(__name__).info('Получен сигнал, корректное завершение работы', signum=signum)
+        if self.signum is None:
+            self.signum = signum
         self.exit = True
+
+
+def _dpichecker_notifier(bot):
+    """Итог прогона монитора DPI//CHECKER → админ-чат, категория «Инфраструктура»."""
+    from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
+
+    async def notify(text: str) -> bool:
+        return await AdminNotificationService(bot).send_admin_notification(
+            text, category=NotificationCategory.INFRASTRUCTURE
+        )
+
+    return notify
 
 
 async def main():
@@ -119,7 +142,7 @@ async def main():
         log_handlers.append(stream_handler)
 
         logging.basicConfig(
-            level=getattr(logging, settings.LOG_LEVEL),
+            level=_resolve_log_level(settings.LOG_LEVEL),
             handlers=log_handlers,
             force=True,
         )
@@ -138,7 +161,7 @@ async def main():
         log_handlers.append(stream_handler)
 
         logging.basicConfig(
-            level=getattr(logging, settings.LOG_LEVEL),
+            level=_resolve_log_level(settings.LOG_LEVEL),
             handlers=log_handlers,
             force=True,
         )
@@ -154,6 +177,9 @@ async def main():
             ('Режим БД', settings.DATABASE_MODE),
         ]
     )
+
+    for insecure_default_warning in settings.collect_insecure_default_warnings():
+        logger.warning('⚠️ Insecure configuration default', detail=insecure_default_warning)
 
     async with timeline.stage('Подготовка локализаций', '🗂️', success_message='Шаблоны локализаций готовы') as stage:
         try:
@@ -179,6 +205,11 @@ async def main():
     payment_webhooks_enabled = False
 
     summary_logged = False
+    # Для уведомления об остановке: когда бот поднялся и почему он останавливается.
+    # started_at остаётся None, если упал ещё на запуске — это покрывает краш-отчёт.
+    started_at: datetime | None = None
+    shutdown_error: BaseException | None = None
+    shutdown_source: str | None = None
 
     try:
         skip_migration = os.getenv('SKIP_MIGRATION', 'false').lower() == 'true'
@@ -270,10 +301,16 @@ async def main():
         ) as stage:
             try:
                 from app.database.database import AsyncSessionLocal
-                from app.services.payment_method_config_service import ensure_payment_method_configs
+                from app.services.payment_method_config_service import (
+                    ensure_payment_method_configs,
+                    refresh_display_name_overrides,
+                )
 
                 async with AsyncSessionLocal() as db:
                     await ensure_payment_method_configs(db)
+                    # Warm the display-name override cache so bot keyboards show
+                    # cabinet-configured method names (matches the cabinet).
+                    await refresh_display_name_overrides(db)
             except Exception as error:
                 stage.warning(f'Не удалось инициализировать платёжные методы: {error}')
                 logger.error('❌ Не удалось инициализировать платёжные методы', error=error)
@@ -288,6 +325,22 @@ async def main():
             except Exception as error:
                 stage.warning(f'Не удалось загрузить конфигурацию: {error}')
                 logger.error('❌ Не удалось загрузить конфигурацию', error=error)
+            # Переключатели уведомлений истёкшим и настройки поддержки раньше жили в JSON-файлах
+            # в data/ — один раз переносятся в базу, чтобы прежние значения операторов не пропали.
+            try:
+                from app.database.database import AsyncSessionLocal
+                from app.services.notification_settings_service import NotificationSettingsService
+                from app.services.support_settings_service import SupportSettingsService
+
+                async with AsyncSessionLocal() as db:
+                    imported = {
+                        **await NotificationSettingsService.import_legacy_file(db),
+                        **await SupportSettingsService.import_legacy_file(db),
+                    }
+                if imported:
+                    stage.log(f'Настройки перенесены из файлов в базу: {len(imported)}')
+            except Exception as error:
+                logger.error('❌ Не удалось перенести настройки из файлов в базу', error=error)
 
         bot = None
         dp = None
@@ -300,13 +353,30 @@ async def main():
             settings.BOT_USERNAME = bot_user.username
             logger.info('BOT_USERNAME auto-detected', bot_username=bot_user.username)
 
+        from app.utils.chat_menu_button import configure_chat_menu_button
+
+        await configure_chat_menu_button(bot)
+
         monitoring_service.bot = bot
+        grace_access_runtime.bot = bot
         maintenance_service.set_bot(bot)
         broadcast_service.set_bot(bot)
         ban_notification_service.set_bot(bot)
         traffic_monitoring_scheduler.set_bot(bot)
         daily_subscription_service.set_bot(bot)
         telegram_notifier.set_bot(bot)
+
+        # Хранилище ошибок: пишет события ДО попытки доставки в Telegram,
+        # поэтому они переживают недоступность всех путей до чата.
+        from app.services.system_error_log_service import system_error_log_service
+
+        await system_error_log_service.start()
+
+        # Очередь повторной отправки писем: без неё письмо, не ушедшее во время
+        # обрыва SMTP-канала, терялось молча — включая код регистрации.
+        from app.services.email_retry_service import email_retry_service
+
+        await email_retry_service.start()
 
         from app.services.channel_subscription_service import channel_subscription_service
 
@@ -412,8 +482,6 @@ async def main():
                     if status.send_to_telegram:
                         stage.log('Отправка в Telegram: включена')
                     if status.next_rotation:
-                        from datetime import datetime
-
                         next_dt = datetime.fromisoformat(status.next_rotation)
                         stage.log(f'Следующая ротация: {next_dt.strftime("%d.%m.%Y %H:%M")}')
                 except Exception as e:
@@ -440,6 +508,28 @@ async def main():
             except Exception as e:
                 stage.warning(f'Ошибка запуска автосинхронизации: {e}')
                 logger.error('❌ Ошибка запуска автосинхронизации RemnaWave', error=e)
+
+        async with timeline.stage(
+            'Grace-доступ для продления',
+            '🛟',
+            success_message='Сервис grace-доступа готов',
+        ) as stage:
+            try:
+                await grace_access_runtime.start()
+                stage.log(f'Режим: {grace_access_runtime.mode.value}')
+            except Exception as e:
+                stage.warning(f'Grace-доступ безопасно отключён из-за ошибки конфигурации: {e}')
+                logger.error('Ошибка запуска grace-доступа; основной бот продолжает работу', error=e)
+
+        # Разовая фоновая чистка накопившихся дублей тарифных подписок (multi-tariff):
+        # лишние истёкшие дубли удаляются из БД и панели вместе, как штатное удаление.
+        # Идемпотентно — после первой чистки no-op; панель легла — повторит на след. старте.
+        try:
+            from app.services.subscription_dedup_service import dedupe_expired_tariff_subscriptions
+
+            asyncio.create_task(dedupe_expired_tariff_subscriptions())
+        except Exception as e:
+            logger.warning('Не удалось запустить чистку дублей подписок', error=e)
 
         payment_service = PaymentService(bot)
         auto_payment_verification_service.set_payment_service(payment_service)
@@ -515,24 +605,6 @@ async def main():
             else:
                 stage.skip('NaloGO отключен настройками')
 
-        async with timeline.stage(
-            'Внешняя админка',
-            '🛡️',
-            success_message='Токен внешней админки готов',
-        ) as stage:
-            try:
-                token = await ensure_external_admin_token(
-                    bot_user.username,
-                    bot_user.id,
-                )
-                if token:
-                    stage.log('Токен синхронизирован')
-                else:
-                    stage.warning('Не удалось получить токен внешней админки')
-            except Exception as error:  # pragma: no cover - защитный блок
-                stage.warning(f'Ошибка подготовки внешней админки: {error}')
-                logger.error('❌ Ошибка подготовки внешней админки', error=error)
-
         bot_run_mode = settings.get_bot_run_mode()
         polling_enabled = bot_run_mode == 'polling'
         telegram_webhook_enabled = bot_run_mode == 'webhook'
@@ -546,6 +618,7 @@ async def main():
                 settings.is_pal24_enabled(),
                 settings.is_wata_enabled(),
                 settings.is_heleket_enabled(),
+                settings.is_apple_iap_enabled(),
             ]
         )
 
@@ -607,6 +680,7 @@ async def main():
                         secret_token=settings.WEBHOOK_SECRET_TOKEN,
                         drop_pending_updates=False,  # Обрабатываем накопившиеся обновления
                         allowed_updates=allowed_updates,
+                        **({'ip_address': settings.WEBHOOK_IP} if settings.WEBHOOK_IP else {}),
                     )
                     stage.log(f'Webhook установлен: {webhook_url}')
                     stage.log(f'Allowed updates: {", ".join(sorted(allowed_updates)) if allowed_updates else "all"}')
@@ -621,6 +695,31 @@ async def main():
         ) as stage:
             monitoring_task = asyncio.create_task(monitoring_service.start_monitoring())
             stage.log(f'Интервал опроса: {settings.MONITORING_INTERVAL}с')
+
+        async with timeline.stage(
+            'Доступность из РФ (bschekbot)',
+            '📶',
+            success_message='Обходчик задач проверки запущен',
+        ) as stage:
+            reachability_enabled = settings.is_bschek_enabled() and settings.is_bschek_configured()
+            if reachability_enabled:
+                reachability_service.start_background()
+                stage.log('Незавершённые задачи будут подхвачены обходчиком')
+            else:
+                stage.skip('Интеграция bschekbot выключена или без ключа')
+
+        async with timeline.stage(
+            'DPI//CHECKER',
+            '🧱',
+            success_message='Обходчик мониторов запущен',
+        ) as stage:
+            dpichecker_notify = _dpichecker_notifier(bot)
+            # Модуль могут включить из кабинета на ходу — цикл здоровья ниже сверяется с настройками.
+            dpichecker_service.sync_background(dpichecker_notify)
+            if dpichecker_service.background_running:
+                stage.log('Итоги мониторов из кабинета будут приходить в админ-чат')
+            else:
+                stage.skip('DPI//CHECKER выключен или без ключа')
 
         async with timeline.stage(
             'Служба техработ',
@@ -662,8 +761,13 @@ async def main():
                 interval_minutes = daily_subscription_service.get_check_interval_minutes()
                 stage.log(f'Интервал проверки: {interval_minutes} мин')
             else:
-                daily_subscription_task = None
-                stage.skip('Суточные подписки отключены настройками')
+                # Суточные тарифы выключены, но сброс истёкших докупок трафика нужен
+                # любой установке, продающей пакеты ГБ: без него истёкший пакет роняет
+                # лимит мимо защиты от ухода в минус (#630055). Запускаем только его.
+                daily_subscription_task = asyncio.create_task(
+                    daily_subscription_service.start_traffic_reset_monitoring()
+                )
+                stage.log('Суточные тарифы выключены — запущен только сброс докупок трафика')
 
         async with timeline.stage(
             'Сервис проверки версий',
@@ -712,6 +816,8 @@ async def main():
             webhook_lines.append(f'WATA: {_fmt(settings.WATA_WEBHOOK_PATH)}')
         if settings.is_heleket_enabled():
             webhook_lines.append(f'Heleket: {_fmt(settings.HELEKET_WEBHOOK_PATH)}')
+        if settings.is_apple_iap_enabled():
+            webhook_lines.append(f'Apple IAP: {_fmt(settings.APPLE_IAP_WEBHOOK_PATH)}')
         if settings.is_platega_enabled():
             webhook_lines.append(f'Platega: {_fmt(settings.PLATEGA_WEBHOOK_PATH)}')
         if settings.is_cloudpayments_enabled():
@@ -757,6 +863,8 @@ async def main():
         except Exception as startup_notify_error:
             logger.warning('Не удалось отправить стартовое уведомление', startup_notify_error=startup_notify_error)
 
+        started_at = datetime.now(UTC)
+
         try:
             while not killer.exit:
                 await asyncio.sleep(1)
@@ -772,6 +880,13 @@ async def main():
                     if exception:
                         logger.error('Служба техработ завершилась с ошибкой', error=exception)
                         maintenance_task = asyncio.create_task(maintenance_service.start_monitoring())
+
+                if reachability_enabled:
+                    # Идемпотентно: перезапускает только упавший обходчик, живой не трогает.
+                    reachability_service.start_background()
+
+                # Идемпотентно и по живым настройкам: включили — запустит, выключили — остановит.
+                dpichecker_service.sync_background(dpichecker_notify)
 
                 if version_check_task and version_check_task.done():
                     exception = version_check_task.exception()
@@ -794,13 +909,28 @@ async def main():
                 if daily_subscription_task and daily_subscription_task.done():
                     exception = daily_subscription_task.exception()
                     if exception:
-                        logger.error('Сервис суточных подписок завершился с ошибкой', error=exception)
                         if daily_subscription_service.is_enabled():
+                            logger.error('Сервис суточных подписок завершился с ошибкой', error=exception)
                             logger.info('🔄 Перезапуск сервиса суточных подписок...')
                             daily_subscription_task = asyncio.create_task(daily_subscription_service.start_monitoring())
+                        else:
+                            # Суточные выключены — крутился только сброс докупок трафика (#630055).
+                            logger.error('Цикл сброса докупок трафика завершился с ошибкой', error=exception)
+                            logger.info('🔄 Перезапуск сброса докупок трафика...')
+                            daily_subscription_task = asyncio.create_task(
+                                daily_subscription_service.start_traffic_reset_monitoring()
+                            )
 
-                if auto_verification_active and not auto_payment_verification_service.is_running():
-                    logger.warning('Сервис автопроверки пополнений остановился, пробуем перезапустить...')
+                # Не завязываемся на auto_verification_active: он защёлкивал
+                # результат ПЕРВОЙ попытки. Если на старте ни один поддерживаемый
+                # провайдер не был включён, start() выходил не создав задачу, и
+                # сторож её больше никогда не поднимал — включённая позже платёжка
+                # оставалась и без вебхука (до этого фикса), и без опроса статусов.
+                if (
+                    settings.is_payment_verification_auto_check_enabled()
+                    and not auto_payment_verification_service.is_running()
+                ):
+                    logger.warning('Сервис автопроверки пополнений не запущен, пробуем поднять...')
                     await auto_payment_verification_service.start()
                     auto_verification_active = auto_payment_verification_service.is_running()
 
@@ -808,10 +938,12 @@ async def main():
                     exception = polling_task.exception()
                     if exception:
                         logger.error('Polling завершился с ошибкой', error=exception)
+                        shutdown_error, shutdown_source = exception, 'polling'
                         break
 
         except Exception as e:
             logger.error('Ошибка в основном цикле', error=e)
+            shutdown_error, shutdown_source = e, 'main_loop'
 
     except Exception as e:
         logger.error('❌ Критическая ошибка при запуске', error=e)
@@ -823,6 +955,20 @@ async def main():
             summary_logged = True
         logger.info('🛑 Начинается корректное завершение работы...')
 
+        # Первым делом, пока сессия бота жива: остальное завершение может не уложиться
+        # в отведённые Docker'ом ~10 секунд, и сообщение не ушло бы вовсе.
+        if started_at is not None and 'bot' in locals():
+            try:
+                from app.services.startup_notification_service import ShutdownReason, send_shutdown_notification
+
+                reason = ShutdownReason(signum=killer.signum, error=shutdown_error, source=shutdown_source)
+                await asyncio.wait_for(
+                    send_shutdown_notification(bot, reason, started_at=started_at),
+                    timeout=SHUTDOWN_NOTIFICATION_TIMEOUT_SECONDS,
+                )
+            except Exception as shutdown_notify_error:
+                logger.warning('Не удалось отправить уведомление об остановке', error=shutdown_notify_error)
+
         logger.info('ℹ️ Остановка сервиса автопроверки пополнений...')
         try:
             await auto_payment_verification_service.stop()
@@ -833,10 +979,19 @@ async def main():
             logger.info('ℹ️ Остановка службы мониторинга...')
             monitoring_service.stop_monitoring()
             monitoring_task.cancel()
-            try:
-                await monitoring_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.wait([monitoring_task])
+
+        logger.info('ℹ️ Остановка обходчика мониторов DPI//CHECKER...')
+        try:
+            await dpichecker_service.stop_background()
+        except Exception as error:
+            logger.warning('Не удалось остановить обходчик мониторов DPI//CHECKER', error=error)
+
+        logger.info('ℹ️ Остановка обходчика задач проверки доступности...')
+        try:
+            await reachability_service.stop_background()
+        except Exception as error:
+            logger.warning('Не удалось остановить обходчик задач проверки', error=error)
 
         if maintenance_task and not maintenance_task.done():
             logger.info('ℹ️ Остановка службы техработ...')
@@ -885,6 +1040,12 @@ async def main():
         except Exception as e:
             logger.error('Ошибка остановки сервиса конкурсов', error=e)
 
+        logger.info('ℹ️ Остановка сервиса grace-доступа...')
+        try:
+            await grace_access_runtime.stop()
+        except Exception as e:
+            logger.error('Ошибка остановки grace-доступа', error=e)
+
         logger.info('ℹ️ Остановка сервиса автосинхронизации RemnaWave...')
         try:
             await remnawave_sync_service.stop()
@@ -903,6 +1064,23 @@ async def main():
                 await log_rotation_service.stop()
             except Exception as e:
                 logger.error('Ошибка остановки сервиса ротации логов', error=e)
+
+        logger.info('ℹ️ Остановка очереди повторной отправки писем...')
+        try:
+            from app.services.email_retry_service import email_retry_service
+
+            await email_retry_service.stop()
+        except Exception as e:
+            logger.warning('Ошибка остановки очереди повторной отправки писем', error=e)
+
+        logger.info('ℹ️ Остановка журнала системных ошибок...')
+        try:
+            from app.services.system_error_log_service import system_error_log_service
+
+            await system_error_log_service.stop()
+        except Exception as e:
+            # warning: error отсюда ушёл бы в тот же конвейер, который мы гасим
+            logger.warning('Ошибка остановки журнала системных ошибок', error=e)
 
         logger.info('ℹ️ Остановка очереди чеков NaloGO...')
         try:

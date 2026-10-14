@@ -1,12 +1,21 @@
+import asyncio
 import html
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
 import structlog
 from aiogram import Bot, types
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from sqlalchemy.exc import MissingGreenlet
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy.exc import MissingGreenlet, NoInspectionAvailable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -16,15 +25,54 @@ from app.database.crud.transaction import get_transaction_by_id
 from app.database.crud.user import get_user_by_id
 from app.database.models import (
     AdvertisingCampaign,
+    AdvertisingCampaignRegistration,
     GuestPurchase,
     PromoCodeType,
     PromoGroup,
     Subscription,
     Transaction,
     User,
+    WithdrawalRequest,
+    WithdrawalRequestStatus,
 )
+from app.keyboards.group_callbacks import strip_group_unsafe_buttons
+from app.utils.formatters import format_username_link
 from app.utils.message_patch import caption_exceeds_telegram_limit
+from app.utils.rich_admin import classic_admin_html_to_rich, try_send_rich_admin_message
 from app.utils.timezone import format_local_datetime
+
+
+# Стандартный формат Telegram bot token: `<numeric_id>:<random_35chars>`.
+# Может появиться в str(e) от aiogram при сетевых ошибках, если транспорт
+# (httpx/aiohttp) сериализует URL `https://api.telegram.org/bot<TOKEN>/...`.
+# Не светим токен в логи (структурированные логи могут уехать в Sentry / ELK).
+# Trailing — negative lookahead, а не `\b`: иначе токены, оканчивающиеся
+# на `-` или `_`, теряли последний символ при редакции (1-char leak).
+# Leading `(?<![\w-])` — намеренно НЕ матчит, если перед токеном стоит word/digit
+# (например `foo123456789:AAH...`). Это trade-off против false-positive'ов
+# на timestamp/UUID-подобных последовательностях. Aiogram и httpx всегда
+# префиксят токен либо `bot`, либо URL-границей (`/`, пробел, кавычка),
+# так что реальный corpus ошибок не страдает.
+_BOT_TOKEN_RE: re.Pattern[str] = re.compile(
+    r'(?<![\w-])(?:bot)?\d{6,}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])',
+)
+
+
+def _redact_telegram_secrets(text: str) -> str:
+    """Replace Telegram bot tokens in an arbitrary string with a placeholder."""
+    return _BOT_TOKEN_RE.sub('bot[REDACTED]', text)
+
+
+def _format_waiting(waited_minutes: int) -> str:
+    """Сколько заявка ждёт решения: «3 д 4 ч», «2 ч 5 мин», «15 мин»."""
+    total = max(0, int(waited_minutes))
+    days, rest = divmod(total, 24 * 60)
+    hours, minutes = divmod(rest, 60)
+    if days:
+        return f'{days} д {hours} ч' if hours else f'{days} д'
+    if hours:
+        return f'{hours} ч {minutes} мин' if minutes else f'{hours} ч'
+    return f'{minutes} мин'
 
 
 class NotificationCategory(StrEnum):
@@ -43,6 +91,29 @@ class NotificationCategory(StrEnum):
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _loaded_relationship(instance: object, name: str) -> Any:
+    """Значение связи, только если она УЖЕ загружена; иначе None и никакого IO.
+
+    ``getattr(obj, name, None)`` для этого не годится: у незагруженной связи
+    async-сессия не отдаёт None, а лезет в базу — и падает MissingGreenlet, потому
+    что default у getattr срабатывает лишь на AttributeError.
+
+    Ровно на этом падало уведомление о регистрации по рекламной кампании:
+    apply_campaign_bonus перечитывает пользователя через ``db.refresh(user)``
+    (сам по себе — фикс прошлого MissingGreenlet), а refresh сбрасывает ранее
+    загруженные связи, включая promo_group.
+    """
+    try:
+        state = sa_inspect(instance)
+    except NoInspectionAvailable:
+        # Не ORM-объект (тестовые фейки, SimpleNamespace) — обычный доступ безопасен.
+        return getattr(instance, name, None)
+
+    if name in state.unloaded:
+        return None
+    return state.dict.get(name)
 
 
 class AdminNotificationService:
@@ -67,6 +138,12 @@ class AdminNotificationService:
             NotificationCategory.TICKETS: self.ticket_topic_id,
         }
 
+        # Per-category enabled flags (default True — backwards compatible)
+        self.category_enabled: dict[NotificationCategory, bool] = {}
+        for cat in NotificationCategory:
+            key = f'ADMIN_NOTIFICATIONS_{cat.value.upper()}_ENABLED'
+            self.category_enabled[cat] = getattr(settings, key, True)
+
     async def _get_referrer_info(self, db: AsyncSession, referred_by_id: int | None) -> str:
         if not referred_by_id:
             return 'Нет'
@@ -77,7 +154,7 @@ class AdminNotificationService:
                 return f'ID {referred_by_id} (не найден)'
 
             if referrer.username:
-                return f'@{html.escape(referrer.username)} (ID: {referred_by_id})'
+                return f'{format_username_link(referrer.username)} (ID: {referred_by_id})'
             if referrer.telegram_id:
                 return f'ID {referrer.telegram_id}'
             if referrer.email:
@@ -89,10 +166,17 @@ class AdminNotificationService:
             return f'ID {referred_by_id}'
 
     async def _get_user_promo_group(self, db: AsyncSession, user: User) -> PromoGroup | None:
-        if getattr(user, 'promo_group', None):
-            return user.promo_group
+        promo_group = _loaded_relationship(user, 'promo_group')
+        if promo_group:
+            return promo_group
 
-        if not user.promo_group_id:
+        try:
+            promo_group_id = user.promo_group_id
+        except Exception:
+            # Инстанс отвязан от сессии или протух — колонка тоже ушла бы в ленивую
+            # подгрузку. Берём последнее известное значение из __dict__.
+            promo_group_id = user.__dict__.get('promo_group_id')
+        if not promo_group_id:
             return None
 
         try:
@@ -101,16 +185,17 @@ class AdminNotificationService:
             # relationship might not be available — fallback to direct fetch
             pass
 
-        if getattr(user, 'promo_group', None):
-            return user.promo_group
+        promo_group = _loaded_relationship(user, 'promo_group')
+        if promo_group:
+            return promo_group
 
         try:
-            return await get_promo_group_by_id(db, user.promo_group_id)
+            return await get_promo_group_by_id(db, promo_group_id)
         except Exception as e:
             logger.error(
                 'Ошибка загрузки промогруппы пользователя',
-                promo_group_id=user.promo_group_id,
-                telegram_id=user.telegram_id,
+                promo_group_id=promo_group_id,
+                telegram_id=user.__dict__.get('telegram_id'),
                 e=e,
             )
             return None
@@ -267,6 +352,7 @@ class AdminNotificationService:
             PromoCodeType.TRIAL_SUBSCRIPTION.value: '🎁 Триал подписка',
             PromoCodeType.PROMO_GROUP.value: '👥 Промогруппа',
             PromoCodeType.DISCOUNT.value: '💸 Скидка',
+            PromoCodeType.BALANCE_AND_DAYS.value: '💰📅 Баланс + дни подписки',
         }
 
         if not promo_type:
@@ -283,9 +369,11 @@ class AdminNotificationService:
         if campaign.is_subscription_bonus:
             default_devices = getattr(settings, 'DEFAULT_DEVICE_LIMIT', 1)
             details = [
-                f'📅 {campaign.subscription_duration_days or 0} дн. '
-                f'• 📊 {campaign.subscription_traffic_gb or 0} ГБ '
-                f'• 📱 {campaign.subscription_device_limit or default_devices} устр.',
+                (
+                    f'📅 {campaign.subscription_duration_days or 0} дн. '
+                    f'• 📊 {campaign.subscription_traffic_gb or 0} ГБ '
+                    f'• 📱 {campaign.subscription_device_limit or default_devices} устр.'
+                ),
             ]
             if campaign.subscription_squads:
                 details.append(f'🌐 Сквады: {len(campaign.subscription_squads)} шт.')
@@ -323,8 +411,16 @@ class AdminNotificationService:
                 occurred_at=datetime.now(UTC),
                 extra={
                     'charged_amount_kopeks': charged_amount_kopeks,
-                    'trial_duration_days': settings.TRIAL_DURATION_DAYS,
-                    'traffic_limit_gb': settings.TRIAL_TRAFFIC_LIMIT_GB,
+                    'trial_duration_days': (
+                        max(1, round((subscription.end_date - subscription.start_date).total_seconds() / 86400))
+                        if subscription.end_date and subscription.start_date
+                        else settings.TRIAL_DURATION_DAYS
+                    ),
+                    'traffic_limit_gb': (
+                        subscription.traffic_limit_gb
+                        if subscription.traffic_limit_gb is not None
+                        else settings.TRIAL_TRAFFIC_LIMIT_GB
+                    ),
                     'device_limit': subscription.device_limit,
                 },
             )
@@ -359,7 +455,7 @@ class AdminNotificationService:
                 '',
                 f'👤 <b>Пользователь:</b> {user_display}',
                 f'🆔 <b>{user_id_label}:</b> {user_id_display}',
-                f'📱 <b>Username:</b> @{html.escape(getattr(user, "username", None) or "отсутствует")}',
+                f'📱 <b>Username:</b> {format_username_link(getattr(user, "username", None), "отсутствует")}',
                 f'👥 <b>Статус:</b> {user_status}',
                 '',
             ]
@@ -376,11 +472,23 @@ class AdminNotificationService:
 
             message_lines.append('')
 
+            trial_duration_days = settings.TRIAL_DURATION_DAYS
+            if subscription.end_date and subscription.start_date:
+                trial_duration_days = max(
+                    1, round((subscription.end_date - subscription.start_date).total_seconds() / 86400)
+                )
+
+            trial_traffic_gb = (
+                subscription.traffic_limit_gb
+                if subscription.traffic_limit_gb is not None
+                else settings.TRIAL_TRAFFIC_LIMIT_GB
+            )
+
             message_lines.extend(
                 [
                     '⏰ <b>Параметры триала:</b>',
-                    f'📅 Период: {settings.TRIAL_DURATION_DAYS} дней',
-                    f'📊 Трафик: {self._format_traffic(settings.TRIAL_TRAFFIC_LIMIT_GB)}',
+                    f'📅 Период: {trial_duration_days} дней',
+                    f'📊 Трафик: {self._format_traffic(trial_traffic_gb)}',
                     f'📱 Устройства: {trial_device_limit}',
                     f'🌐 Сервер: {subscription.connected_squads[0] if subscription.connected_squads else "По умолчанию"}',
                 ]
@@ -496,7 +604,7 @@ class AdminNotificationService:
             # Добавляем username только если есть
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             message_lines.append(f'📋 {user_status}')
 
@@ -659,7 +767,7 @@ class AdminNotificationService:
 
         username = getattr(user, 'username', None)
         if username:
-            message_lines.append(f'📱 @{html.escape(username)}')
+            message_lines.append(f'📱 {format_username_link(username)}')
 
         message_lines.append(f'💳 {topup_status}')
 
@@ -674,8 +782,10 @@ class AdminNotificationService:
             [
                 f'💵 <b>{settings.format_price(transaction.amount_kopeks)}</b> | {payment_method}',
                 '',
-                f'📉 {settings.format_price(old_balance)} → 📈 {settings.format_price(user.balance_kopeks)}'
-                f' (<b>+{settings.format_price(balance_change)}</b>)',
+                (
+                    f'📉 {settings.format_price(old_balance)} → 📈 {settings.format_price(user.balance_kopeks)}'
+                    f' (<b>+{settings.format_price(balance_change)}</b>)'
+                ),
             ]
         )
 
@@ -918,7 +1028,7 @@ class AdminNotificationService:
 
 👤 <b>Пользователь:</b> {user_display}
 🆔 <b>{user_id_label}:</b> {user_id_display}
-📱 <b>Username:</b> @{html.escape(getattr(user, 'username', None) or 'отсутствует')}
+📱 <b>Username:</b> {format_username_link(getattr(user, 'username', None), 'отсутствует')}
 
 {promo_block}
 
@@ -1005,7 +1115,7 @@ class AdminNotificationService:
                 '',
                 f'👤 <b>Пользователь:</b> {user_display}',
                 f'🆔 <b>{user_id_label}:</b> {user_id_display}',
-                f'📱 <b>Username:</b> @{html.escape(getattr(user, "username", None) or "отсутствует")}',
+                f'📱 <b>Username:</b> {format_username_link(getattr(user, "username", None), "отсутствует")}',
                 '',
                 promo_block,
                 '',
@@ -1069,7 +1179,27 @@ class AdminNotificationService:
         campaign: AdvertisingCampaign,
         user: User | None = None,
     ) -> bool:
+        # Дедуп: если юзер уже зарегистрирован в этой кампании
+        # (AdvertisingCampaignRegistration.UniqueConstraint(campaign_id, user_id))
+        # — повторный /start не должен слать новое уведомление в админ-чат, иначе
+        # кол-во сообщений в чате превышает реальное число регистраций в БД и
+        # вводит админа в заблуждение. Для новых юзеров (user is None) уведомление
+        # уходит как раньше — это первичный переход.
         if user:
+            existing_registration = await db.execute(
+                select(AdvertisingCampaignRegistration.id).where(
+                    AdvertisingCampaignRegistration.campaign_id == campaign.id,
+                    AdvertisingCampaignRegistration.user_id == user.id,
+                )
+            )
+            if existing_registration.scalar_one_or_none() is not None:
+                logger.debug(
+                    'Skip campaign visit notification: user already registered in campaign',
+                    user_id=user.id,
+                    campaign_id=campaign.id,
+                )
+                return False
+
             try:
                 await self._record_subscription_event(
                     db,
@@ -1110,7 +1240,7 @@ class AdminNotificationService:
             ]
 
             if telegram_user.username:
-                message_lines.append(f'📱 @{html.escape(telegram_user.username)}')
+                message_lines.append(f'📱 {format_username_link(telegram_user.username)}')
 
             message_lines.append(f'📋 {user_status}')
 
@@ -1149,6 +1279,95 @@ class AdminNotificationService:
 
         except Exception as e:
             logger.error('Ошибка отправки уведомления о переходе по кампании', error=e)
+            return False
+
+    async def send_campaign_registration_notification(
+        self,
+        db: AsyncSession,
+        telegram_user_id: int,
+        telegram_user_name: str,
+        telegram_username: str | None,
+        campaign: AdvertisingCampaign,
+        user: User,
+        *,
+        bonus_type: str,
+        balance_kopeks: int = 0,
+        subscription_days: int | None = None,
+        subscription_traffic_gb: int | None = None,
+        subscription_device_limit: int | None = None,
+        tariff_name: str | None = None,
+    ) -> bool:
+        """Уведомление о СОВЕРШЁННОЙ регистрации по рекламной кампании.
+
+        Шлётся ровно один раз на каждую новую запись в advertising_campaign_registrations
+        (caller передаёт is_new_registration=True). Это даёт паритет: число сообщений
+        в админ-чате равно числу регистраций в кабинете.
+        """
+        if not self._is_enabled():
+            return False
+
+        try:
+            await self._record_subscription_event(
+                db,
+                event_type='campaign_registration',
+                user=user,
+                subscription=None,
+                transaction=None,
+                amount_kopeks=balance_kopeks or None,
+                message='Campaign registration completed',
+                occurred_at=datetime.now(UTC),
+                extra={
+                    'campaign_id': campaign.id,
+                    'campaign_name': campaign.name,
+                    'start_parameter': campaign.start_parameter,
+                    'bonus_type': bonus_type,
+                },
+            )
+        except Exception:
+            logger.error(
+                'Не удалось сохранить событие регистрации по кампании',
+                user_id=user.id,
+                campaign_id=campaign.id,
+                exc_info=True,
+            )
+
+        try:
+            message_lines = [
+                '✅ <b>РЕГИСТРАЦИЯ ПО РК</b>',
+                '',
+                f'🧾 {html.escape(campaign.name)} (<code>{html.escape(campaign.start_parameter)}</code>)',
+                '',
+                f'👤 {html.escape(telegram_user_name)} (<code>{telegram_user_id}</code>)',
+            ]
+            if telegram_username:
+                message_lines.append(f'📱 {format_username_link(telegram_username)}')
+
+            promo_group = await self._get_user_promo_group(db, user)
+            if promo_group:
+                message_lines.append(f'🏷️ Промогруппа: {html.escape(promo_group.name)}')
+
+            message_lines.append('')
+
+            bonus_lines = self._format_campaign_bonus(campaign, tariff_name=tariff_name)
+            message_lines.extend(bonus_lines)
+
+            message_lines.extend(
+                [
+                    '',
+                    f'<i>{format_local_datetime(datetime.now(UTC), "%d.%m.%Y %H:%M:%S")}</i>',
+                ]
+            )
+
+            return await self._send_message('\n'.join(message_lines), category=NotificationCategory.PROMO)
+
+        except Exception as e:
+            logger.error(
+                'Ошибка отправки уведомления о регистрации по кампании',
+                error=str(e),
+                user_id=user.id,
+                campaign_id=campaign.id,
+                exc_info=True,
+            )
             return False
 
     async def send_user_promo_group_change_notification(
@@ -1210,7 +1429,7 @@ class AdminNotificationService:
                 '',
                 f'👤 <b>Пользователь:</b> {user_display}',
                 f'🆔 <b>{user_id_label}:</b> {user_id_display}',
-                f'📱 <b>Username:</b> @{html.escape(getattr(user, "username", None) or "отсутствует")}',
+                f'📱 <b>Username:</b> {format_username_link(getattr(user, "username", None), "отсутствует")}',
                 '',
                 self._format_promo_group_block(new_group, title='Новая промогруппа', icon='🏆'),
             ]
@@ -1255,44 +1474,165 @@ class AdminNotificationService:
                 return topic
         return self.topic_id
 
+    def resolve_recipient_role(self) -> str:
+        """Определяет роль получателя уведомления по chat_id.
+
+        В личном чате chat_id совпадает с telegram_id получателя, что позволяет
+        проверить права до отправки без I/O (данные читаются из памяти).
+
+        Returns:
+            'admin'     — полный набор кнопок;
+            'moderator' — набор без «👤 К пользователю» (@admin_required);
+            'group'     — групповой/супергруппа/канал админ-чат: только надёжные
+                          (не-FSM) кнопки, т.к. конкретного получателя не определить
+                          и FSM-ввод в общем чате не работает (privacy mode бота);
+            'none'      — без кнопок (посторонний в личке, либо
+                          ADMIN_NOTIFICATIONS_CHAT_ID задан строкой @username).
+        """
+        try:
+            chat_id = int(self.chat_id)
+        except (TypeError, ValueError):
+            return 'none'  # строка @username или None — тип чата не определить
+        if chat_id < 0:
+            # супергруппа / канал / старая группа — доверенный админ-чат оператора,
+            # но конкретного получателя не определить → только надёжные кнопки.
+            return 'group'
+        if chat_id == 0:
+            return 'none'  # невалидный chat_id
+        if settings.is_admin(chat_id):
+            return 'admin'
+
+        from app.services.support_settings_service import SupportSettingsService
+
+        if SupportSettingsService.is_moderator(chat_id):
+            return 'moderator'
+
+        return 'none'  # личка постороннего — не показываем кнопки
+
     async def _send_message(
         self,
         text: str,
         reply_markup: types.InlineKeyboardMarkup | None = None,
         *,
         category: NotificationCategory | None = None,
+        thread_id: int | None = None,
     ) -> bool:
-        if not self.chat_id:
-            logger.warning('ADMIN_NOTIFICATIONS_CHAT_ID не настроен')
+        if not self._is_enabled():
             return False
 
-        try:
-            message_kwargs = {
-                'chat_id': self.chat_id,
-                'text': text,
-                'parse_mode': 'HTML',
-                'disable_web_page_preview': True,
-            }
+        # Per-category suppression
+        if category and not self.category_enabled.get(category, True):
+            logger.debug('Уведомление подавлено (категория отключена)', category=category.value)
+            return False
 
+        # Явный thread_id (например, топик заявок на вывод) важнее топика категории
+        if thread_id is None:
             thread_id = self._resolve_topic_id(category)
-            if thread_id:
-                message_kwargs['message_thread_id'] = thread_id
-            if reply_markup is not None:
-                message_kwargs['reply_markup'] = reply_markup
 
-            await self.bot.send_message(**message_kwargs)
-            logger.info('Уведомление отправлено в чат', chat_id=self.chat_id, category=category)
-            return True
+        # В групповом админ-чате работают только разрешённые callback-кнопки
+        # (фильтр чатов глушит остальные): такие выкидываем здесь, а не рисуем
+        # мёртвыми. URL-кнопки и разрешённые действия остаются.
+        if reply_markup is not None and self.resolve_recipient_role() == 'group':
+            reply_markup, dropped = strip_group_unsafe_buttons(reply_markup)
+            if dropped:
+                logger.warning(
+                    'Кнопки не работают в групповом админ-чате — убраны из уведомления',
+                    chat_id=self.chat_id,
+                    dropped=dropped,
+                )
 
-        except TelegramForbiddenError:
-            logger.error('Бот не имеет прав для отправки в чат', chat_id=self.chat_id)
-            return False
-        except TelegramBadRequest as e:
-            logger.error('Ошибка отправки уведомления', error=e)
-            return False
-        except Exception as e:
-            logger.error('Неожиданная ошибка при отправке уведомления', error=e)
-            return False
+        # Rich-вид (Bot API 10.1): заголовок, разделители, footer с tg-time.
+        # При недоступности/ошибке молча продолжаем классическим путём ниже
+        # (там ретраи и обработка flood control).
+        try:
+            rich_html = classic_admin_html_to_rich(text)
+            if await try_send_rich_admin_message(
+                self.bot, self.chat_id, rich_html, thread_id=thread_id, reply_markup=reply_markup
+            ):
+                logger.info('Rich-уведомление отправлено в чат', chat_id=self.chat_id, category=category)
+                return True
+        except Exception as rich_error:
+            logger.warning('Сбой rich-рендера админ-уведомления', error=str(rich_error))
+
+        message_kwargs: dict[str, Any] = {
+            'chat_id': self.chat_id,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }
+        if thread_id:
+            message_kwargs['message_thread_id'] = thread_id
+        if reply_markup is not None:
+            message_kwargs['reply_markup'] = reply_markup
+
+        # ВАЖНО: вся ветка ошибок ниже логируется через logger.warning, а не
+        # logger.error. Иначе TelegramNotifierProcessor попытается переслать
+        # ошибку в этот же админ-чат, упрётся в тот же flood control — петля
+        # усиления (баг с node.connection_lost/restored, 7-8 webhook'ов подряд).
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self.bot.send_message(**message_kwargs)
+                logger.info('Уведомление отправлено в чат', chat_id=self.chat_id, category=category)
+                return True
+
+            except TelegramForbiddenError:
+                logger.warning('Бот не имеет прав для отправки в чат', chat_id=self.chat_id)
+                return False
+
+            except TelegramBadRequest as e:
+                logger.warning(
+                    'Ошибка отправки уведомления в админ-чат',
+                    error=_redact_telegram_secrets(str(e))[:200],
+                )
+                return False
+
+            except TelegramRetryAfter as e:
+                # Flood control: ждём столько, сколько сказал Telegram (cap 30s),
+                # потом ретраим. До фикса исключение проваливалось в bare
+                # except → logger.error → петля через TelegramNotifierProcessor.
+                requested_retry_after = max(1, int(getattr(e, 'retry_after', 1)))
+                retry_after = min(requested_retry_after, 30)
+                log_kwargs: dict[str, Any] = {
+                    'chat_id': self.chat_id,
+                    'retry_after': retry_after,
+                    'attempt': attempt,
+                }
+                if requested_retry_after > retry_after:
+                    # Telegram реально просит дольше cap'а — видимый сигнал,
+                    # что бот аккаунт перегружен сильнее обычного flood-control'а.
+                    log_kwargs['retry_after_requested'] = requested_retry_after
+                    log_kwargs['clamped'] = True
+                logger.warning('Telegram flood control при отправке в админ-чат', **log_kwargs)
+                if attempt < max_attempts:
+                    await asyncio.sleep(retry_after)
+                    continue
+                return False
+
+            except (TelegramNetworkError, TelegramServerError) as e:
+                # Транзиентные сетевые/5xx — warning, не error.
+                logger.warning(
+                    'Транзиентная сетевая ошибка отправки в админ-чат',
+                    chat_id=self.chat_id,
+                    error=_redact_telegram_secrets(str(e))[:200],
+                    error_type=type(e).__name__,
+                    attempt=attempt,
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                return False
+
+            except Exception as e:
+                logger.warning(
+                    'Неожиданная ошибка при отправке в админ-чат',
+                    chat_id=self.chat_id,
+                    error=_redact_telegram_secrets(str(e))[:200],
+                    error_type=type(e).__name__,
+                )
+                return False
+
+        return False
 
     def _is_enabled(self) -> bool:
         return self.enabled and bool(self.chat_id)
@@ -1321,29 +1661,22 @@ class AdminNotificationService:
         *,
         is_pending_activation: bool = False,
     ) -> bool:
-        """Send admin notification for a guest (landing page) purchase."""
+        """Send admin notification for a guest/gift purchase (landing or cabinet)."""
         if not self._is_enabled():
             return False
 
         try:
-            if is_pending_activation:
+            is_cabinet = purchase.source == 'cabinet'
+
+            # Event title
+            if is_cabinet and purchase.is_gift:
+                event_title = '🎁 ПОДАРОК ИЗ КАБИНЕТА'
+            elif is_pending_activation:
                 event_title = '⏳ ПОКУПКА С ЛЕНДИНГА (ожидает активации)'
             elif purchase.is_gift:
                 event_title = '🎁 ПОКУПКА В ПОДАРОК С ЛЕНДИНГА'
             else:
                 event_title = '🛒 ПОКУПКА С ЛЕНДИНГА'
-
-            # Landing page slug
-            landing_slug = '—'
-            try:
-                landing = purchase.landing
-                if landing:
-                    landing_slug = landing.slug
-                elif purchase.landing_id:
-                    landing_slug = f'ID:{purchase.landing_id}'
-            except Exception:
-                if purchase.landing_id:
-                    landing_slug = f'ID:{purchase.landing_id}'
 
             # Contact info
             contact_display = html.escape(purchase.contact_value or '—')
@@ -1354,14 +1687,42 @@ class AdminNotificationService:
             message_lines = [
                 f'<b>{event_title}</b>',
                 '',
-                f'🌐 Страница: <b>/buy/{html.escape(landing_slug)}</b>',
-                f'{contact_icon} Покупатель: <code>{contact_display}</code>',
             ]
 
+            if is_cabinet:
+                # Cabinet gift: show buyer with link to user profile
+                buyer = getattr(purchase, 'buyer', None)
+                if buyer:
+                    if buyer.username:
+                        buyer_display = format_username_link(buyer.username)
+                    else:
+                        buyer_name = buyer.email or f'id:{buyer.id}'
+                        buyer_display = f'<code>{html.escape(buyer_name)}</code>'
+                    message_lines.append(f'👤 Покупатель: {buyer_display}')
+                else:
+                    message_lines.append(f'{contact_icon} Покупатель: <code>{contact_display}</code>')
+            else:
+                # Landing: show page slug and buyer contact
+                landing_slug = '—'
+                try:
+                    landing = purchase.landing
+                    if landing:
+                        landing_slug = landing.slug
+                    elif purchase.landing_id:
+                        landing_slug = f'ID:{purchase.landing_id}'
+                except Exception:
+                    if purchase.landing_id:
+                        landing_slug = f'ID:{purchase.landing_id}'
+                message_lines.append(f'🌐 Страница: <b>/buy/{html.escape(landing_slug)}</b>')
+                message_lines.append(f'{contact_icon} Покупатель: <code>{contact_display}</code>')
+
             if purchase.is_gift:
-                recipient_value = html.escape(purchase.gift_recipient_value or '—')
-                recipient_icon = '📧' if purchase.gift_recipient_type == 'email' else '📱'
-                message_lines.append(f'{recipient_icon} Получатель: <code>{recipient_value}</code>')
+                if purchase.gift_recipient_value:
+                    recipient_icon = '📧' if purchase.gift_recipient_type == 'email' else '📱'
+                    recipient_value = html.escape(purchase.gift_recipient_value)
+                    message_lines.append(f'{recipient_icon} Получатель: <code>{recipient_value}</code>')
+                else:
+                    message_lines.append('🔗 Получатель: <i>по коду активации</i>')
                 if purchase.gift_message:
                     raw_msg = purchase.gift_message[:100]
                     suffix = '…' if len(purchase.gift_message) > 100 else ''
@@ -1387,6 +1748,80 @@ class AdminNotificationService:
 
         except Exception as e:
             logger.error('Ошибка отправки уведомления о гостевой покупке', error=e)
+            return False
+
+    async def send_grace_access_notification(
+        self,
+        *,
+        event: str,
+        user: User,
+        subscription: Subscription,
+        tariff_name: str | None,
+        reason: str,
+        grace_until: datetime,
+        hours: int,
+        quota_gb: float,
+        allowed: str,
+        completion_reason: str | None = None,
+        last_error: str | None = None,
+    ) -> bool:
+        """Выдача или завершение grace-доступа — в чат админов, категория «Продления».
+
+        Владелец: «выдача втухлую — это тупо»: админ обязан видеть, кому, почему и до
+        какого срока бот временно оставил доступ к тому, что оператор назвал в
+        GRACE_ACCESS_ALLOWED_SERVICES (``allowed``, уже экранировано), и чем это
+        закончилось — продлением, истечением срока или конфликтом с панелью.
+        """
+        try:
+            user_display = self._get_user_display(user)
+            user_id_label = self._get_user_identifier_label(user)
+            user_id_display = self._get_user_identifier_display(user)
+            username = format_username_link(getattr(user, 'username', None), 'отсутствует')
+            subscription_line = f'#{subscription.id}'
+            if tariff_name:
+                subscription_line += f' «{html.escape(tariff_name)}»'
+            reason_line = 'исчерпан трафик' if reason == 'limited' else 'срок подписки истёк'
+            quota_text = f'{quota_gb:g} ГБ'
+            until_text = format_local_datetime(grace_until, '%d.%m.%Y %H:%M')
+
+            if event == 'granted':
+                message = f"""🛟 <b>GRACE-ДОСТУП ВЫДАН</b>
+
+👤 <b>Пользователь:</b> {user_display}
+🆔 <b>{user_id_label}:</b> {user_id_display}
+📱 <b>Username:</b> {username}
+
+📋 <b>Подписка:</b> {subscription_line}
+⚠️ <b>Почему:</b> {reason_line}
+🛟 <b>Что выдано:</b> {allowed}, {quota_text} на {hours} ч.
+⏳ <b>Действует до:</b> {until_text}
+
+⏰ <i>{format_local_datetime(datetime.now(UTC), '%d.%m.%Y %H:%M:%S')}</i>"""
+            else:
+                outcomes = {
+                    'paid': '✅ человек продлил подписку — вернули обычный тариф',
+                    'timeout': '⌛ срок grace вышел, подписку не продлили — доступ закрыт',
+                    'drained': '🚰 grace выключают (слив) — доступ закрыт',
+                    'revoked': '🚫 отозван: пользователь заблокирован или подписка отключена',
+                    'conflict': '⚠️ конфликт с панелью — доступ закрыт',
+                }
+                outcome = outcomes.get(completion_reason or '', f'завершён ({completion_reason or "?"})')
+                error_line = f'\n❗ <code>{html.escape(last_error)}</code>' if last_error else ''
+                message = f"""🛟 <b>GRACE-ДОСТУП ЗАВЕРШЁН</b>
+
+👤 <b>Пользователь:</b> {user_display}
+🆔 <b>{user_id_label}:</b> {user_id_display}
+📱 <b>Username:</b> {username}
+
+📋 <b>Подписка:</b> {subscription_line}
+⚠️ <b>Был выдан:</b> {reason_line}, до {until_text}
+🏁 <b>Итог:</b> {outcome}{error_line}
+
+⏰ <i>{format_local_datetime(datetime.now(UTC), '%d.%m.%Y %H:%M:%S')}</i>"""
+
+            return await self._send_message(message, category=NotificationCategory.RENEWALS)
+        except Exception as error:
+            logger.error('Ошибка отправки уведомления о grace-доступе', error=error)
             return False
 
     async def send_webhook_notification(self, text: str) -> bool:
@@ -1416,6 +1851,10 @@ class AdminNotificationService:
             'cloudpayments': f'💳 {settings.get_cloudpayments_display_name()}',
             'freekassa': f'💳 {settings.get_freekassa_display_name()}',
             'kassa_ai': f'💳 {settings.get_kassa_ai_display_name()}',
+            'cispay': f'💳 {settings.get_cispay_display_name()}',
+            'cashera': f'💳 {settings.get_cashera_display_name()}',
+            'tabpay': f'💳 {settings.get_tabpay_display_name()}',
+            'paritypay': f'💳 {settings.get_paritypay_display_name()}',
             'manual': '🛠️ Вручную (админ)',
             'balance': '💰 С баланса',
         }
@@ -1442,7 +1881,7 @@ class AdminNotificationService:
             return '❌ Нет серверов'
 
         try:
-            from app.handlers.subscription import get_servers_display_names
+            from app.handlers.subscription.devices import get_servers_display_names
 
             servers_names = await get_servers_display_names(squad_uuids)
             return f'{len(squad_uuids)} шт. ({servers_names})'
@@ -1712,7 +2151,7 @@ class AdminNotificationService:
             # Добавляем username только если есть
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             # Тариф (если есть)
             if tariff_name:
@@ -1772,7 +2211,7 @@ class AdminNotificationService:
             return 'Нет серверов'
 
         try:
-            from app.handlers.subscription import get_servers_display_names
+            from app.handlers.subscription.devices import get_servers_display_names
 
             servers_names = await get_servers_display_names(server_uuids)
 
@@ -1818,7 +2257,7 @@ class AdminNotificationService:
 
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             message_lines.append('')
 
@@ -1856,8 +2295,14 @@ class AdminNotificationService:
         user: User,
         amount_kopeks: int,
         payment_details: str | None = None,
+        *,
+        request_id: int | None = None,
     ) -> bool:
-        """Уведомление о запросе на вывод средств."""
+        """Уведомление о запросе на вывод средств.
+
+        С ``request_id`` к уведомлению прикладываются кнопки «Одобрить»/«Отклонить»
+        по роли получателя — как у заявки, поданной из бота.
+        """
         if not self._is_enabled():
             return False
 
@@ -1873,7 +2318,7 @@ class AdminNotificationService:
 
             username = getattr(user, 'username', None)
             if username:
-                message_lines.append(f'📱 @{html.escape(username)}')
+                message_lines.append(f'📱 {format_username_link(username)}')
 
             message_lines.extend(
                 [
@@ -1896,10 +2341,84 @@ class AdminNotificationService:
                 ]
             )
 
-            return await self._send_message('\n'.join(message_lines), category=NotificationCategory.PARTNERS)
+            reply_markup = None
+            if request_id is not None:
+                from app.keyboards.withdrawal import get_withdrawal_request_keyboard
+
+                reply_markup = get_withdrawal_request_keyboard(
+                    request_id,
+                    WithdrawalRequestStatus.PENDING.value,
+                    user_db_id=getattr(user, 'id', None),
+                    role=self.resolve_recipient_role(),
+                )
+
+            return await self._send_message(
+                '\n'.join(message_lines), reply_markup=reply_markup, category=NotificationCategory.PARTNERS
+            )
 
         except Exception as e:
             logger.error('Ошибка отправки уведомления о запросе на вывод', error=e)
+            return False
+
+    async def send_withdrawal_pending_reminder(self, request: WithdrawalRequest, waited_minutes: int) -> bool:
+        """Напоминание о заявке на вывод, которая ждёт решения дольше лимита.
+
+        Аналог SLA-напоминания по тикетам. Уходит в топик заявок на вывод
+        (REFERRAL_WITHDRAWAL_NOTIFICATIONS_TOPIC_ID), а без него — по категории
+        PARTNERS, то есть туда же, куда пришло исходное уведомление о заявке.
+        Кнопки — та же клавиатура, что у исходного уведомления, по роли получателя:
+        решить заявку можно прямо отсюда.
+        """
+        if not self._is_enabled():
+            return False
+
+        try:
+            from app.keyboards.withdrawal import get_withdrawal_request_keyboard
+
+            user = getattr(request, 'user', None)
+            user_display = self._get_user_display(user) if user else 'Unknown'
+            user_id_display = self._get_user_identifier_display(user) if user else '—'
+            username = getattr(user, 'username', None) if user else None
+
+            message_lines = [
+                '⏰ <b>Заявка на вывод ждёт решения</b>',
+                '',
+                f'🆔 <b>Заявка:</b> #{request.id}',
+                f'👤 <b>Пользователь:</b> {user_display} ({user_id_display})',
+            ]
+            if username:
+                message_lines.append(f'📱 <b>Username:</b> {format_username_link(username)}')
+            message_lines.extend(
+                [
+                    f'💵 <b>Сумма:</b> {settings.format_price(request.amount_kopeks)}',
+                    f'⏱️ <b>Ожидает решения:</b> {_format_waiting(waited_minutes)}',
+                ]
+            )
+
+            # Та же клавиатура, что у исходного уведомления. Собранная вручную вела на
+            # admin_user_<telegram_id> — у такого callback обработчика нет, — рисовала
+            # профиль в групповом чате и давала модератору кнопки, которые ответят
+            # «нет доступа».
+            keyboard = get_withdrawal_request_keyboard(
+                request.id,
+                WithdrawalRequestStatus.PENDING.value,
+                user_db_id=getattr(request, 'user_id', None) or getattr(user, 'id', None),
+                role=self.resolve_recipient_role(),
+            )
+
+            topic_id = getattr(settings, 'REFERRAL_WITHDRAWAL_NOTIFICATIONS_TOPIC_ID', None) or None
+            return await self._send_message(
+                '\n'.join(message_lines),
+                reply_markup=keyboard,
+                category=NotificationCategory.PARTNERS,
+                thread_id=topic_id,
+            )
+        except Exception as e:
+            logger.error(
+                'Ошибка отправки напоминания о заявке на вывод',
+                request_id=getattr(request, 'id', None),
+                error=e,
+            )
             return False
 
     async def send_bulk_ban_notification(
@@ -1967,7 +2486,7 @@ class AdminNotificationService:
             runtime_enabled = True
         if not (self._is_enabled() and runtime_enabled):
             logger.info(
-                'Ticket notification skipped: _is_enabled=, runtime_enabled',
+                'Ticket notification skipped',
                 _is_enabled=self._is_enabled(),
                 runtime_enabled=runtime_enabled,
             )
@@ -2047,8 +2566,7 @@ class AdminNotificationService:
             bot: экземпляр бота для отправки сообщения
             topic_id: ID топика для отправки уведомления (если не указан, использует стандартный)
         """
-        if not self.chat_id:
-            logger.warning('ADMIN_NOTIFICATIONS_CHAT_ID не настроен')
+        if not self._is_enabled() or not self.category_enabled.get(NotificationCategory.INFRASTRUCTURE, True):
             return False
 
         # Используем специальный топик для подозрительной активности, если он задан

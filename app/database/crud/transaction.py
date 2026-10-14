@@ -5,29 +5,64 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.database.local_date import as_date, local_date_expr
 from app.database.models import PaymentMethod, Transaction, TransactionType, User
+from app.utils.timezone import local_day_bounds, local_day_start, local_month_start
 
 
 logger = structlog.get_logger(__name__)
 
-# Реальные платёжные методы для подсчёта дохода
-# Исключены: MANUAL (админские), BALANCE (оплата с баланса), NULL (колесо, промокоды, бонусы)
-REAL_PAYMENT_METHODS = [
-    PaymentMethod.TELEGRAM_STARS.value,
-    PaymentMethod.TRIBUTE.value,
-    PaymentMethod.YOOKASSA.value,
-    PaymentMethod.CRYPTOBOT.value,
-    PaymentMethod.HELEKET.value,
-    PaymentMethod.MULENPAY.value,
-    PaymentMethod.PAL24.value,
-    PaymentMethod.WATA.value,
-    PaymentMethod.PLATEGA.value,
-    PaymentMethod.CLOUDPAYMENTS.value,
-    PaymentMethod.FREEKASSA.value,
-    PaymentMethod.KASSA_AI.value,
-    PaymentMethod.RIOPAY.value,
-    PaymentMethod.SEVERPAY.value,
-]
+# Реальные платёжные методы для подсчёта дохода.
+#
+# Выводим из enum, а не перечисляем руками: раньше список хардкодился, и каждый
+# новый шлюз надо было не забыть добавить — Jupiter/Donut/Lava забыли, и их выручка
+# выпадала из ВСЕХ отчётов (сводка, по методам, партнёрка, ежедневный отчёт, webapi).
+# Теперь новый шлюз попадает в статистику автоматически.
+#
+# Исключаем только НЕ-шлюзовые значения enum:
+#   MANUAL  — админские пополнения (считаются отдельной строкой, не как доход шлюза);
+#   BALANCE — оплата с баланса (иначе двойной счёт: деньги уже учтены при пополнении).
+# Все остальные значения PaymentMethod — реальные платёжные шлюзы.
+_NON_GATEWAY_METHODS = frozenset(
+    {
+        PaymentMethod.MANUAL.value,
+        PaymentMethod.BALANCE.value,
+    }
+)
+REAL_PAYMENT_METHODS = [m.value for m in PaymentMethod if m.value not in _NON_GATEWAY_METHODS]
+
+
+# ── Доп. услуги (докупка трафика / устройств) ──────────────────────────────────
+#
+# Допы переиспользуют тип SUBSCRIPTION_PAYMENT, поэтому отличить их от настоящих
+# продаж/продлений можно только по тексту описания. Описания — захардкоженные
+# литералы в местах покупки (НЕ через texts.t), поэтому подстроки стабильны для
+# любого языка интерфейса. Держим их единым списком, чтобы хрупкое сопоставление
+# жило в одном месте, а не дублировалось по эндпоинтам.
+#
+# ВАЖНО (известное ограничение): если ТАРИФ назван со словом «трафик»/«устройств»,
+# обычная покупка/продление такого тарифа ложно попадёт под фильтр. Надёжное
+# решение — отдельный тип/маркер транзакции для допов; пока его нет, фрагильность
+# локализована здесь. Английский вариант «Traffic upgrade …» (кабинет) раньше
+# выпадал из %трафик% — теперь учтён.
+TRAFFIC_ADDON_PATTERNS = ('%трафик%', '%traffic upgrade%')
+DEVICE_ADDON_PATTERNS = ('%устройств%',)
+ADDON_DESCRIPTION_PATTERNS = (*TRAFFIC_ADDON_PATTERNS, *DEVICE_ADDON_PATTERNS)
+
+
+def traffic_addon_clause(description_column):
+    """SQL-условие: описание транзакции похоже на докупку трафика."""
+    return or_(*(description_column.ilike(p) for p in TRAFFIC_ADDON_PATTERNS))
+
+
+def device_addon_clause(description_column):
+    """SQL-условие: описание транзакции похоже на покупку доп. устройств."""
+    return or_(*(description_column.ilike(p) for p in DEVICE_ADDON_PATTERNS))
+
+
+def addon_description_clause(description_column):
+    """SQL-условие: транзакция — любой доп (трафик или устройства), не продажа/продление."""
+    return or_(*(description_column.ilike(p) for p in ADDON_DESCRIPTION_PATTERNS))
 
 
 async def create_transaction(
@@ -76,7 +111,7 @@ async def create_transaction(
     await db.refresh(transaction)
 
     logger.info(
-        '💳 Создана транзакция: на ₽ для пользователя',
+        '💳 Создана транзакция',
         type_value=type.value,
         amount_kopeks=stored_amount / 100,
         user_id=user_id,
@@ -125,6 +160,19 @@ async def create_transaction(
                 )
             except Exception as exc:
                 logger.debug('Не удалось записать событие конкурса для пользователя', user_id=user_id, exc=exc)
+
+            # Yandex.Metrika offline conversion — central chokepoint.
+            # Every completed SUBSCRIPTION_PAYMENT (cabinet, bot handlers, guest,
+            # stars, trial→paid conversion, autopay/recurring, IAP, webhooks)
+            # passes through here, so the purchase event fires exactly once per
+            # paid purchase. Background task with its own DB session; no-ops when
+            # the service is disabled or no CID is stored.
+            try:
+                from app.services import yandex_offline_conv_service as yandex_conv
+
+                yandex_conv.spawn_bg(yandex_conv.fire_purchase_bg(user_id, abs(amount_kopeks)))
+            except Exception as exc:
+                logger.debug('Не удалось отправить Yandex purchase для пользователя', user_id=user_id, exc=exc)
 
     return transaction
 
@@ -187,6 +235,17 @@ async def emit_transaction_side_effects(
         except Exception as exc:
             logger.debug('Не удалось записать событие конкурса для пользователя', user_id=user_id, exc=exc)
 
+        # Yandex.Metrika offline conversion — central chokepoint (deferred path
+        # for create_transaction(commit=False) callers). Fires the purchase event
+        # exactly once per completed SUBSCRIPTION_PAYMENT. Background task with
+        # its own DB session; no-ops when disabled or no CID stored.
+        try:
+            from app.services import yandex_offline_conv_service as yandex_conv
+
+            yandex_conv.spawn_bg(yandex_conv.fire_purchase_bg(user_id, abs(amount_kopeks)))
+        except Exception as exc:
+            logger.debug('Не удалось отправить Yandex purchase для пользователя', user_id=user_id, exc=exc)
+
 
 async def get_transaction_by_id(db: AsyncSession, transaction_id: int) -> Transaction | None:
     result = await db.execute(
@@ -230,6 +289,11 @@ async def get_user_transactions_count(
 
 
 async def get_user_total_spent_kopeks(db: AsyncSession, user_id: int) -> int:
+    """Sum of personal spending for promo group auto-assignment.
+
+    Only counts SUBSCRIPTION_PAYMENT (user's own subscriptions).
+    GIFT_PAYMENT is excluded — buying a gift for someone else is not personal spending.
+    """
     result = await db.execute(
         select(func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0)).where(
             and_(
@@ -240,6 +304,31 @@ async def get_user_total_spent_kopeks(db: AsyncSession, user_id: int) -> int:
         )
     )
     return int(result.scalar_one())
+
+
+async def get_last_subscription_payment_at(db: AsyncSession, user_id: int) -> datetime | None:
+    """Когда человек последний раз платил за подписку (завершённая оплата подписки).
+
+    Нужна панельной сверке: пока с оплаты не прошло двух суток, более ранняя дата
+    из панели считается устаревшим снимком, а не правкой оператора.
+    """
+    result = await db.execute(
+        select(func.max(Transaction.created_at)).where(
+            and_(
+                Transaction.user_id == user_id,
+                Transaction.is_completed.is_(True),
+                Transaction.type == TransactionType.SUBSCRIPTION_PAYMENT.value,
+            )
+        )
+    )
+    value = result.scalar_one_or_none()
+    # Не дата (пустая выборка, чужой драйвер, подменённая сессия в тестах) —
+    # оплаты не было: сторож оплаченного срока молчит, панель — истина как раньше.
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value
 
 
 async def complete_transaction(db: AsyncSession, transaction: Transaction) -> Transaction:
@@ -279,7 +368,7 @@ async def get_transactions_statistics(
     db: AsyncSession, start_date: datetime | None = None, end_date: datetime | None = None
 ) -> dict:
     if not start_date:
-        start_date = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_date = local_month_start()
     if not end_date:
         end_date = datetime.now(UTC)
 
@@ -360,10 +449,15 @@ async def get_transactions_statistics(
         row.payment_method: {'count': row.count, 'amount': row.total_amount} for row in payment_methods_result
     }
 
-    today = datetime.now(UTC).date()
+    # «Сегодня» — календарный день settings.TIMEZONE, границы в UTC (#3136).
+    today_start, today_end = local_day_bounds()
     today_result = await db.execute(
         select(func.count(Transaction.id)).where(
-            and_(Transaction.is_completed == True, Transaction.created_at >= today)
+            and_(
+                Transaction.is_completed == True,
+                Transaction.created_at >= today_start,
+                Transaction.created_at < today_end,
+            )
         )
     )
     transactions_today = today_result.scalar()
@@ -374,7 +468,8 @@ async def get_transactions_statistics(
             and_(
                 Transaction.type.in_([TransactionType.DEPOSIT.value, TransactionType.SUBSCRIPTION_PAYMENT.value]),
                 Transaction.is_completed == True,
-                Transaction.created_at >= today,
+                Transaction.created_at >= today_start,
+                Transaction.created_at < today_end,
                 Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
             )
         )
@@ -396,12 +491,17 @@ async def get_transactions_statistics(
 
 
 async def get_revenue_by_period(db: AsyncSession, days: int = 30) -> list[dict]:
-    """Доход по дням — реальные платежи + прямые покупки подписок (лендинги)."""
-    start_date = datetime.now(UTC) - timedelta(days=days)
+    """Доход по календарным дням settings.TIMEZONE за последние ``days`` дней, включая сегодня.
+
+    Реальные платежи + прямые покупки подписок (лендинги). ``date`` в строках —
+    всегда ``date``, на любой БД.
+    """
+    start_date = local_day_start(days_back=max(days, 1) - 1)
+    day = local_date_expr(Transaction.created_at, db)
 
     result = await db.execute(
         select(
-            func.date(Transaction.created_at).label('date'),
+            day.label('date'),
             func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0).label('amount'),
         )
         .where(
@@ -412,11 +512,11 @@ async def get_revenue_by_period(db: AsyncSession, days: int = 30) -> list[dict]:
                 Transaction.payment_method.in_(REAL_PAYMENT_METHODS),
             )
         )
-        .group_by(func.date(Transaction.created_at))
-        .order_by(func.date(Transaction.created_at))
+        .group_by(day)
+        .order_by(day)
     )
 
-    return [{'date': row.date, 'amount_kopeks': row.amount} for row in result]
+    return [{'date': as_date(row.date), 'amount_kopeks': row.amount} for row in result]
 
 
 async def find_tribute_transactions_by_payment_id(
@@ -475,18 +575,42 @@ async def check_tribute_payment_duplicate(
 
 async def create_unique_tribute_transaction(
     db: AsyncSession, user_id: int, payment_id: str, amount_kopeks: int, description: str
-) -> Transaction:
+) -> tuple[Transaction, bool]:
+    """Create a Tribute deposit transaction idempotently.
+
+    Returns ``(transaction, created)``. When ``created`` is False the payment was
+    already processed (a replayed webhook) and the caller MUST NOT credit the balance
+    again.
+
+    Без коммита (flush) — вызывающий коммитит транзакцию вместе с зачислением
+    и после коммита вызывает ``emit_transaction_side_effects``.
+    """
     external_id = f'donation_{payment_id}'
 
     existing = await get_transaction_by_external_id(db, external_id, PaymentMethod.TRIBUTE)
 
     if existing:
+        # Synthesized fallback ids (``tribute_<tg>_<amount>``) are NOT unique per payment,
+        # so a user legitimately repeating a same-amount donation must still be credited —
+        # keep the disambiguating suffix for those only. A real Tribute event id is unique,
+        # so a collision there means a replayed webhook: stay idempotent and do not
+        # double-credit. (The previous unconditional timestamped suffix defeated the
+        # uq_transaction_external_id_method constraint and credited again on every replay
+        # delivered after the 24h dedup window.)
+        if not str(payment_id).startswith('tribute_'):
+            logger.info(
+                'Tribute: повторный webhook с тем же payment_id — идемпотентно, начисление пропускаем',
+                external_id=external_id,
+                transaction_id=existing.id,
+            )
+            return existing, False
+
         timestamp = int(datetime.now(UTC).timestamp())
         external_id = f'donation_{payment_id}_{amount_kopeks}_{timestamp}'
 
-        logger.info('Создан уникальный external_id для избежания дубликатов', external_id=external_id)
+        logger.info('Создан уникальный external_id для fallback payment_id', external_id=external_id)
 
-    return await create_transaction(
+    transaction = await create_transaction(
         db=db,
         user_id=user_id,
         type=TransactionType.DEPOSIT,
@@ -495,4 +619,6 @@ async def create_unique_tribute_transaction(
         payment_method=PaymentMethod.TRIBUTE,
         external_id=external_id,
         is_completed=True,
+        commit=False,
     )
+    return transaction, True

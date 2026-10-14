@@ -28,7 +28,9 @@ from app.database.crud.promocode import (
     get_promocodes_list,
     update_promocode,
 )
+from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import PromoCode, PromoCodeType, PromoCodeUse, PromoGroup, User
+from app.services.promo_group_recalculation import promo_group_recalculation
 
 from ..dependencies import get_cabinet_db, require_permission
 
@@ -46,6 +48,7 @@ class PromoCodeResponse(BaseModel):
     balance_bonus_kopeks: int
     balance_bonus_rubles: float
     subscription_days: int
+    traffic_gb: int = 0
     max_uses: int
     current_uses: int
     uses_left: int
@@ -55,6 +58,8 @@ class PromoCodeResponse(BaseModel):
     valid_from: datetime
     valid_until: datetime | None = None
     promo_group_id: int | None = None
+    tariff_id: int | None = None
+    tariff_name: str | None = None
     created_by: int | None = None
     created_at: datetime
     updated_at: datetime
@@ -87,12 +92,14 @@ class PromoCodeCreateRequest(BaseModel):
     type: PromoCodeType
     balance_bonus_kopeks: int = 0
     subscription_days: int = 0
+    traffic_gb: int = 0
     max_uses: int = Field(default=1, ge=0)
     valid_from: datetime | None = None
     valid_until: datetime | None = None
     is_active: bool = True
     first_purchase_only: bool = False
     promo_group_id: int | None = None
+    tariff_id: int | None = None
 
 
 class PromoCodeUpdateRequest(BaseModel):
@@ -100,12 +107,14 @@ class PromoCodeUpdateRequest(BaseModel):
     type: PromoCodeType | None = None
     balance_bonus_kopeks: int | None = None
     subscription_days: int | None = None
+    traffic_gb: int | None = None
     max_uses: int | None = Field(default=None, ge=0)
     valid_from: datetime | None = None
     valid_until: datetime | None = None
     is_active: bool | None = None
     first_purchase_only: bool | None = None
     promo_group_id: int | None = None
+    tariff_id: int | None = None
 
 
 # ============== PromoGroup Schemas ==============
@@ -155,6 +164,26 @@ class PromoGroupUpdateRequest(BaseModel):
     is_default: bool | None = None
 
 
+class PromoGroupRecalculationLast(BaseModel):
+    """Итог последнего прохода пересчёта людей по тратам."""
+
+    reason: str
+    checked: int
+    changed: int
+    failed: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+
+
+class PromoGroupRecalculationStatus(BaseModel):
+    running: bool
+    queued: bool = False
+    reason: str | None = None
+    started: bool = False
+    last: PromoGroupRecalculationLast | None = None
+
+
 # ============== Helpers ==============
 
 
@@ -168,7 +197,12 @@ def _normalize_datetime(value: datetime | None) -> datetime | None:
     return value
 
 
-def _serialize_promocode(promocode: PromoCode) -> PromoCodeResponse:
+async def _serialize_promocode(db: AsyncSession, promocode: PromoCode) -> PromoCodeResponse:
+    tariff_name = None
+    if promocode.tariff_id:
+        tariff = await get_tariff_by_id(db, promocode.tariff_id)
+        tariff_name = tariff.name if tariff else None
+
     promo_type = PromoCodeType(promocode.type)
     return PromoCodeResponse(
         id=promocode.id,
@@ -177,6 +211,7 @@ def _serialize_promocode(promocode: PromoCode) -> PromoCodeResponse:
         balance_bonus_kopeks=promocode.balance_bonus_kopeks,
         balance_bonus_rubles=round(promocode.balance_bonus_kopeks / 100, 2),
         subscription_days=promocode.subscription_days,
+        traffic_gb=getattr(promocode, 'traffic_gb', 0) or 0,
         max_uses=promocode.max_uses,
         current_uses=promocode.current_uses,
         uses_left=promocode.uses_left,
@@ -186,6 +221,8 @@ def _serialize_promocode(promocode: PromoCode) -> PromoCodeResponse:
         valid_from=promocode.valid_from,
         valid_until=promocode.valid_until,
         promo_group_id=promocode.promo_group_id,
+        tariff_id=promocode.tariff_id,
+        tariff_name=tariff_name,
         created_by=promocode.created_by,
         created_at=promocode.created_at,
         updated_at=promocode.updated_at,
@@ -243,7 +280,23 @@ def _validate_create_payload(payload: PromoCodeCreateRequest) -> None:
     if payload.type == PromoCodeType.BALANCE and payload.balance_bonus_kopeks <= 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Balance bonus must be positive for balance promo codes')
 
-    if payload.type in {PromoCodeType.SUBSCRIPTION_DAYS, PromoCodeType.TRIAL_SUBSCRIPTION}:
+    # Набор бонусов собирается галочками, поэтому жёстко требовать все
+    # составляющие нельзя — достаточно, чтобы хоть что-то начислялось.
+    if payload.type == PromoCodeType.BALANCE_AND_DAYS and not (
+        payload.balance_bonus_kopeks > 0 or payload.subscription_days > 0 or payload.traffic_gb > 0
+    ):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            'Bonus set must grant at least one of: balance, subscription days, traffic',
+        )
+
+    if payload.traffic_gb < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Traffic must not be negative')
+
+    if payload.type in {
+        PromoCodeType.SUBSCRIPTION_DAYS,
+        PromoCodeType.TRIAL_SUBSCRIPTION,
+    }:
         if payload.subscription_days <= 0:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, 'Subscription days must be positive for this promo code type'
@@ -252,8 +305,9 @@ def _validate_create_payload(payload: PromoCodeCreateRequest) -> None:
     if payload.type == PromoCodeType.DISCOUNT:
         if payload.balance_bonus_kopeks <= 0 or payload.balance_bonus_kopeks > 100:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Discount percent must be between 1 and 100')
-        if payload.subscription_days <= 0:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Discount validity hours must be positive')
+        # 0 hours = perpetual ("until first purchase"), matching the bot + service.
+        if payload.subscription_days < 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Discount validity hours cannot be negative')
 
     if normalized_valid_from and normalized_valid_until and normalized_valid_from > normalized_valid_until:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'valid_from cannot be greater than valid_until')
@@ -274,9 +328,22 @@ def _validate_update_payload(payload: PromoCodeUpdateRequest, promocode: PromoCo
     subscription_days = (
         payload.subscription_days if payload.subscription_days is not None else promocode.subscription_days
     )
+    traffic_gb = payload.traffic_gb if payload.traffic_gb is not None else (getattr(promocode, 'traffic_gb', 0) or 0)
 
     if new_type == PromoCodeType.BALANCE and balance_bonus <= 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Balance bonus must be positive for balance promo codes')
+
+    # Набор бонусов: достаточно одной включённой составляющей (см. создание).
+    if new_type == PromoCodeType.BALANCE_AND_DAYS and not (
+        balance_bonus > 0 or subscription_days > 0 or traffic_gb > 0
+    ):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            'Bonus set must grant at least one of: balance, subscription days, traffic',
+        )
+
+    if traffic_gb < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Traffic must not be negative')
 
     if new_type in {PromoCodeType.SUBSCRIPTION_DAYS, PromoCodeType.TRIAL_SUBSCRIPTION}:
         if subscription_days <= 0:
@@ -287,8 +354,9 @@ def _validate_update_payload(payload: PromoCodeUpdateRequest, promocode: PromoCo
     if new_type == PromoCodeType.DISCOUNT:
         if balance_bonus <= 0 or balance_bonus > 100:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Discount percent must be between 1 and 100')
-        if subscription_days <= 0:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Discount validity hours must be positive')
+        # 0 hours = perpetual ("until first purchase"), matching the bot + service.
+        if subscription_days < 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Discount validity hours cannot be negative')
 
     valid_from = _normalize_datetime(payload.valid_from) if payload.valid_from is not None else promocode.valid_from
     valid_until = _normalize_datetime(payload.valid_until) if payload.valid_until is not None else promocode.valid_until
@@ -315,8 +383,9 @@ async def list_promocodes(
     total = await get_promocodes_count(db, is_active=is_active) or 0
     promocodes = await get_promocodes_list(db, offset=offset, limit=limit, is_active=is_active)
 
+    serialized = [await _serialize_promocode(db, p) for p in promocodes]
     return PromoCodeListResponse(
-        items=[_serialize_promocode(promocode) for promocode in promocodes],
+        items=serialized,
         total=int(total),
         limit=limit,
         offset=offset,
@@ -335,7 +404,7 @@ async def get_promocode(
         raise HTTPException(status.HTTP_404_NOT_FOUND, 'Promo code not found')
 
     stats = await get_promocode_statistics(db, promocode_id)
-    base = _serialize_promocode(promocode)
+    base = await _serialize_promocode(db, promocode)
     recent_uses = [_serialize_recent_use(use) for use in stats.get('recent_uses', [])]
 
     return PromoCodeDetailResponse(
@@ -372,6 +441,7 @@ async def create_promocode_endpoint(
         type=payload.type,
         balance_bonus_kopeks=payload.balance_bonus_kopeks,
         subscription_days=payload.subscription_days,
+        traffic_gb=payload.traffic_gb,
         max_uses=effective_max_uses,
         valid_until=normalized_valid_until,
         created_by=admin.id,
@@ -388,11 +458,13 @@ async def create_promocode_endpoint(
         update_fields['first_purchase_only'] = payload.first_purchase_only
     if payload.promo_group_id is not None:
         update_fields['promo_group_id'] = payload.promo_group_id
+    if payload.tariff_id is not None:
+        update_fields['tariff_id'] = payload.tariff_id
 
     if update_fields:
         promocode = await update_promocode(db, promocode, **update_fields)
 
-    return _serialize_promocode(promocode)
+    return await _serialize_promocode(db, promocode)
 
 
 @router.patch('/{promocode_id}', response_model=PromoCodeResponse)
@@ -427,6 +499,8 @@ async def update_promocode_endpoint(
 
     if payload.subscription_days is not None:
         updates['subscription_days'] = payload.subscription_days
+    if payload.traffic_gb is not None:
+        updates['traffic_gb'] = payload.traffic_gb
 
     if payload.max_uses is not None:
         updates['max_uses'] = 999999 if payload.max_uses == 0 else payload.max_uses
@@ -446,11 +520,14 @@ async def update_promocode_endpoint(
     if payload.promo_group_id is not None:
         updates['promo_group_id'] = payload.promo_group_id
 
+    if payload.tariff_id is not None:
+        updates['tariff_id'] = payload.tariff_id if payload.tariff_id != 0 else None
+
     if not updates:
-        return _serialize_promocode(promocode)
+        return await _serialize_promocode(db, promocode)
 
     promocode = await update_promocode(db, promocode, **updates)
-    return _serialize_promocode(promocode)
+    return await _serialize_promocode(db, promocode)
 
 
 @router.delete(
@@ -575,6 +652,38 @@ async def list_promo_groups(
         limit=limit,
         offset=offset,
     )
+
+
+def _recalculation_status(*, started: bool = False) -> PromoGroupRecalculationStatus:
+    snapshot = promo_group_recalculation.snapshot()
+    return PromoGroupRecalculationStatus(
+        running=bool(snapshot['running']),
+        queued=bool(snapshot['queued']),
+        reason=snapshot['reason'],
+        started=started,
+        last=PromoGroupRecalculationLast(**snapshot['last']) if snapshot['last'] else None,
+    )
+
+
+# Объявлены ДО ``/{group_id}``: тот маршрут принимает любую строку,
+# и «recalculate» ушёл бы в него с ошибкой 422.
+@promo_groups_router.post(
+    '/recalculate', response_model=PromoGroupRecalculationStatus, status_code=status.HTTP_202_ACCEPTED
+)
+async def start_promo_group_recalculation(
+    admin: User = Depends(require_permission('promo_groups:edit')),
+) -> PromoGroupRecalculationStatus:
+    """Пересчитать промогруппы всех людей по их тратам (в фоне)."""
+    started = promo_group_recalculation.schedule('запущен из кабинета')
+    return _recalculation_status(started=started)
+
+
+@promo_groups_router.get('/recalculate', response_model=PromoGroupRecalculationStatus)
+async def get_promo_group_recalculation_status(
+    admin: User = Depends(require_permission('promo_groups:read')),
+) -> PromoGroupRecalculationStatus:
+    """Идёт ли пересчёт и чем кончился последний."""
+    return _recalculation_status()
 
 
 @promo_groups_router.get('/{group_id}', response_model=PromoGroupResponse)

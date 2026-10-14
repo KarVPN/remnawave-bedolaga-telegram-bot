@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from importlib import import_module
@@ -189,7 +190,7 @@ class YooKassaPaymentMixin:
             )
 
             logger.info(
-                'Создан платеж YooKassa на ₽ для пользователя',
+                'Создан платеж YooKassa',
                 yookassa_response=yookassa_response['id'],
                 amount_rubles=amount_rubles,
                 user_id=user_id,
@@ -300,7 +301,7 @@ class YooKassaPaymentMixin:
             )
 
             logger.info(
-                'Создан платеж YooKassa СБП на ₽ для пользователя',
+                'Создан платеж YooKassa СБП',
                 yookassa_response=yookassa_response['id'],
                 amount_rubles=amount_rubles,
                 user_id=user_id,
@@ -395,7 +396,7 @@ class YooKassaPaymentMixin:
 
             if transaction_id:
                 logger.info(
-                    'Пропускаем повторную обработку платежа YooKassa : уже связан с транзакцией',
+                    'Пропускаем повторную обработку платежа YooKassa: уже связан с транзакцией',
                     yookassa_payment_id=payment.yookassa_payment_id,
                     transaction_id=transaction_id,
                 )
@@ -436,7 +437,7 @@ class YooKassaPaymentMixin:
             # Fast-path: already processed
             if getattr(payment, 'transaction_id', None):
                 logger.info(
-                    'Платеж YooKassa уже обработан (transaction_id=), пропускаем.',
+                    'Платеж YooKassa уже обработан, пропускаем.',
                     yookassa_payment_id=payment.yookassa_payment_id,
                     transaction_id=payment.transaction_id,
                 )
@@ -549,7 +550,7 @@ class YooKassaPaymentMixin:
 
                 if transaction and processing_completed:
                     logger.info(
-                        'Пропускаем повторную обработку платежа YooKassa : транзакция уже завершила начисление.',
+                        'Пропускаем повторную обработку платежа YooKassa: транзакция уже завершила начисление.',
                         yookassa_payment_id=payment.yookassa_payment_id,
                         existing_transaction_id=existing_transaction_id,
                     )
@@ -713,6 +714,13 @@ class YooKassaPaymentMixin:
                                     await subscription_service.create_remnawave_user(db, subscription)
                                 except Exception as rw_error:
                                     logger.error('Ошибка создания RemnaWave для триала', rw_error=rw_error)
+                                    from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+                                    remnawave_retry_queue.enqueue(
+                                        subscription_id=subscription.id,
+                                        user_id=subscription.user_id,
+                                        action='create',
+                                    )
 
                                 # Уведомление админам
                                 if getattr(self, 'bot', None):
@@ -728,7 +736,11 @@ class YooKassaPaymentMixin:
                                         logger.warning('Ошибка уведомления админов о триале', admin_error=admin_error)
 
                                 # Уведомление пользователю (только для Telegram-пользователей)
-                                if getattr(self, 'bot', None) and user.telegram_id:
+                                if (
+                                    getattr(self, 'bot', None)
+                                    and user.telegram_id
+                                    and settings.is_notifications_enabled()
+                                ):
                                     try:
                                         await self.bot.send_message(
                                             chat_id=user.telegram_id,
@@ -751,7 +763,7 @@ class YooKassaPaymentMixin:
                                     )
                             else:
                                 logger.error(
-                                    'Не удалось активировать триал для',
+                                    'Не удалось активировать триал',
                                     subscription_id=subscription_id,
                                     user_id=user.id,
                                 )
@@ -803,14 +815,57 @@ class YooKassaPaymentMixin:
                     # Загружаем пользователя с подпиской и промо-группой
                     full_user_result = await db.execute(
                         select(User)
-                        .options(selectinload(User.subscription))
+                        .options(selectinload(User.subscriptions).selectinload(SubscriptionModel.tariff))
                         .options(selectinload(User.user_promo_groups))
                         .where(User.id == user.id)
                     )
                     full_user = full_user_result.scalar_one_or_none()
 
                     # Используем обновленные данные или исходные, если не удалось обновить
-                    subscription = full_user.subscription if full_user else getattr(user, 'subscription', None)
+                    full_subs = getattr(full_user, 'subscriptions', []) if full_user else []
+                    fallback_subs = getattr(user, 'subscriptions', [])
+                    all_subs = full_subs or fallback_subs
+                    _active = [s for s in all_subs if s.status in ('active', 'trial')]
+                    if _active:
+                        _non_daily = [s for s in _active if not getattr(s, 'is_daily_tariff', False)]
+                        _pool = _non_daily or _active
+                        subscription = max(_pool, key=lambda s: s.days_left)
+                    else:
+                        subscription = all_subs[0] if all_subs else None
+
+                    # Validate subscription_id from metadata matches the resolved subscription
+                    if is_recurrent_topup and subscription is not None:
+                        _meta_sub_id = payment_metadata.get('subscription_id')
+                        if _meta_sub_id and str(subscription.id) != _meta_sub_id:
+                            # Heuristic picked the wrong sub — resolve correct one from metadata
+                            try:
+                                _correct_sub_id = int(_meta_sub_id)
+                                _correct_sub = next(
+                                    (s for s in all_subs if s.id == _correct_sub_id),
+                                    None,
+                                )
+                                if _correct_sub:
+                                    logger.info(
+                                        'Recurrent payment: resolved correct subscription from metadata',
+                                        meta_sub_id=_meta_sub_id,
+                                        heuristic_sub_id=subscription.id,
+                                        user_id=user.id,
+                                    )
+                                    subscription = _correct_sub
+                                else:
+                                    logger.warning(
+                                        'Recurrent payment subscription_id mismatch, metadata sub not found in user subs',
+                                        expected_sub_id=_meta_sub_id,
+                                        actual_sub_id=subscription.id,
+                                        user_id=user.id,
+                                    )
+                            except (ValueError, TypeError):
+                                logger.warning(
+                                    'Recurrent payment: invalid subscription_id in metadata',
+                                    meta_sub_id=_meta_sub_id,
+                                    user_id=user.id,
+                                )
+
                     promo_group = (
                         full_user.get_primary_promo_group()
                         if full_user
@@ -895,7 +950,7 @@ class YooKassaPaymentMixin:
                     # Для рекуррентных автоплатежей уведомления отправляет recurrent_payment_service
                     if not is_recurrent_topup:
                         # Отправляем уведомление пользователю (только Telegram-пользователям)
-                        if getattr(self, 'bot', None) and user.telegram_id:
+                        if getattr(self, 'bot', None) and user.telegram_id and settings.is_notifications_enabled():
                             try:
                                 # Передаем только простые данные, чтобы избежать проблем с ленивой загрузкой
                                 await self._send_payment_success_notification(
@@ -946,8 +1001,12 @@ class YooKassaPaymentMixin:
                         # Активируем pending подписку пользователя
                         from app.database.crud.subscription import activate_pending_subscription
 
+                        order_subscription_id = int(order_id) if order_id is not None else None
                         subscription = await activate_pending_subscription(
-                            db=db, user_id=user.id, period_days=subscription_period
+                            db=db,
+                            user_id=user.id,
+                            period_days=subscription_period,
+                            subscription_id=order_subscription_id,
                         )
 
                         if subscription:
@@ -977,17 +1036,35 @@ class YooKassaPaymentMixin:
                                     sync_error=sync_error,
                                     exc_info=True,
                                 )
+                                from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+                                remnawave_retry_queue.enqueue(
+                                    subscription_id=subscription.id,
+                                    user_id=subscription.user_id,
+                                    action='create',
+                                )
 
                             # Отправляем уведомление пользователю об активации подписки (только Telegram)
-                            if getattr(self, 'bot', None) and user.telegram_id:
+                            if getattr(self, 'bot', None) and user.telegram_id and settings.is_notifications_enabled():
                                 from aiogram import types
 
+                                tariff_line = ''
+                                if settings.is_multi_tariff_enabled() and getattr(subscription, 'tariff_id', None):
+                                    try:
+                                        from app.database.crud.tariff import get_tariff_by_id
+
+                                        _t = await get_tariff_by_id(db, subscription.tariff_id)
+                                        if _t:
+                                            tariff_line = f'\n📦 Тариф: «{_t.name}»'
+                                    except Exception:
+                                        pass
                                 success_message = (
                                     f'✅ <b>Подписка успешно активирована!</b>\n\n'
                                     f'📅 Период: {subscription_period} дней\n'
                                     f'📱 Устройства: 1\n'
                                     f'📊 Трафик: Безлимит\n'
-                                    f'💳 Оплата: {settings.format_price(payment.amount_kopeks)} (YooKassa)\n\n'
+                                    f'💳 Оплата: {settings.format_price(payment.amount_kopeks)} (YooKassa)'
+                                    f'{tariff_line}\n\n'
                                     f"🔗 Для подключения перейдите в раздел 'Моя подписка'"
                                 )
 
@@ -1034,22 +1111,18 @@ class YooKassaPaymentMixin:
                                     # Загружаем пользователя с подпиской и промо-группой
                                     full_user_result = await db.execute(
                                         select(User)
-                                        .options(selectinload(User.subscription))
+                                        .options(
+                                            selectinload(User.subscriptions).selectinload(SubscriptionModel.tariff)
+                                        )
                                         .options(selectinload(User.user_promo_groups))
                                         .where(User.id == user.id)
                                     )
                                     full_user = full_user_result.scalar_one_or_none()
 
-                                    # Загружаем подписку отдельно, если нужно
-                                    subscription_result = await db.execute(
-                                        select(SubscriptionModel).where(SubscriptionModel.user_id == user.id)
-                                    )
-                                    subscription_db = subscription_result.scalar_one_or_none()
-
                                     await notification_service.send_subscription_purchase_notification(
                                         db,
                                         full_user or user,
-                                        subscription_db or subscription,
+                                        subscription,
                                         transaction,
                                         subscription_period,
                                         was_trial_conversion=False,
@@ -1088,7 +1161,7 @@ class YooKassaPaymentMixin:
                 )
 
             if critical_flow_completed and not processing_marked:
-                payment_metadata = await self._mark_yookassa_payment_processing_completed(
+                await self._mark_yookassa_payment_processing_completed(
                     db,
                     payment,
                     payment_metadata,
@@ -1097,14 +1170,14 @@ class YooKassaPaymentMixin:
 
             if is_simple_subscription:
                 logger.info(
-                    'Успешно обработан платеж YooKassa как покупка подписки: пользователь , сумма ₽',
+                    'Успешно обработан платеж YooKassa как покупка подписки',
                     yookassa_payment_id=payment.yookassa_payment_id,
                     user_id=payment.user_id,
                     amount_rubles=payment.amount_kopeks / 100,
                 )
             else:
                 logger.info(
-                    'Успешно обработан платеж YooKassa : пользователь пополнил баланс на ₽',
+                    'Успешно обработан платеж YooKassa: пользователь пополнил баланс',
                     yookassa_payment_id=payment.yookassa_payment_id,
                     user_id=payment.user_id,
                     amount_rubles=payment.amount_kopeks / 100,
@@ -1121,6 +1194,7 @@ class YooKassaPaymentMixin:
                     payment=payment,
                     transaction=transaction,
                     telegram_user_id=user.telegram_id if user else None,
+                    user_email=user.email if user else None,
                 )
 
             return True
@@ -1266,6 +1340,7 @@ class YooKassaPaymentMixin:
         payment: YooKassaPayment,
         transaction: Transaction | None = None,
         telegram_user_id: int | None = None,
+        user_email: str | None = None,
     ) -> None:
         """Создание чека через NaloGO для успешного платежа."""
         if not hasattr(self, 'nalogo_service') or not self.nalogo_service:
@@ -1295,6 +1370,7 @@ class YooKassaPaymentMixin:
                 payment_id=payment.yookassa_payment_id,
                 telegram_user_id=telegram_user_id,
                 amount_kopeks=payment.amount_kopeks,
+                user_email=user_email,
             )
 
             if receipt_uuid:
@@ -1315,6 +1391,15 @@ class YooKassaPaymentMixin:
                         )
                     except Exception as save_error:
                         logger.warning('Не удалось сохранить receipt_uuid в транзакцию', save_error=save_error)
+
+                # Отправляем чек пользователю (Telegram или почта) и дублируем в админ-топик
+                if getattr(self, 'bot', None):
+                    await self._send_nalogo_receipt_to_user(
+                        telegram_user_id=telegram_user_id,
+                        receipt_uuid=receipt_uuid,
+                        amount_kopeks=payment.amount_kopeks,
+                        user_email=user_email,
+                    )
             # При временной недоступности чек добавляется в очередь автоматически
 
         except Exception as error:
@@ -1324,6 +1409,29 @@ class YooKassaPaymentMixin:
                 error=error,
                 exc_info=True,
             )
+
+    async def _send_nalogo_receipt_to_user(
+        self,
+        telegram_user_id: int | None,
+        receipt_uuid: str,
+        amount_kopeks: int,
+        user_email: str | None = None,
+    ) -> None:
+        """Отправляет пользователю ссылку на фискальный чек НПД и дублирует в админ-топик."""
+        if not hasattr(self, 'nalogo_service') or not self.nalogo_service:
+            return
+
+        from app.services.nalogo_service import send_nalogo_receipt_notifications
+
+        await send_nalogo_receipt_notifications(
+            bot=getattr(self, 'bot', None),
+            nalogo_service=self.nalogo_service,
+            receipt_uuid=receipt_uuid,
+            amount_kopeks=amount_kopeks,
+            telegram_user_id=telegram_user_id,
+            context_label='Источник: YooKassa',
+            user_email=user_email,
+        )
 
     async def process_yookassa_webhook(
         self,
@@ -1335,14 +1443,33 @@ class YooKassaPaymentMixin:
         yookassa_payment_id = event_object.get('id')
 
         if not yookassa_payment_id:
-            logger.warning('Webhook без payment id', event=event)
+            # 'event' зарезервировано в structlog (это само сообщение лога), нельзя
+            # передавать его как kwarg — иначе TypeError. Берём другое имя.
+            logger.warning('Webhook без payment id', webhook_event=event)
             return False
 
+        # ЮKassa вебхуки не подписывает (https://yookassa.ru/developers/using-api/webhooks):
+        # подлинность подтверждается либо IP отправителя, либо повторным запросом объекта.
+        # Надёжность IP-гейта зависит от конфигурации прокси перед ботом, поэтому запрос
+        # платежа в API — ОБЯЗАТЕЛЬНЫЙ и fail-closed в любом режиме: без подтверждения
+        # тело запроса не используется ни для статуса, ни для восстановления записи.
+        # Нет ответа (404, таймаут, ошибка, нет клиента) → отказ и не-200, чтобы ЮKassa
+        # повторила настоящее уведомление позже. Бюджет 8 с: при деградации API
+        # длинный вызов сериализовал обработку вебхуков на исполнителе ЮKassa.
         remote_data: dict[str, Any] | None = None
         if getattr(self, 'yookassa_service', None):
             try:
-                remote_data = await self.yookassa_service.get_payment_info(  # type: ignore[union-attr]
-                    yookassa_payment_id
+                remote_data = await asyncio.wait_for(
+                    self.yookassa_service.get_payment_info(  # type: ignore[union-attr]
+                        yookassa_payment_id
+                    ),
+                    timeout=8,
+                )
+            except TimeoutError:
+                logger.warning(
+                    'YooKassa API не ответил за 8с при подтверждении webhook — отказ, ЮKassa повторит уведомление',
+                    yookassa_payment_id=yookassa_payment_id,
+                    payload_status=event_object.get('status'),
                 )
             except Exception as error:  # pragma: no cover - диагностический лог
                 logger.warning(
@@ -1351,13 +1478,27 @@ class YooKassaPaymentMixin:
                     error=error,
                     exc_info=True,
                 )
+        else:
+            logger.error(
+                'YooKassa webhook получен, но клиент API YooKassa не сконфигурирован — подтвердить платёж нечем',
+                yookassa_payment_id=yookassa_payment_id,
+            )
+
+        if remote_data is None:
+            logger.warning(
+                'YooKassa webhook отклонён: API YooKassa не подтвердил платёж — fail-closed, начисление не выполнено',
+                yookassa_payment_id=yookassa_payment_id,
+                payload_status=event_object.get('status'),
+                ip_check_skipped=settings.YOOKASSA_SKIP_IP_CHECK,
+            )
+            return False
 
         if remote_data:
             previous_status = event_object.get('status')
             event_object = self._merge_remote_yookassa_payload(event_object, remote_data)
             if previous_status and event_object.get('status') != previous_status:
                 logger.info(
-                    'Статус платежа YooKassa скорректирован по данным API: →',
+                    'Статус платежа YooKassa скорректирован по данным API',
                     yookassa_payment_id=yookassa_payment_id,
                     previous_status=previous_status,
                     event_object=event_object.get('status'),
@@ -1549,7 +1690,7 @@ class YooKassaPaymentMixin:
                 yookassa_created_at = datetime.fromisoformat(created_at_raw.replace('Z', '+00:00'))
             except Exception as error:  # pragma: no cover - диагностический лог
                 logger.debug(
-                    'Не удалось распарсить created_at= для YooKassa',
+                    'Не удалось распарсить created_at для YooKassa',
                     created_at_raw=created_at_raw,
                     yookassa_payment_id=yookassa_payment_id,
                     error=error,

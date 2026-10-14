@@ -46,6 +46,7 @@ from app.services.pinned_message_service import (
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
 from app.utils.miniapp_buttons import BUTTON_KEY_TO_CABINET_PATH, build_miniapp_or_callback_button
+from app.utils.timezone import format_local_datetime, local_day_start
 
 
 logger = structlog.get_logger(__name__)
@@ -134,11 +135,21 @@ def create_broadcast_keyboard(
             action_value = btn.get('action_value', '')
             if not label or not action_value:
                 continue
+            # Необязательный custom emoji перед текстом кнопки (#3025)
+            icon_emoji = btn.get('icon_custom_emoji_id') or None
             if action_type == 'url':
-                keyboard.append([types.InlineKeyboardButton(text=label, url=action_value)])
+                keyboard.append(
+                    [types.InlineKeyboardButton(text=label, url=action_value, icon_custom_emoji_id=icon_emoji)]
+                )
             else:
                 # callback type
-                keyboard.append([types.InlineKeyboardButton(text=label, callback_data=action_value)])
+                keyboard.append(
+                    [
+                        types.InlineKeyboardButton(
+                            text=label, callback_data=action_value, icon_custom_emoji_id=icon_emoji
+                        )
+                    ]
+                )
 
     if not keyboard:
         return None
@@ -177,7 +188,7 @@ async def _persist_broadcast_result(
                 broadcast_history = await session.get(BroadcastHistory, broadcast_id)
                 if not broadcast_history:
                     logger.critical(
-                        'Не удалось найти запись BroadcastHistory # для записи результатов', broadcast_id=broadcast_id
+                        'Не удалось найти запись BroadcastHistory для записи результатов', broadcast_id=broadcast_id
                     )
                     return
 
@@ -189,7 +200,7 @@ async def _persist_broadcast_result(
                 await session.commit()
 
                 logger.info(
-                    'Результаты рассылки сохранены (id sent failed blocked status=)',
+                    'Результаты рассылки сохранены',
                     broadcast_id=broadcast_id,
                     sent_count=sent_count,
                     failed_count=failed_count,
@@ -200,7 +211,7 @@ async def _persist_broadcast_result(
 
         except InterfaceError as error:
             logger.warning(
-                'Ошибка соединения при сохранении результатов рассылки (попытка /)',
+                'Ошибка соединения при сохранении результатов рассылки, повтор',
                 attempt=attempt,
                 max_retries=max_retries,
                 error=error,
@@ -210,14 +221,14 @@ async def _persist_broadcast_result(
                 retry_delay *= 2
             else:
                 logger.critical(
-                    'Не удалось сохранить результаты рассылки после попыток (id=)',
+                    'Не удалось сохранить результаты рассылки после всех попыток',
                     max_retries=max_retries,
                     broadcast_id=broadcast_id,
                 )
 
         except Exception as error:
             logger.critical(
-                'Неожиданная ошибка при сохранении результатов рассылки (id=)',
+                'Неожиданная ошибка при сохранении результатов рассылки',
                 broadcast_id=broadcast_id,
                 exc_info=error,
             )
@@ -260,7 +271,7 @@ async def show_pinned_message_menu(
     if pinned_message:
         content_preview = html.escape(pinned_message.content or '')
         last_updated = pinned_message.updated_at or pinned_message.created_at
-        timestamp_text = last_updated.strftime('%d.%m.%Y %H:%M') if last_updated else '—'
+        timestamp_text = format_local_datetime(last_updated, '%d.%m.%Y %H:%M') if last_updated else '—'
         media_line = ''
         if pinned_message.media_type:
             media_label = 'Фото' if pinned_message.media_type == 'photo' else 'Видео'
@@ -640,7 +651,7 @@ async def show_messages_history(callback: types.CallbackQuery, db_user: User, db
             message_preview = html.escape(message_preview)
 
             text += f"""
-{status_emoji} <b>{broadcast.created_at.strftime('%d.%m.%Y %H:%M')}</b>
+{status_emoji} <b>{format_local_datetime(broadcast.created_at, '%d.%m.%Y %H:%M')}</b>
 📊 Отправлено: {broadcast.sent_count}/{broadcast.total_count} ({success_rate}%)
 🎯 Аудитория: {get_target_name(broadcast.target_type)}
 👤 Админ: {html.escape(broadcast.admin_name or '')}
@@ -1318,7 +1329,7 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
                 wait_seconds = e.retry_after + 1
                 flood_wait_until = asyncio.get_event_loop().time() + wait_seconds
                 logger.warning(
-                    'FloodWait: Telegram просит подождать сек (пользователь , попытка /)',
+                    'FloodWait: Telegram просит подождать перед повтором отправки',
                     retry_after=e.retry_after,
                     telegram_id=telegram_id,
                     attempt=attempt + 1,
@@ -1338,7 +1349,7 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
 
             except Exception as e:
                 logger.error(
-                    'Ошибка отправки пользователю (попытка /)',
+                    'Ошибка отправки пользователю, повтор',
                     telegram_id=telegram_id,
                     attempt=attempt + 1,
                     MAX_SEND_RETRIES=_MAX_SEND_RETRIES,
@@ -1504,13 +1515,26 @@ async def confirm_broadcast(callback: types.CallbackQuery, db_user: User, state:
 
     await state.clear()
     logger.info(
-        'Рассылка завершена админом : sent failed total= (медиа:)',
+        'Рассылка завершена админом',
         admin_telegram_id=admin_telegram_id,
         sent_count=sent_count,
         failed_count=failed_count,
         total_users_count=total_users_count,
         has_media=has_media,
     )
+
+
+# Пороги сегментов. Вынесены в константы, потому что get_target_users_count (SQL COUNT)
+# и get_target_users (фильтрация в Python) обязаны совпадать: разъехавшиеся пороги дают
+# счётчик в интерфейсе, который не сходится с реальным числом получателей.
+LOW_BALANCE_THRESHOLD_KOPEKS = 10000
+TRIAL_ENDING_DAYS = 3
+AUTOPAY_FAILED_WINDOW_DAYS = 7
+INACTIVE_TARGET_DAYS = {
+    'inactive_30d': 30,
+    'inactive_60d': 60,
+    'inactive_90d': 90,
+}
 
 
 async def get_target_users_count(db: AsyncSession, target: str) -> int:
@@ -1559,6 +1583,7 @@ async def get_target_users_count(db: AsyncSession, target: str) -> int:
                 Subscription.user_id == User.id,
                 Subscription.status == SubscriptionStatus.ACTIVE.value,
             )
+            .correlate(User)
             .exists()
         )
         query = select(sql_func.count(User.id)).where(base_filter, ~subquery)
@@ -1599,48 +1624,39 @@ async def get_target_users_count(db: AsyncSession, target: str) -> int:
         result = await db.execute(query)
         return result.scalar() or 0
 
-    if target == 'expired':
-        # Истекшие подписки
+    if target in ('expired', 'expired_subscribers'):
+        # Зеркало одноимённых веток get_target_users: активная (ACTIVE и не истекшая)
+        # подписка исключает; иначе нужен хотя бы один истёкший сабж (EXPIRED/DISABLED
+        # или end_date в прошлом) либо платное прошлое без единой подписки. LIMITED с
+        # будущей датой истёкшим не считается, ACTIVE с прошедшей — активной не считается.
         now = datetime.now(UTC)
-        expired_statuses = [
-            SubscriptionStatus.EXPIRED.value,
-            SubscriptionStatus.DISABLED.value,
-            SubscriptionStatus.LIMITED.value,
-        ]
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .outerjoin(Subscription, User.id == Subscription.user_id)
+        has_active_sub = (
+            select(Subscription.id)
             .where(
-                base_filter,
-                or_(
-                    Subscription.status.in_(expired_statuses),
-                    and_(Subscription.end_date <= now, Subscription.status != SubscriptionStatus.ACTIVE.value),
-                    and_(Subscription.id == None, User.has_had_paid_subscription == True),
-                ),
+                Subscription.user_id == User.id,
+                Subscription.status == SubscriptionStatus.ACTIVE.value,
+                Subscription.end_date > now,
             )
+            .correlate(User)
+            .exists()
         )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    if target == 'expired_subscribers':
-        # То же что и expired
-        now = datetime.now(UTC)
-        expired_statuses = [
-            SubscriptionStatus.EXPIRED.value,
-            SubscriptionStatus.DISABLED.value,
-            SubscriptionStatus.LIMITED.value,
-        ]
-        query = (
-            select(sql_func.count(distinct(User.id)))
-            .outerjoin(Subscription, User.id == Subscription.user_id)
+        has_expired_sub = (
+            select(Subscription.id)
             .where(
-                base_filter,
+                Subscription.user_id == User.id,
                 or_(
-                    Subscription.status.in_(expired_statuses),
-                    and_(Subscription.end_date <= now, Subscription.status != SubscriptionStatus.ACTIVE.value),
-                    and_(Subscription.id == None, User.has_had_paid_subscription == True),
+                    Subscription.status.in_([SubscriptionStatus.EXPIRED.value, SubscriptionStatus.DISABLED.value]),
+                    Subscription.end_date <= now,
                 ),
             )
+            .correlate(User)
+            .exists()
+        )
+        has_any_sub = select(Subscription.id).where(Subscription.user_id == User.id).correlate(User).exists()
+        query = select(sql_func.count(User.id)).where(
+            base_filter,
+            ~has_active_sub,
+            or_(has_expired_sub, and_(~has_any_sub, User.has_had_paid_subscription == True)),
         )
         result = await db.execute(query)
         return result.scalar() or 0
@@ -1689,6 +1705,59 @@ async def get_target_users_count(db: AsyncSession, target: str) -> int:
         result = await db.execute(query)
         return result.scalar() or 0
 
+    if target == 'trial_ending':
+        now = datetime.now(UTC)
+        query = (
+            select(sql_func.count(distinct(User.id)))
+            .join(Subscription, User.id == Subscription.user_id)
+            .where(
+                base_filter,
+                Subscription.is_trial == True,
+                Subscription.status == SubscriptionStatus.ACTIVE.value,
+                Subscription.end_date > now,
+                Subscription.end_date <= now + timedelta(days=TRIAL_ENDING_DAYS),
+            )
+        )
+        result = await db.execute(query)
+        return result.scalar() or 0
+
+    if target == 'autopay_failed':
+        from app.database.models import SubscriptionEvent
+
+        window_start = datetime.now(UTC) - timedelta(days=AUTOPAY_FAILED_WINDOW_DAYS)
+        has_recent_failure = (
+            select(SubscriptionEvent.id)
+            .where(
+                SubscriptionEvent.user_id == User.id,
+                SubscriptionEvent.event_type == 'autopay_failed',
+                SubscriptionEvent.occurred_at >= window_start,
+            )
+            .correlate(User)
+            .exists()
+        )
+        query = select(sql_func.count(User.id)).where(base_filter, has_recent_failure)
+        result = await db.execute(query)
+        return result.scalar() or 0
+
+    if target == 'low_balance':
+        query = select(sql_func.count(User.id)).where(
+            base_filter,
+            User.balance_kopeks > 0,
+            User.balance_kopeks < LOW_BALANCE_THRESHOLD_KOPEKS,
+        )
+        result = await db.execute(query)
+        return result.scalar() or 0
+
+    if target in INACTIVE_TARGET_DAYS:
+        threshold = datetime.now(UTC) - timedelta(days=INACTIVE_TARGET_DAYS[target])
+        query = select(sql_func.count(User.id)).where(
+            base_filter,
+            User.last_activity.isnot(None),
+            User.last_activity < threshold,
+        )
+        result = await db.execute(query)
+        return result.scalar() or 0
+
     # Фильтр по тарифу
     if target.startswith('tariff_'):
         tariff_id = int(target.split('_')[1])
@@ -1707,7 +1776,7 @@ async def get_target_users_count(db: AsyncSession, target: str) -> int:
     # Custom filters — быстрый COUNT вместо загрузки всех пользователей
     if target.startswith('custom_'):
         now = datetime.now(UTC)
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today = local_day_start(now)
         criteria = target[len('custom_') :]
 
         if criteria == 'today':
@@ -1762,14 +1831,14 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         return [
             user
             for user in users
-            if user.subscription and user.subscription.is_active and not user.subscription.is_trial
+            if any(s.is_active and not s.is_trial for s in (getattr(user, 'subscriptions', None) or []))
         ]
 
     if target == 'trial':
-        return [user for user in users if user.subscription and user.subscription.is_trial]
+        return [user for user in users if any(s.is_trial for s in (getattr(user, 'subscriptions', None) or []))]
 
     if target == 'no':
-        return [user for user in users if not user.subscription or not user.subscription.is_active]
+        return [user for user in users if not any(s.is_active for s in (getattr(user, 'subscriptions', None) or []))]
 
     if target == 'expiring':
         expiring_subs = await get_expiring_subscriptions(db, 3)
@@ -1783,14 +1852,14 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         }
         expired_users = []
         for user in users:
-            subscription = user.subscription
-            if subscription:
-                if subscription.status in expired_statuses:
+            subs = getattr(user, 'subscriptions', None) or []
+            if subs:
+                has_active = any(s.is_active for s in subs)
+                if has_active:
+                    continue  # Skip users who have at least one active subscription
+                has_expired = any(s.status in expired_statuses or (s.end_date <= now and not s.is_active) for s in subs)
+                if has_expired:
                     expired_users.append(user)
-                    continue
-                if subscription.end_date <= now and not subscription.is_active:
-                    expired_users.append(user)
-                    continue
             elif user.has_had_paid_subscription:
                 expired_users.append(user)
         return expired_users
@@ -1799,27 +1868,27 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         return [
             user
             for user in users
-            if user.subscription
-            and not user.subscription.is_trial
-            and user.subscription.is_active
-            and (user.subscription.traffic_used_gb or 0) <= 0
+            if any(
+                not s.is_trial and s.is_active and (s.traffic_used_gb or 0) <= 0
+                for s in (getattr(user, 'subscriptions', None) or [])
+            )
         ]
 
     if target == 'trial_zero':
         return [
             user
             for user in users
-            if user.subscription
-            and user.subscription.is_trial
-            and user.subscription.is_active
-            and (user.subscription.traffic_used_gb or 0) <= 0
+            if any(
+                s.is_trial and s.is_active and (s.traffic_used_gb or 0) <= 0
+                for s in (getattr(user, 'subscriptions', None) or [])
+            )
         ]
 
     if target == 'zero':
         return [
             user
             for user in users
-            if user.subscription and user.subscription.is_active and (user.subscription.traffic_used_gb or 0) <= 0
+            if any(s.is_active and (s.traffic_used_gb or 0) <= 0 for s in (getattr(user, 'subscriptions', None) or []))
         ]
 
     if target == 'expiring_subscribers':
@@ -1834,14 +1903,14 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         }
         expired_users = []
         for user in users:
-            subscription = user.subscription
-            if subscription:
-                if subscription.status in expired_statuses:
+            subs = getattr(user, 'subscriptions', None) or []
+            if subs:
+                has_active = any(s.is_active for s in subs)
+                if has_active:
+                    continue  # Skip users who have at least one active subscription
+                has_expired = any(s.status in expired_statuses or (s.end_date <= now and not s.is_active) for s in subs)
+                if has_expired:
                     expired_users.append(user)
-                    continue
-                if subscription.end_date <= now and not subscription.is_active:
-                    expired_users.append(user)
-                    continue
             elif user.has_had_paid_subscription:
                 expired_users.append(user)
         return expired_users
@@ -1850,19 +1919,19 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         return [
             user
             for user in users
-            if user.subscription and user.subscription.status == SubscriptionStatus.DISABLED.value
+            if any(s.status == SubscriptionStatus.DISABLED.value for s in (getattr(user, 'subscriptions', None) or []))
         ]
 
     if target == 'trial_ending':
         now = datetime.now(UTC)
-        in_3_days = now + timedelta(days=3)
+        in_3_days = now + timedelta(days=TRIAL_ENDING_DAYS)
         return [
             user
             for user in users
-            if user.subscription
-            and user.subscription.is_trial
-            and user.subscription.is_active
-            and user.subscription.end_date <= in_3_days
+            if any(
+                s.is_trial and s.is_active and s.end_date <= in_3_days
+                for s in (getattr(user, 'subscriptions', None) or [])
+            )
         ]
 
     if target == 'trial_expired':
@@ -1870,13 +1939,13 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         return [
             user
             for user in users
-            if user.subscription and user.subscription.is_trial and user.subscription.end_date <= now
+            if any(s.is_trial and s.end_date <= now for s in (getattr(user, 'subscriptions', None) or []))
         ]
 
     if target == 'autopay_failed':
         from app.database.models import SubscriptionEvent
 
-        week_ago = datetime.now(UTC) - timedelta(days=7)
+        week_ago = datetime.now(UTC) - timedelta(days=AUTOPAY_FAILED_WINDOW_DAYS)
         stmt = (
             select(SubscriptionEvent.user_id)
             .where(
@@ -1892,21 +1961,13 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         return [user for user in users if user.id in failed_user_ids]
 
     if target == 'low_balance':
-        threshold_kopeks = 10000  # 100 рублей
+        threshold_kopeks = LOW_BALANCE_THRESHOLD_KOPEKS
         return [
             user for user in users if (user.balance_kopeks or 0) < threshold_kopeks and (user.balance_kopeks or 0) > 0
         ]
 
-    if target == 'inactive_30d':
-        threshold = datetime.now(UTC) - timedelta(days=30)
-        return [user for user in users if user.last_activity and user.last_activity < threshold]
-
-    if target == 'inactive_60d':
-        threshold = datetime.now(UTC) - timedelta(days=60)
-        return [user for user in users if user.last_activity and user.last_activity < threshold]
-
-    if target == 'inactive_90d':
-        threshold = datetime.now(UTC) - timedelta(days=90)
+    if target in INACTIVE_TARGET_DAYS:
+        threshold = datetime.now(UTC) - timedelta(days=INACTIVE_TARGET_DAYS[target])
         return [user for user in users if user.last_activity and user.last_activity < threshold]
 
     # Фильтр по тарифу
@@ -1915,7 +1976,7 @@ async def get_target_users(db: AsyncSession, target: str) -> list:
         return [
             user
             for user in users
-            if user.subscription and user.subscription.is_active and user.subscription.tariff_id == tariff_id
+            if any(s.is_active and s.tariff_id == tariff_id for s in (getattr(user, 'subscriptions', None) or []))
         ]
 
     return []
@@ -1928,7 +1989,7 @@ async def get_custom_users_count(db: AsyncSession, criteria: str) -> int:
 
 async def get_custom_users(db: AsyncSession, criteria: str) -> list:
     now = datetime.now(UTC)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today = local_day_start(now)
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
 
@@ -1957,7 +2018,7 @@ async def get_custom_users(db: AsyncSession, criteria: str) -> list:
 
 async def get_users_statistics(db: AsyncSession) -> dict:
     now = datetime.now(UTC)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today = local_day_start(now)
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
 
@@ -2029,6 +2090,7 @@ def get_target_name(target_type: str) -> str:
         'custom_inactive_month': 'Неактивные 30+ дней',
         'custom_referrals': 'Через рефералов',
         'custom_direct': 'Прямая регистрация',
+        'audience': 'По условиям из кабинета',
     }
     # Обработка фильтра по тарифу
     if target_type.startswith('tariff_'):

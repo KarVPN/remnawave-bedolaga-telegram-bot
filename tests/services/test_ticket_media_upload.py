@@ -200,11 +200,13 @@ class TestCabinetMediaDownload:
         bot = _DownloadBot()
         monkeypatch.setattr(cabinet_media, 'create_bot', lambda: bot)
 
-        response = await cabinet_media.download_media('photo-file-id')
+        response = await cabinet_media.download_media(
+            'AgACAgIAAxkBAAI_photo', token=cabinet_media.make_media_token('AgACAgIAAxkBAAI_photo')
+        )
 
-        assert bot.requested_file_id == 'photo-file-id'
+        assert bot.requested_file_id == 'AgACAgIAAxkBAAI_photo'
         assert bot.requested_path == 'photos/screenshot.jpg'
         assert response.body == b'jpeg bytes'
         assert response.media_type == 'image/jpeg'
-        assert response.headers['content-disposition'] == 'inline; filename=screenshot.jpg'
+        assert response.headers['content-disposition'] == 'inline; filename="screenshot.jpg"'
         assert bot.session.closed is True

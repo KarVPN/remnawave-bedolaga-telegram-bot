@@ -18,6 +18,9 @@ class GiftConfigTariffPeriod(BaseModel):
     price_label: str
     original_price_kopeks: int | None = None
     discount_percent: int | None = None
+    # Период, отмеченный оператором как самый выгодный: кабинет обводит его
+    # рамкой и выбирает сразу, вместо первого по счёту.
+    is_highlighted: bool = False
 
 
 class GiftConfigTariff(BaseModel):
@@ -27,6 +30,8 @@ class GiftConfigTariff(BaseModel):
     traffic_limit_gb: int
     device_limit: int
     periods: list[GiftConfigTariffPeriod]
+    # Тариф, отмеченный оператором как выгодный.
+    is_highlighted: bool = False
 
 
 class GiftConfigPaymentMethod(BaseModel):
@@ -71,18 +76,25 @@ class GiftPurchaseResponse(BaseModel):
     purchase_token: str
     payment_url: str | None = None
     warning: str | None = None
+    gift_code: str | None = None
+    bot_claim_url: str | None = None
+    cabinet_claim_url: str | None = None
 
 
 class GiftPurchaseStatusResponse(BaseModel):
     status: str
     is_gift: bool = True
     is_code_only: bool = False
+    is_claimable: bool = False
     purchase_token: str | None = None
     recipient_contact_value: str | None = None
     gift_message: str | None = None
     tariff_name: str | None = None
     period_days: int | None = None
     warning: str | None = None
+    gift_code: str | None = None
+    bot_claim_url: str | None = None
+    cabinet_claim_url: str | None = None
 
 
 class PendingGiftResponse(BaseModel):
@@ -106,6 +118,9 @@ class SentGiftResponse(BaseModel):
     gift_message: str | None = None
     activated_by_username: str | None = None
     created_at: datetime | None = None
+    gift_code: str | None = None
+    bot_claim_url: str | None = None
+    cabinet_claim_url: str | None = None
 
 
 class ReceivedGiftResponse(BaseModel):
@@ -122,7 +137,7 @@ class ReceivedGiftResponse(BaseModel):
 
 
 class ActivateGiftRequest(BaseModel):
-    code: str = Field(min_length=1, max_length=100)
+    code: str = Field(min_length=1, max_length=255)
 
 
 class ActivateGiftResponse(BaseModel):

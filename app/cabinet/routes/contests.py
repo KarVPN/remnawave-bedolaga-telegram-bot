@@ -9,14 +9,28 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database.crud.contest import (
     create_attempt,
     get_active_rounds,
     get_attempt,
     increment_winner_count,
 )
-from app.database.crud.subscription import get_subscription_by_user_id
+from app.database.crud.subscription import get_active_subscriptions_by_user_id, get_subscription_by_user_id
 from app.database.models import SubscriptionStatus, User
+
+
+async def _resolve_subscription_for_prize(db, user_id: int):
+    """Resolve best subscription for applying contest prize (days/traffic)."""
+    if settings.is_multi_tariff_enabled():
+        active_subs = await get_active_subscriptions_by_user_id(db, user_id)
+        # Prefer non-daily with most days left
+        non_daily = [s for s in active_subs if not (s.tariff and getattr(s.tariff, 'is_daily', False))]
+        eligible = non_daily or active_subs
+        return max(eligible, key=lambda s: s.days_left) if eligible else None
+    return await get_subscription_by_user_id(db, user_id)
+
+
 from app.services.contest_rotation_service import (
     GAME_ANAGRAM,
     GAME_BLITZ,
@@ -98,12 +112,20 @@ async def _award_prize(db: AsyncSession, user_id: int, prize_type: str, prize_va
         except ValueError:
             return 'Error: invalid prize value'
 
-        subscription = await get_subscription_by_user_id(db, user_id)
+        subscription = await _resolve_subscription_for_prize(db, user_id)
         if not subscription:
             return 'Error: subscription not found'
 
+        # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
+        from app.services.grace_access_echo import undo_grace_overlay_echo
+
+        await undo_grace_overlay_echo(db, subscription)
         subscription.end_date = subscription.end_date + timedelta(days=days)
         subscription.updated_at = datetime.now(UTC)
+        # Условия тарифа на новый срок: база тарифа + активные докупки.
+        from app.database.crud.subscription import reconcile_tariff_traffic_limit
+
+        await reconcile_tariff_traffic_limit(db, subscription)
         await db.commit()
         await db.refresh(subscription)
 
@@ -151,7 +173,7 @@ async def get_contests_count(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get count of contests available for the user."""
-    subscription = await get_subscription_by_user_id(db, user.id)
+    subscription = await _resolve_subscription_for_prize(db, user.id)
 
     if not _user_allowed(subscription):
         return ContestsCountResponse(count=0)
@@ -183,7 +205,7 @@ async def get_contests(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get list of available contests/games."""
-    subscription = await get_subscription_by_user_id(db, user.id)
+    subscription = await _resolve_subscription_for_prize(db, user.id)
 
     if not _user_allowed(subscription):
         raise HTTPException(
@@ -230,7 +252,7 @@ async def get_contest_game(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get game data for a specific contest round."""
-    subscription = await get_subscription_by_user_id(db, user.id)
+    subscription = await _resolve_subscription_for_prize(db, user.id)
 
     if not _user_allowed(subscription):
         raise HTTPException(
@@ -350,7 +372,7 @@ async def submit_contest_answer(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Submit answer for a contest round."""
-    subscription = await get_subscription_by_user_id(db, user.id)
+    subscription = await _resolve_subscription_for_prize(db, user.id)
 
     if not _user_allowed(subscription):
         raise HTTPException(

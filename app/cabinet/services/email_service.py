@@ -1,10 +1,15 @@
 """Email service for sending verification and password reset emails."""
 
-import html
+import re
 import smtplib
+import time
+from datetime import UTC, datetime, timedelta
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formatdate, make_msgid
+from email.utils import formataddr, formatdate, make_msgid
+from typing import Any
 
 import structlog
 
@@ -14,8 +19,23 @@ from app.config import settings
 logger = structlog.get_logger(__name__)
 
 
+# Сколько молчать после отказа установить соединение. Один упавший коннект
+# доказывает недоступность сервера для всей пачки: рассылка на N адресов иначе
+# ждёт таймаут N раз подряд и пишет N одинаковых трейсбеков. Держим окно
+# коротким — примерно один таймаут коннекта: транзакционное письмо (код входа),
+# отправленное сразу после сорвавшейся рассылки, всё равно не дошло бы, но и
+# зависать в этом состоянии дольше необходимого не должно.
+_CONNECTION_FAILURE_COOLDOWN_SECONDS = 30.0
+
+
 class EmailService:
     """Service for sending emails via SMTP."""
+
+    def __init__(self) -> None:
+        # Момент, до которого считаем сервер недоступным. Гонки между потоками
+        # исполнителя безобидны: худшее — лишняя попытка соединения.
+        self._unreachable_until: float = 0.0
+        self._unreachable_reason: str = ''
 
     @property
     def host(self) -> str | None:
@@ -42,21 +62,90 @@ class EmailService:
         return settings.SMTP_FROM_NAME
 
     @property
+    def reply_to(self) -> str:
+        return (settings.SMTP_REPLY_TO or '').strip()
+
+    @property
     def use_tls(self) -> bool:
         return settings.SMTP_USE_TLS
+
+    @property
+    def use_ssl(self) -> bool:
+        # Port 465 always implies implicit TLS (SMTPS, RFC 8314).
+        return settings.SMTP_USE_SSL or self.port == 465
 
     def is_configured(self) -> bool:
         """Check if SMTP is properly configured."""
         return settings.is_smtp_configured()
 
+    @staticmethod
+    def _html_to_plain_text(body_html: str) -> str:
+        """Грубая конвертация HTML в text/plain для multipart/alternative.
+
+        Блоки <style>/<script> удаляются ЦЕЛИКОМ до вырезания тегов: сами теги
+        регулярка убирала и раньше, а их содержимое (CSS/JS-правила) утекало в
+        текстовую версию письма перед основным текстом (#2974).
+
+        &amp; расшифровывается ПОСЛЕДНИМ: иначе "&amp;lt;" проходит двойную
+        расшифровку и превращается в "<" вместо "&lt;".
+        """
+        text = re.sub(r'<(style|script)\b[^>]*>.*?</\1\s*>', '', body_html, flags=re.DOTALL | re.IGNORECASE)
+        # Запасной проход для битого шаблона (кастомные письма из админки): открытый
+        # <style>/<script> без закрывающего тега иначе утёк бы телом CSS/JS в текст —
+        # срезаем висячий блок до конца ввода.
+        text = re.sub(r'<(style|script)\b[^>]*>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^<>]+>', '', text)
+        text = text.replace('&nbsp;', ' ')
+        text = text.replace('&lt;', '<')
+        text = text.replace('&gt;', '>')
+        text = text.replace('&amp;', '&')
+        # После удаления блоков и тегов остаются простыни пустых строк —
+        # схлопываем, чтобы текст не начинался с десятков переносов.
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        return text.strip()
+
+    def _endpoint(self) -> dict[str, Any]:
+        """Куда именно шли — без этого «Network is unreachable» ничего не говорит."""
+        mode = 'ssl' if self.use_ssl else ('starttls' if self.use_tls else 'plain')
+        return {'smtp_host': self.host, 'smtp_port': self.port, 'smtp_mode': mode}
+
+    def _cooldown_left(self) -> float:
+        return max(0.0, self._unreachable_until - time.monotonic())
+
+    def _note_connection_failure(self, error: BaseException) -> None:
+        self._unreachable_until = time.monotonic() + _CONNECTION_FAILURE_COOLDOWN_SECONDS
+        self._unreachable_reason = f'{type(error).__name__}: {error}'
+
+    def _note_success(self) -> None:
+        self._unreachable_until = 0.0
+        self._unreachable_reason = ''
+
+    def _log_connection_failure(self, to_email: str, error: BaseException) -> None:
+        """Причина строкой, а не объектом исключения.
+
+        Объект в kwarg заставляет логгер приложить трейсбек, а он здесь всегда
+        одинаковый (три кадра внутри smtplib) и не добавляет ничего к «куда
+        шли и что ответила сеть». На рассылке это N одинаковых полотен в логе.
+        """
+        logger.warning(
+            'Не удалось соединиться с SMTP-сервером, письмо не отправлено',
+            to_email=to_email,
+            reason=f'{type(error).__name__}: {error}',
+            retry_after_seconds=_CONNECTION_FAILURE_COOLDOWN_SECONDS,
+            **self._endpoint(),
+        )
+
     def _get_smtp_connection(self) -> smtplib.SMTP:
         """Create and return SMTP connection."""
-        smtp = smtplib.SMTP(self.host, self.port, timeout=30)
-        smtp.ehlo()
-
-        if self.use_tls:
-            smtp.starttls()
+        if self.use_ssl:
+            smtp: smtplib.SMTP = smtplib.SMTP_SSL(self.host, self.port, timeout=30)
             smtp.ehlo()
+        else:
+            smtp = smtplib.SMTP(self.host, self.port, timeout=30)
+            smtp.ehlo()
+            if self.use_tls:
+                smtp.starttls()
+                smtp.ehlo()
 
         # Only attempt login if credentials are provided AND server supports AUTH
         if self.user and self.password:
@@ -67,12 +156,45 @@ class EmailService:
 
         return smtp
 
+    def _queue_for_retry(
+        self,
+        *,
+        to_email: str,
+        subject: str,
+        body_html: str,
+        body_text: str | None,
+        attachments: list[tuple[str, bytes, str]] | None,
+        unsubscribe_url: str | None,
+        retry_until: datetime | None,
+    ) -> bool:
+        """Отложить письмо для повторной отправки.
+
+        Вызывается ТОЛЬКО там, где виновата недоступность канала: остывание и
+        обе сетевые ветки. Отказ сервера по конкретному адресу (SMTPException)
+        и ошибка сборки письма не откладываются — повтор их не починит.
+        """
+        from app.services.email_retry_service import email_retry_service
+
+        return email_retry_service.enqueue(
+            to_email=to_email,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            attachments=attachments,
+            unsubscribe_url=unsubscribe_url,
+            retry_until=retry_until,
+        )
+
     def send_email(
         self,
         to_email: str,
         subject: str,
         body_html: str,
         body_text: str | None = None,
+        attachments: list[tuple[str, bytes, str]] | None = None,
+        unsubscribe_url: str | None = None,
+        queue_on_failure: bool = True,
+        retry_until: datetime | None = None,
     ) -> bool:
         """
         Send an email.
@@ -82,6 +204,10 @@ class EmailService:
             subject: Email subject
             body_html: HTML body content
             body_text: Plain text body (optional, generated from HTML if not provided)
+            attachments: Optional list of (filename, content, mimetype) tuples
+            unsubscribe_url: One-click unsubscribe URL. Задаётся ТОЛЬКО для
+                маркетинговых писем — на транзакционных (код входа, чек об
+                оплате) List-Unsubscribe не ставят.
 
         Returns:
             True if email was sent successfully, False otherwise
@@ -99,42 +225,183 @@ class EmailService:
         to_email = to_email.strip().replace('\n', '').replace('\r', '')
         subject = subject.replace('\n', '').replace('\r', '')
 
+        cooldown_left = self._cooldown_left()
+        if cooldown_left:
+            # Соединение только что не состоялось — ждать таймаут ещё раз незачем.
+            logger.debug(
+                'SMTP недоступен, письмо пропущено без попытки соединения',
+                to_email=to_email,
+                retry_in_seconds=round(cooldown_left, 1),
+                last_failure=self._unreachable_reason,
+                **self._endpoint(),
+            )
+            if queue_on_failure:
+                self._queue_for_retry(
+                    to_email=to_email,
+                    subject=subject,
+                    body_html=body_html,
+                    body_text=body_text,
+                    attachments=attachments,
+                    unsubscribe_url=unsubscribe_url,
+                    retry_until=retry_until,
+                )
+            return False
+
         try:
-            msg = MIMEMultipart('alternative')
+            # С вложениями письмо становится multipart/mixed: внутри него
+            # обычная alternative-пара text/html плюс файлы.
+            alternative = MIMEMultipart('alternative')
+            msg = MIMEMultipart('mixed') if attachments else alternative
             msg['Subject'] = subject
             safe_from_name = self.from_name.replace('\n', '').replace('\r', '') if self.from_name else ''
             safe_from_email = sender_email.replace('\n', '').replace('\r', '')
-            msg['From'] = f'{safe_from_name} <{safe_from_email}>'
+            msg['From'] = formataddr((safe_from_name, safe_from_email))
             msg['To'] = to_email
+            # Адрес из .env: перенос строки в нём дописал бы произвольный
+            # заголовок в письмо, поэтому кривое значение не чиним, а
+            # выбрасываем — письмо важнее обратного канала.
+            if reply_to := self.reply_to:
+                if any(ch in reply_to for ch in '\r\n') or '@' not in reply_to:
+                    logger.warning('Некорректный SMTP_REPLY_TO — заголовок Reply-To пропущен')
+                else:
+                    msg['Reply-To'] = formataddr((safe_from_name, reply_to))
+
             msg['Date'] = formatdate(localtime=False)
             msg['Message-ID'] = make_msgid(domain=safe_from_email.split('@')[-1])
 
+            # RFC 8058: пара List-Unsubscribe + List-Unsubscribe-Post — это то, из
+            # чего Gmail/Yahoo рисуют свою кнопку «Отписаться» рядом с адресом
+            # отправителя. Без -Post заголовок считается «старым» и кнопку дают
+            # не всегда.
+            if unsubscribe_url:
+                safe_unsubscribe = unsubscribe_url.strip()
+                # URL приходит из настроек/БД: перенос строки в нём дописал бы
+                # произвольный заголовок в письмо, поэтому такой URL не чиним, а
+                # выбрасываем целиком вместе с заголовками.
+                if any(ch in safe_unsubscribe for ch in '\r\n<>') or not safe_unsubscribe.startswith(
+                    ('http://', 'https://')
+                ):
+                    logger.warning('Некорректный unsubscribe_url — заголовки отписки пропущены')
+                else:
+                    from .email_unsubscribe import build_unsubscribe_mailto
+
+                    targets = [f'<{safe_unsubscribe}>']
+                    if mailto := build_unsubscribe_mailto():
+                        targets.append(f'<{mailto}>')
+                    msg['List-Unsubscribe'] = ', '.join(targets)
+                    msg['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click'
+
             # Plain text version
             if body_text is None:
-                # Simple HTML to text conversion
-                import re
-
-                body_text = re.sub(r'<[^>]+>', '', body_html)
-                body_text = body_text.replace('&nbsp;', ' ')
-                body_text = body_text.replace('&amp;', '&')
-                body_text = body_text.replace('&lt;', '<')
-                body_text = body_text.replace('&gt;', '>')
+                body_text = self._html_to_plain_text(body_html)
 
             part1 = MIMEText(body_text, 'plain', 'utf-8')
             part2 = MIMEText(body_html, 'html', 'utf-8')
 
-            msg.attach(part1)
-            msg.attach(part2)
+            alternative.attach(part1)
+            alternative.attach(part2)
 
-            with self._get_smtp_connection() as smtp:
-                smtp.sendmail(safe_from_email, to_email, msg.as_string())
+            if attachments:
+                msg.attach(alternative)
+                for filename, content, mimetype in attachments:
+                    maintype, _, subtype = (mimetype or 'application/octet-stream').partition('/')
+                    attachment_part = MIMEBase(maintype or 'application', subtype or 'octet-stream')
+                    attachment_part.set_payload(content)
+                    encoders.encode_base64(attachment_part)
+                    safe_filename = filename.replace('\n', '').replace('\r', '')
+                    attachment_part.add_header('Content-Disposition', 'attachment', filename=safe_filename)
+                    msg.attach(attachment_part)
 
+            try:
+                with self._get_smtp_connection() as smtp:
+                    smtp.sendmail(safe_from_email, to_email, msg.as_string())
+            # Порядок веток задан иерархией smtplib: SMTPException наследуется
+            # от OSError, поэтому широкий except OSError выше перехватывал бы и
+            # отказ по одному адресу — и глушил бы почту всем на время остывания.
+            except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected) as connection_error:
+                self._note_connection_failure(connection_error)
+                self._log_connection_failure(to_email, connection_error)
+                if queue_on_failure:
+                    self._queue_for_retry(
+                        to_email=to_email,
+                        subject=subject,
+                        body_html=body_html,
+                        body_text=body_text,
+                        attachments=attachments,
+                        unsubscribe_url=unsubscribe_url,
+                        retry_until=retry_until,
+                    )
+                return False
+            except smtplib.SMTPException as smtp_error:
+                # Сервер ответил отказом: отклонён адрес, не прошла авторизация,
+                # превышен лимит. Соединение при этом рабочее, и остывание не
+                # объявляется: следующему адресу письмо может уйти.
+                logger.warning(
+                    'SMTP-сервер отклонил письмо',
+                    to_email=to_email,
+                    reason=f'{type(smtp_error).__name__}: {smtp_error}',
+                    **self._endpoint(),
+                )
+                return False
+            except OSError as connection_error:
+                # Сеть: недоступный маршрут, таймаут, отказ в соединении, DNS.
+                self._note_connection_failure(connection_error)
+                self._log_connection_failure(to_email, connection_error)
+                if queue_on_failure:
+                    self._queue_for_retry(
+                        to_email=to_email,
+                        subject=subject,
+                        body_html=body_html,
+                        body_text=body_text,
+                        attachments=attachments,
+                        unsubscribe_url=unsubscribe_url,
+                        retry_until=retry_until,
+                    )
+                return False
+
+            self._note_success()
             logger.info('Email sent successfully to', to_email=to_email)
             return True
 
         except Exception as e:
+            # Сюда попадает уже не работа сети, а ошибка сборки письма — такой
+            # трейсбек нужен.
             logger.error('Failed to send email to', to_email=to_email, error=e)
             return False
+
+    def _render_default_template(
+        self,
+        notification_type: str,
+        language: str,
+        context: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """
+        Render the built-in default template for an auth email.
+
+        Single source of truth: the same EmailNotificationTemplates the admin
+        editor and the notification delivery service use — what the admin sees
+        in the editor preview is exactly what this service sends.
+
+        Imports are lazy to avoid a module cycle
+        (notification_delivery_service imports this module).
+        """
+        from app.services.notification_delivery_service import NotificationType
+
+        from .email_templates import EmailNotificationTemplates
+
+        try:
+            template = EmailNotificationTemplates().get_template(NotificationType(notification_type), language, context)
+        except Exception as e:
+            logger.error(
+                'Не удалось отрендерить дефолтный email шаблон',
+                notification_type=notification_type,
+                language=language,
+                error=e,
+            )
+            return None
+        if not template:
+            return None
+        return (template['subject'], template['body_html'])
 
     def send_verification_email(
         self,
@@ -161,110 +428,22 @@ class EmailService:
         Returns:
             True if email was sent successfully, False otherwise
         """
+        retry_until = datetime.now(tz=UTC) + timedelta(hours=settings.get_cabinet_email_verification_expire_hours())
         if custom_subject and custom_body_html:
-            return self.send_email(to_email, custom_subject, custom_body_html)
+            return self.send_email(to_email, custom_subject, custom_body_html, retry_until=retry_until)
 
-        full_url = f'{verification_url}?token={verification_token}'
-        expire_hours = settings.get_cabinet_email_verification_expire_hours()
-
-        # Escape user-provided values for HTML context
-        safe_username = html.escape(username) if username else None
-
-        # Localized content
-        texts = {
-            'ru': {
-                'greeting': f'Здравствуйте{", " + safe_username if safe_username else ""}!',
-                'subject': 'Подтверждение email адреса',
-                'intro': 'Спасибо за регистрацию! Пожалуйста, подтвердите ваш email адрес, нажав на кнопку ниже:',
-                'button': 'Подтвердить email',
-                'or_copy': 'Или скопируйте и вставьте эту ссылку в браузер:',
-                'expires': f'Ссылка действительна в течение {expire_hours} часов.',
-                'ignore': 'Если вы не создавали аккаунт, просто проигнорируйте это письмо.',
-                'regards': 'С уважением,',
+        rendered = self._render_default_template(
+            'email_verification',
+            language,
+            {
+                'username': username or '',
+                'verification_url': f'{verification_url}?token={verification_token}',
+                'expire_hours': settings.get_cabinet_email_verification_expire_hours(),
             },
-            'en': {
-                'greeting': f'Hello{", " + safe_username if safe_username else ""}!',
-                'subject': 'Verify your email address',
-                'intro': 'Thank you for registering! Please verify your email address by clicking the button below:',
-                'button': 'Verify Email',
-                'or_copy': 'Or copy and paste this link in your browser:',
-                'expires': f'This link will expire in {expire_hours} hours.',
-                'ignore': "If you didn't create an account, you can safely ignore this email.",
-                'regards': 'Best regards,',
-            },
-            'zh': {
-                'greeting': f'您好{", " + safe_username if safe_username else ""}!',
-                'subject': '验证您的邮箱地址',
-                'intro': '感谢您的注册！请点击下方按钮验证您的邮箱地址：',
-                'button': '验证邮箱',
-                'or_copy': '或将此链接复制并粘贴到浏览器中：',
-                'expires': f'此链接将在 {expire_hours} 小时后过期。',
-                'ignore': '如果您没有创建账户，请忽略此邮件。',
-                'regards': '此致,',
-            },
-            'ua': {
-                'greeting': f'Вітаємо{", " + safe_username if safe_username else ""}!',
-                'subject': 'Підтвердження email адреси',
-                'intro': 'Дякуємо за реєстрацію! Будь ласка, підтвердіть вашу email адресу, натиснувши на кнопку нижче:',
-                'button': 'Підтвердити email',
-                'or_copy': 'Або скопіюйте та вставте це посилання в браузер:',
-                'expires': f'Посилання дійсне протягом {expire_hours} годин.',
-                'ignore': 'Якщо ви не створювали акаунт, просто проігноруйте цей лист.',
-                'regards': 'З повагою,',
-            },
-            'fa': {
-                'greeting': f'سلام{", " + safe_username if safe_username else ""}!',
-                'subject': 'تایید آدرس ایمیل',
-                'intro': 'از ثبت‌نام شما سپاسگزاریم! لطفاً با کلیک روی دکمه زیر ایمیل خود را تایید کنید:',
-                'button': 'تایید ایمیل',
-                'or_copy': 'یا این لینک را در مرورگر خود کپی و باز کنید:',
-                'expires': f'این لینک تا {expire_hours} ساعت معتبر است.',
-                'ignore': 'اگر شما این حساب را ایجاد نکرده‌اید، این ایمیل را نادیده بگیرید.',
-                'regards': 'با احترام،',
-            },
-        }
-
-        t = texts.get(language, texts['ru'])
-
-        subject = t['subject']
-        body_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-                .button {{
-                    display: inline-block;
-                    padding: 12px 24px;
-                    background-color: #007bff;
-                    color: white !important;
-                    text-decoration: none;
-                    border-radius: 5px;
-                    margin: 20px 0;
-                }}
-                .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>{t['greeting']}</h2>
-                <p>{t['intro']}</p>
-                <a href="{full_url}" class="button">{t['button']}</a>
-                <p>{t['or_copy']}</p>
-                <p><a href="{full_url}">{full_url}</a></p>
-                <p>{t['expires']}</p>
-                <p>{t['ignore']}</p>
-                <div class="footer">
-                    <p>{t['regards']}<br>{self.from_name}</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-        return self.send_email(to_email, subject, body_html)
+        )
+        if not rendered:
+            return False
+        return self.send_email(to_email, *rendered, retry_until=retry_until)
 
     def send_password_reset_email(
         self,
@@ -291,111 +470,22 @@ class EmailService:
         Returns:
             True if email was sent successfully, False otherwise
         """
+        retry_until = datetime.now(tz=UTC) + timedelta(hours=settings.get_cabinet_password_reset_expire_hours())
         if custom_subject and custom_body_html:
-            return self.send_email(to_email, custom_subject, custom_body_html)
+            return self.send_email(to_email, custom_subject, custom_body_html, retry_until=retry_until)
 
-        full_url = f'{reset_url}?token={reset_token}'
-        expire_hours = settings.get_cabinet_password_reset_expire_hours()
-
-        # Escape user-provided values for HTML context
-        safe_username = html.escape(username) if username else None
-
-        # Localized content
-        texts = {
-            'ru': {
-                'greeting': f'Здравствуйте{", " + safe_username if safe_username else ""}!',
-                'subject': 'Сброс пароля',
-                'intro': 'Мы получили запрос на сброс вашего пароля. Нажмите на кнопку ниже, чтобы установить новый пароль:',
-                'button': 'Сбросить пароль',
-                'or_copy': 'Или скопируйте и вставьте эту ссылку в браузер:',
-                'expires': f'Ссылка действительна в течение {expire_hours} часов.',
-                'warning': 'Если вы не запрашивали сброс пароля, проигнорируйте это письмо или свяжитесь с поддержкой.',
-                'regards': 'С уважением,',
+        rendered = self._render_default_template(
+            'password_reset',
+            language,
+            {
+                'username': username or '',
+                'reset_url': f'{reset_url}?token={reset_token}',
+                'expire_hours': settings.get_cabinet_password_reset_expire_hours(),
             },
-            'en': {
-                'greeting': f'Hello{", " + safe_username if safe_username else ""}!',
-                'subject': 'Reset your password',
-                'intro': 'We received a request to reset your password. Click the button below to set a new password:',
-                'button': 'Reset Password',
-                'or_copy': 'Or copy and paste this link in your browser:',
-                'expires': f'This link will expire in {expire_hours} hour(s).',
-                'warning': "If you didn't request a password reset, please ignore this email or contact support if you're concerned.",
-                'regards': 'Best regards,',
-            },
-            'zh': {
-                'greeting': f'您好{", " + safe_username if safe_username else ""}!',
-                'subject': '重置您的密码',
-                'intro': '我们收到了重置您密码的请求。点击下方按钮设置新密码：',
-                'button': '重置密码',
-                'or_copy': '或将此链接复制并粘贴到浏览器中：',
-                'expires': f'此链接将在 {expire_hours} 小时后过期。',
-                'warning': '如果您没有请求重置密码，请忽略此邮件或联系客服。',
-                'regards': '此致,',
-            },
-            'ua': {
-                'greeting': f'Вітаємо{", " + safe_username if safe_username else ""}!',
-                'subject': 'Скидання пароля',
-                'intro': 'Ми отримали запит на скидання вашого пароля. Натисніть на кнопку нижче, щоб встановити новий пароль:',
-                'button': 'Скинути пароль',
-                'or_copy': 'Або скопіюйте та вставте це посилання в браузер:',
-                'expires': f'Посилання дійсне протягом {expire_hours} годин.',
-                'warning': "Якщо ви не запитували скидання пароля, проігноруйте цей лист або зв'яжіться з підтримкою.",
-                'regards': 'З повагою,',
-            },
-            'fa': {
-                'greeting': f'سلام{", " + safe_username if safe_username else ""}!',
-                'subject': 'بازنشانی رمز عبور',
-                'intro': 'درخواستی برای بازنشانی رمز عبور شما دریافت شد. برای تعیین رمز جدید روی دکمه زیر بزنید:',
-                'button': 'بازنشانی رمز عبور',
-                'or_copy': 'یا این لینک را در مرورگر خود کپی و باز کنید:',
-                'expires': f'این لینک تا {expire_hours} ساعت معتبر است.',
-                'warning': 'اگر شما درخواست بازنشانی رمز عبور نداده‌اید، این ایمیل را نادیده بگیرید یا با پشتیبانی تماس بگیرید.',
-                'regards': 'با احترام،',
-            },
-        }
-
-        t = texts.get(language, texts['ru'])
-
-        subject = t['subject']
-        body_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-                .button {{
-                    display: inline-block;
-                    padding: 12px 24px;
-                    background-color: #dc3545;
-                    color: white !important;
-                    text-decoration: none;
-                    border-radius: 5px;
-                    margin: 20px 0;
-                }}
-                .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
-                .warning {{ color: #dc3545; font-weight: bold; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>{t['greeting']}</h2>
-                <p>{t['intro']}</p>
-                <a href="{full_url}" class="button">{t['button']}</a>
-                <p>{t['or_copy']}</p>
-                <p><a href="{full_url}">{full_url}</a></p>
-                <p>{t['expires']}</p>
-                <p class="warning">{t['warning']}</p>
-                <div class="footer">
-                    <p>{t['regards']}<br>{self.from_name}</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-        return self.send_email(to_email, subject, body_html)
+        )
+        if not rendered:
+            return False
+        return self.send_email(to_email, *rendered, retry_until=retry_until)
 
     def send_email_change_code(
         self,
@@ -420,110 +510,22 @@ class EmailService:
         Returns:
             True if email was sent successfully, False otherwise
         """
+        retry_until = datetime.now(tz=UTC) + timedelta(minutes=settings.get_cabinet_email_change_code_expire_minutes())
         if custom_subject and custom_body_html:
-            return self.send_email(to_email, custom_subject, custom_body_html)
+            return self.send_email(to_email, custom_subject, custom_body_html, retry_until=retry_until)
 
-        expire_minutes = settings.get_cabinet_email_change_code_expire_minutes()
-
-        # Escape user-provided values for HTML context
-        safe_username = html.escape(username) if username else None
-
-        texts = {
-            'ru': {
-                'greeting': f'Здравствуйте{", " + safe_username if safe_username else ""}!',
-                'subject': 'Код подтверждения для смены email',
-                'intro': 'Вы запросили смену email адреса. Используйте код ниже для подтверждения:',
-                'code_label': 'Ваш код подтверждения:',
-                'expires': f'Код действителен в течение {expire_minutes} минут.',
-                'ignore': 'Если вы не запрашивали смену email, просто проигнорируйте это письмо.',
-                'regards': 'С уважением,',
+        rendered = self._render_default_template(
+            'email_change_code',
+            language,
+            {
+                'username': username or '',
+                'code': code,
+                'expire_minutes': settings.get_cabinet_email_change_code_expire_minutes(),
             },
-            'en': {
-                'greeting': f'Hello{", " + safe_username if safe_username else ""}!',
-                'subject': 'Email change verification code',
-                'intro': 'You requested to change your email address. Use the code below to confirm:',
-                'code_label': 'Your verification code:',
-                'expires': f'This code will expire in {expire_minutes} minutes.',
-                'ignore': "If you didn't request an email change, you can safely ignore this email.",
-                'regards': 'Best regards,',
-            },
-            'zh': {
-                'greeting': f'您好{", " + safe_username if safe_username else ""}!',
-                'subject': '邮箱更换验证码',
-                'intro': '您请求更换邮箱地址。请使用以下验证码确认：',
-                'code_label': '您的验证码：',
-                'expires': f'此验证码将在 {expire_minutes} 分钟后过期。',
-                'ignore': '如果您没有请求更换邮箱，请忽略此邮件。',
-                'regards': '此致,',
-            },
-            'ua': {
-                'greeting': f'Вітаємо{", " + safe_username if safe_username else ""}!',
-                'subject': 'Код підтвердження для зміни email',
-                'intro': 'Ви запросили зміну email адреси. Використовуйте код нижче для підтвердження:',
-                'code_label': 'Ваш код підтвердження:',
-                'expires': f'Код дійсний протягом {expire_minutes} хвилин.',
-                'ignore': 'Якщо ви не запитували зміну email, просто проігноруйте цей лист.',
-                'regards': 'З повагою,',
-            },
-            'fa': {
-                'greeting': f'سلام{", " + safe_username if safe_username else ""}!',
-                'subject': 'کد تایید تغییر ایمیل',
-                'intro': 'شما درخواست تغییر ایمیل داده‌اید. برای تایید از کد زیر استفاده کنید:',
-                'code_label': 'کد تایید شما:',
-                'expires': f'این کد تا {expire_minutes} دقیقه معتبر است.',
-                'ignore': 'اگر شما درخواست تغییر ایمیل نداده‌اید، این ایمیل را نادیده بگیرید.',
-                'regards': 'با احترام،',
-            },
-        }
-
-        t = texts.get(language, texts['ru'])
-
-        subject = t['subject']
-        body_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-                .code-box {{
-                    background-color: #f8f9fa;
-                    border: 2px solid #007bff;
-                    border-radius: 8px;
-                    padding: 20px;
-                    text-align: center;
-                    margin: 20px 0;
-                }}
-                .code {{
-                    font-size: 32px;
-                    font-weight: bold;
-                    letter-spacing: 8px;
-                    color: #007bff;
-                    font-family: monospace;
-                }}
-                .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>{t['greeting']}</h2>
-                <p>{t['intro']}</p>
-                <div class="code-box">
-                    <p>{t['code_label']}</p>
-                    <p class="code">{code}</p>
-                </div>
-                <p>{t['expires']}</p>
-                <p>{t['ignore']}</p>
-                <div class="footer">
-                    <p>{t['regards']}<br>{self.from_name}</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-        return self.send_email(to_email, subject, body_html)
+        )
+        if not rendered:
+            return False
+        return self.send_email(to_email, *rendered, retry_until=retry_until)
 
 
 # Singleton instance
