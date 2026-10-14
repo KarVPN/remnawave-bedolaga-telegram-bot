@@ -6,6 +6,7 @@ import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from pydantic import BaseModel
 
+from app.bot_factory import create_bot
 from app.database.models import User
 from app.services.ticket_media_service import resolve_ticket_upload_chat_id, upload_media_to_chat
 

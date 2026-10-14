@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 
 from app import bot_factory
+from app.cabinet.routes import media as cabinet_media
 from app.services.ticket_media_service import (
     MAX_TICKET_MEDIA_BYTES,
     media_kind,
@@ -177,3 +179,32 @@ class TestUploading:
         await upload_ticket_media_to_admin_chat(filename='app.log', data=b'log line\n', media_type='document')
 
         assert fake_bot.sent[0][1]['chat_id'] == 123
+
+
+class TestCabinetMediaDownload:
+    async def test_download_route_returns_the_telegram_file_and_closes_the_bot(self, monkeypatch):
+        class _DownloadBot:
+            def __init__(self):
+                self.session = _FakeSession()
+                self.requested_file_id = None
+                self.requested_path = None
+
+            async def get_file(self, file_id):
+                self.requested_file_id = file_id
+                return SimpleNamespace(file_path='photos/screenshot.jpg')
+
+            async def download_file(self, file_path):
+                self.requested_path = file_path
+                return BytesIO(b'jpeg bytes')
+
+        bot = _DownloadBot()
+        monkeypatch.setattr(cabinet_media, 'create_bot', lambda: bot)
+
+        response = await cabinet_media.download_media('photo-file-id')
+
+        assert bot.requested_file_id == 'photo-file-id'
+        assert bot.requested_path == 'photos/screenshot.jpg'
+        assert response.body == b'jpeg bytes'
+        assert response.media_type == 'image/jpeg'
+        assert response.headers['content-disposition'] == 'inline; filename=screenshot.jpg'
+        assert bot.session.closed is True
