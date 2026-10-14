@@ -3,13 +3,12 @@
 import mimetypes
 
 import structlog
-from aiogram.types import BufferedInputFile
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from pydantic import BaseModel
 
 from app.bot_factory import create_bot
-from app.config import settings
 from app.database.models import User
+from app.services.ticket_media_service import resolve_ticket_upload_chat_id, upload_media_to_chat
 
 from ..dependencies import get_current_cabinet_user
 
@@ -33,18 +32,13 @@ class MediaUploadResponse(BaseModel):
 
 def _resolve_target_chat_id() -> int:
     """Get chat ID for uploading files (notification channel or first admin)."""
-    chat_id = settings.get_admin_notifications_chat_id()
-    if chat_id is not None:
-        return chat_id
-
-    admin_ids = settings.get_admin_ids()
-    if admin_ids:
-        return admin_ids[0]
-
-    raise HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail='No chat configured for file uploads',
-    )
+    try:
+        return resolve_ticket_upload_chat_id()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='No chat configured for file uploads',
+        ) from error
 
 
 def _build_media_url(request: Request, file_id: str) -> str:
@@ -93,44 +87,27 @@ async def upload_media(
                 detail='Invalid image type. Allowed: JPEG, PNG, GIF, WebP',
             )
 
-    target_chat_id = _resolve_target_chat_id()
-    upload = BufferedInputFile(file_bytes, filename=file.filename or 'upload')
-
-    bot = create_bot()
-
     try:
-        if media_type_normalized == 'photo':
-            message = await bot.send_photo(
-                chat_id=target_chat_id,
-                photo=upload,
-            )
-            media = message.photo[-1]
-        elif media_type_normalized == 'video':
-            message = await bot.send_video(
-                chat_id=target_chat_id,
-                video=upload,
-            )
-            media = message.video
-        else:
-            message = await bot.send_document(
-                chat_id=target_chat_id,
-                document=upload,
-            )
-            media = message.document
-
-        media_url = _build_media_url(request, media.file_id)
+        target_chat_id = _resolve_target_chat_id()
+        file_id, file_unique_id = await upload_media_to_chat(
+            chat_id=target_chat_id,
+            filename=file.filename or 'upload',
+            data=file_bytes,
+            media_type=media_type_normalized,
+        )
+        media_url = _build_media_url(request, file_id)
 
         logger.info(
             'User uploaded',
             telegram_id=user.telegram_id,
             media_type_normalized=media_type_normalized,
-            file_id=media.file_id,
+            file_id=file_id,
         )
 
         return MediaUploadResponse(
             media_type=media_type_normalized,
-            file_id=media.file_id,
-            file_unique_id=getattr(media, 'file_unique_id', None),
+            file_id=file_id,
+            file_unique_id=file_unique_id,
             media_url=media_url,
         )
     except HTTPException:
@@ -141,8 +118,6 @@ async def upload_media(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to upload media',
         ) from error
-    finally:
-        await bot.session.close()
 
 
 @router.get('/{file_id}', name='cabinet_download_media')

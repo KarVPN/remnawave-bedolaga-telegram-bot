@@ -99,38 +99,91 @@ async def upload_ticket_media(
     the caller keeps only the `file_id` and passes it into ticket creation or a
     message, where the support announcement delivers the attachment.
     """
+    file_id, _ = await upload_media_to_chat(
+        chat_id=telegram_id,
+        filename=filename,
+        data=data,
+        media_type=media_type,
+        caption=caption,
+        disable_notification=True,
+        delete_after_upload=True,
+    )
+    return file_id
+
+
+def resolve_ticket_upload_chat_id() -> int:
+    """Return the existing cabinet ticket upload destination."""
+    from app.config import settings
+
+    chat_id = settings.get_admin_notifications_chat_id()
+    if chat_id is not None:
+        return chat_id
+
+    admin_ids = settings.get_admin_ids()
+    if admin_ids:
+        return admin_ids[0]
+
+    raise ValueError('No chat configured for file uploads')
+
+
+async def upload_ticket_media_to_admin_chat(
+    *,
+    filename: str,
+    data: bytes,
+    media_type: str,
+) -> str:
+    """Upload a ticket attachment through the cabinet's existing Telegram storage."""
+    file_id, _ = await upload_media_to_chat(
+        chat_id=resolve_ticket_upload_chat_id(),
+        filename=filename,
+        data=data,
+        media_type=media_type,
+    )
+    return file_id
+
+
+async def upload_media_to_chat(
+    *,
+    chat_id: int,
+    filename: str,
+    data: bytes,
+    media_type: str,
+    caption: str | None = None,
+    disable_notification: bool = False,
+    delete_after_upload: bool = False,
+) -> tuple[str, str | None]:
+    """Upload one Telegram media object and return its reusable file ID."""
     from app.bot_factory import create_bot
 
     bot = create_bot()
     try:
         upload = BufferedInputFile(data, filename=filename or 'upload')
-        send_kwargs: dict = {
-            'chat_id': telegram_id,
-            'caption': caption,
-            'disable_notification': True,
-        }
+        send_kwargs: dict = {'chat_id': chat_id}
+        if caption is not None:
+            send_kwargs['caption'] = caption
+        if disable_notification:
+            send_kwargs['disable_notification'] = True
 
         if media_type == 'photo':
             message = await bot.send_photo(photo=upload, **send_kwargs)
-            file_id = message.photo[-1].file_id
+            media = message.photo[-1]
         elif media_type == 'video':
             message = await bot.send_video(video=upload, **send_kwargs)
-            file_id = message.video.file_id
+            media = message.video
         else:
             message = await bot.send_document(document=upload, **send_kwargs)
-            file_id = message.document.file_id
+            media = message.document
 
-        try:
-            await bot.delete_message(chat_id=telegram_id, message_id=message.message_id)
-        except Exception as delete_error:
-            # The file_id is valid already and support is untouched: a copy left
-            # in the person's own chat is not a duplicate where it matters.
-            logger.warning(
-                'Failed to delete the temporary ticket media message',
-                telegram_id=telegram_id,
-                error=delete_error,
-            )
+        if delete_after_upload:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+            except Exception as delete_error:
+                logger.warning(
+                    'Failed to delete the temporary ticket media message',
+                    telegram_id=chat_id,
+                    error=delete_error,
+                )
 
-        return file_id
+        return media.file_id, getattr(media, 'file_unique_id', None)
     finally:
         await bot.session.close()

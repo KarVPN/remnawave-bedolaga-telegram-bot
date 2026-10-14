@@ -7,12 +7,19 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 
 from app import bot_factory
-from app.services.ticket_media_service import MAX_TICKET_MEDIA_BYTES, media_kind, upload_ticket_media
+from app.cabinet.routes import media as cabinet_media
+from app.services.ticket_media_service import (
+    MAX_TICKET_MEDIA_BYTES,
+    media_kind,
+    upload_ticket_media,
+    upload_ticket_media_to_admin_chat,
+)
 
 
 TELEGRAM_ID = 895225
@@ -41,7 +48,9 @@ class _FakeBot:
 
     async def send_photo(self, **kwargs):
         self.sent.append(('photo', kwargs))
-        return SimpleNamespace(photo=[SimpleNamespace(file_id='SMALL'), SimpleNamespace(file_id='PHOTO_FILE_ID')], message_id=12)
+        return SimpleNamespace(
+            photo=[SimpleNamespace(file_id='SMALL'), SimpleNamespace(file_id='PHOTO_FILE_ID')], message_id=12
+        )
 
     async def send_video(self, **kwargs):
         self.sent.append(('video', kwargs))
@@ -139,4 +148,63 @@ class TestUploading:
 
         assert file_id == 'DOC_FILE_ID'
         assert bot.deleted == []
+        assert bot.session.closed is True
+
+    async def test_email_only_ticket_upload_uses_existing_admin_chat_storage(self, fake_bot, monkeypatch):
+        from app.config import settings
+
+        monkeypatch.setattr(type(settings), 'get_admin_notifications_chat_id', lambda _settings: -100123)
+        monkeypatch.setattr(type(settings), 'get_admin_ids', lambda _settings: [123])
+
+        file_id = await upload_ticket_media_to_admin_chat(
+            filename='app.log',
+            data=b'log line\n',
+            media_type='document',
+        )
+
+        assert file_id == 'DOC_FILE_ID'
+        kind, sent = fake_bot.sent[0]
+        assert kind == 'document'
+        assert sent['chat_id'] == -100123
+        assert 'caption' not in sent
+        assert fake_bot.deleted == []
+        assert fake_bot.session.closed is True
+
+    async def test_email_only_upload_falls_back_to_existing_admin_destination(self, fake_bot, monkeypatch):
+        from app.config import settings
+
+        monkeypatch.setattr(type(settings), 'get_admin_notifications_chat_id', lambda _settings: None)
+        monkeypatch.setattr(type(settings), 'get_admin_ids', lambda _settings: [123])
+
+        await upload_ticket_media_to_admin_chat(filename='app.log', data=b'log line\n', media_type='document')
+
+        assert fake_bot.sent[0][1]['chat_id'] == 123
+
+
+class TestCabinetMediaDownload:
+    async def test_download_route_returns_the_telegram_file_and_closes_the_bot(self, monkeypatch):
+        class _DownloadBot:
+            def __init__(self):
+                self.session = _FakeSession()
+                self.requested_file_id = None
+                self.requested_path = None
+
+            async def get_file(self, file_id):
+                self.requested_file_id = file_id
+                return SimpleNamespace(file_path='photos/screenshot.jpg')
+
+            async def download_file(self, file_path):
+                self.requested_path = file_path
+                return BytesIO(b'jpeg bytes')
+
+        bot = _DownloadBot()
+        monkeypatch.setattr(cabinet_media, 'create_bot', lambda: bot)
+
+        response = await cabinet_media.download_media('photo-file-id')
+
+        assert bot.requested_file_id == 'photo-file-id'
+        assert bot.requested_path == 'photos/screenshot.jpg'
+        assert response.body == b'jpeg bytes'
+        assert response.media_type == 'image/jpeg'
+        assert response.headers['content-disposition'] == 'inline; filename=screenshot.jpg'
         assert bot.session.closed is True
