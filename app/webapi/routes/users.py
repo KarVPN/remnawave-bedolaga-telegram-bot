@@ -205,7 +205,7 @@ async def get_user_by_id_endpoint(
         id=user.id,
         telegram_id=user.telegram_id,
         status=user.status,
-        remnawave_uuid=user.remnawave_uuid,
+        remnawave_id=user.remnawave_id,
     )
 
 

@@ -36,7 +36,7 @@ async def _get(app: FastAPI, path: str, *, key: str | None = 'machine-key'):
 class TestExactMachineIdentity:
     async def test_by_id_uses_only_the_cabinet_primary_key_and_returns_minimal_fields(self, identity_app, monkeypatch):
         calls: list[tuple[str, int]] = []
-        account = User(id=41, telegram_id=None, status='active', remnawave_uuid='panel-uuid')
+        account = User(id=41, telegram_id=None, status='active', remnawave_id=701, remnawave_uuid='legacy-uuid')
 
         async def get_by_id(_db, user_id):
             calls.append(('id', user_id))
@@ -55,12 +55,15 @@ class TestExactMachineIdentity:
             'id': 41,
             'telegram_id': None,
             'status': 'active',
-            'remnawave_uuid': 'panel-uuid',
+            'remnawave_id': 701,
+            'remnawave_uuid': None,
         }
         assert calls == [('id', 41)]
 
     async def test_id_collision_resolves_exact_internal_user(self, identity_app, monkeypatch):
-        account = User(id=895225, telegram_id=None, status='active', remnawave_uuid='email-panel-uuid')
+        account = User(
+            id=895225, telegram_id=None, status='active', remnawave_id=702, remnawave_uuid='email-panel-uuid'
+        )
         unrelated_telegram_user = User(id=52, telegram_id=895225, status='blocked', remnawave_uuid='other-uuid')
         calls: list[str] = []
 
@@ -79,7 +82,8 @@ class TestExactMachineIdentity:
 
         assert response.status_code == 200
         assert response.json()['id'] == account.id
-        assert response.json()['remnawave_uuid'] == 'email-panel-uuid'
+        assert response.json()['remnawave_id'] == 702
+        assert response.json()['remnawave_uuid'] is None
         assert calls == ['id']
 
     async def test_unknown_exact_id_is_404(self, identity_app, monkeypatch):

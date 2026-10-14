@@ -392,7 +392,7 @@
   Функции: `get_subscription`
 - `app/cabinet/routes/subscription_modules/`
 - `app/cabinet/routes/support_ws.py` — Python-модуль
-  Классы: `WsUserContext` (2 методов), `UploadTransfer` (1 методов), `DownloadTransfer` (1 методов), `SupportWsSession` (2 методов), `SupportWsManager` (4 методов)
+  Классы: `WsUserContext` (2 методов), `UploadTransfer` (1 методов), `DownloadTransfer` (1 методов), `SupportWsSession` (1 методов), `SupportWsManager` (4 методов)
   Функции: `support_mobile_websocket_endpoint` — Mobile-only support ticket command WebSocket., `register_support_ticket_event_bridge` — Attach the support-socket bridge to the global event emitter (idempotent).
 - `app/cabinet/routes/ticket_notifications.py` — Python-модуль
   Классы: `TicketNotificationResponse`, `TicketNotificationListResponse`, `UnreadCountResponse`
@@ -2694,6 +2694,7 @@
 - `docs/payments-payer-data.md` — файл
 - `docs/persistent_cart_system.md` — файл
 - `docs/postgresql-18-upgrade.md` — файл
+- `docs/pr11-codeql-review.md` — файл
 - `docs/project_structure_reference.md` — файл
 - `docs/referral_program_setting.md` — файл
 - `docs/web-admin-integration-guide.md` — файл

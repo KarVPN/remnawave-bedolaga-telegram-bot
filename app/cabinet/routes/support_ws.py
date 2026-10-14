@@ -325,9 +325,6 @@ class SupportWsSession:
     idempotency_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def __hash__(self) -> int:
-        return id(self)
-
     async def send_json(self, data: dict[str, Any]) -> None:
         # Broadcasts run from another user's task; serialize with the session's own
         # receive-loop sends so two coroutines never interleave frames on one socket.

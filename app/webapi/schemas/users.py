@@ -90,7 +90,10 @@ class MachineUserIdentityResponse(BaseModel):
     id: int
     telegram_id: int | None = None
     status: str
-    remnawave_uuid: str | None = None
+    remnawave_id: int | None = None
+    remnawave_uuid: str | None = Field(
+        default=None, deprecated=True, description='Legacy field; always null with Remnawave 3. Use remnawave_id.'
+    )
 
 
 class UserListResponse(BaseModel):
