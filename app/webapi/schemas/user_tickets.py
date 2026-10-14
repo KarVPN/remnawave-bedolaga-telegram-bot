@@ -49,5 +49,18 @@ class UserTicketCreateRequest(TicketCreateRequest):
     """Machine API uses the same validated contract as the v5 cabinet."""
 
 
+class UserTicketMediaUploadResponse(BaseModel):
+    """Result of uploading one attachment (`POST /tickets/by-telegram-id/{id}/media`).
+
+    This is exactly the triple the caller passes into ticket creation or a
+    message: `media_type`, `media_file_id`, `media_caption`. Telegram addresses
+    an uploaded file by `file_id`, so the file itself is never echoed back.
+    """
+
+    media_type: str = Field(..., description='Media type: photo, video, document')
+    media_file_id: str = Field(..., description='Telegram file_id of the uploaded media')
+    media_caption: str | None = Field(default=None, description='Caption stored with the media')
+
+
 class UserTicketMessageCreateRequest(TicketMessageCreateRequest):
     """Machine API uses the same validated contract as the v5 cabinet."""

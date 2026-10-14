@@ -940,12 +940,8 @@ async def _auto_purchase_tariff(
         selected_extra_squads = cart_data.get('selected_extra_squads')
 
     result = await pricing_engine.calculate_tariff_purchase_price(
-        tariff,
-        period_days,
-        device_limit=device_limit,
-        user=user,
-        extra_squad_uuids=selected_extra_squads,
-    db=db)
+        tariff, period_days, device_limit=device_limit, user=user, extra_squad_uuids=selected_extra_squads, db=db
+    )
     final_price = result.final_total
     consume_promo = result.promo_offer_discount > 0
 

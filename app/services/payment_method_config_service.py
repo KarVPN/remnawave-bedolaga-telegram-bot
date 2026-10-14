@@ -19,6 +19,8 @@ def _get_yookassa_sub_options() -> list[dict] | None:
     if settings.is_yookassa_sbp_enabled():
         options.append({'id': 'sbp', 'name': 'СБП'})
     return options or None
+
+
 # ============ Display-name override cache ============
 # The cabinet stores per-method name overrides in PaymentMethodConfig.display_name.
 # The bot keyboards (app/keyboards/inline.py) are synchronous and have no DB handle,

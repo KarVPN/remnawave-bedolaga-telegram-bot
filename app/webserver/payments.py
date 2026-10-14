@@ -894,8 +894,9 @@ def create_payment_router(bot: Bot, payment_service: PaymentService) -> APIRoute
             try:
                 parsed_payload = pal24_service.parse_callback(payload)
             except Pal24APIError as error:
+                logger.warning('Invalid Pal24 callback', error=str(error))
                 return JSONResponse(
-                    {'status': 'error', 'reason': str(error)},
+                    {'status': 'error', 'reason': 'invalid_payload'},
                     status_code=status.HTTP_400_BAD_REQUEST,
                 )
 

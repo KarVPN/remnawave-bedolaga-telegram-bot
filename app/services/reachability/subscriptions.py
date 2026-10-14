@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
@@ -123,13 +123,26 @@ def _default_session() -> aiohttp.ClientSession:
 
 
 async def _get(session: Any, url: str, headers: dict[str, str]) -> tuple[bytes, dict[str, str]]:
-    async with session.get(url, headers=headers, allow_redirects=True, max_redirects=MAX_REDIRECTS) as response:
-        _check_host(response.url.host)
-        if response.status >= 400:
-            raise SubscriptionFetchError(f'Подписка ответила HTTP {response.status}')
-        body = await _read_capped(response.content)
-        raw_headers = getattr(response, 'headers', None) or {}
-        return body, {str(key).lower(): str(value) for key, value in dict(raw_headers).items()}
+    # Literal-IP redirects bypass aiohttp's DNS resolver. Validate each Location
+    # before sending the next request; checking only response.url is too late.
+    for redirects in range(MAX_REDIRECTS + 1):
+        url = validate_public_url(url)
+        async with session.get(url, headers=headers, allow_redirects=False) as response:
+            _check_host(response.url.host)
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.headers.get('Location')
+                if not location:
+                    raise SubscriptionFetchError('Подписка перенаправляет без адреса')
+                if redirects == MAX_REDIRECTS:
+                    raise SubscriptionFetchError('Слишком много перенаправлений подписки')
+                url = validate_public_url(urljoin(str(response.url), location))
+                continue
+            if response.status >= 400:
+                raise SubscriptionFetchError(f'Подписка ответила HTTP {response.status}')
+            body = await _read_capped(response.content)
+            raw_headers = getattr(response, 'headers', None) or {}
+            return body, {str(key).lower(): str(value) for key, value in dict(raw_headers).items()}
+    raise SubscriptionFetchError('Слишком много перенаправлений подписки')
 
 
 async def _read_capped(content: Any) -> bytes:

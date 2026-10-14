@@ -5469,11 +5469,8 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
 
     try:
         result = await pricing_engine.calculate_tariff_purchase_price(
-            tariff,
-            period,
-            device_limit=device_limit,
-            user=target_user,
-        db=db)
+            tariff, period, device_limit=device_limit, user=target_user, db=db
+        )
         price_kopeks = result.final_total
     except Exception as e:
         logger.error(

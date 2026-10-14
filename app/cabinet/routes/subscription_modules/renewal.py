@@ -20,8 +20,8 @@ from app.services.subscription_renewal_service import (
     SubscriptionRenewalChargeError,
     SubscriptionRenewalService,
 )
-from app.services.user_cart_service import user_cart_service
 from app.services.tariff_extra_squads import build_connected_squads_for_tariff_renewal
+from app.services.user_cart_service import user_cart_service
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import (
@@ -265,7 +265,8 @@ async def renew_subscription(
     renewal_service = SubscriptionRenewalService()
     connected_squads_override = (
         await build_connected_squads_for_tariff_renewal(db, subscription, request.selected_extra_squads)
-        if subscription.tariff_id else None
+        if subscription.tariff_id
+        else None
     )
 
     try:

@@ -6697,11 +6697,8 @@ async def purchase_tariff_endpoint(
     device_limit = matching_sub.device_limit if matching_sub else None
 
     result = await pricing_engine.calculate_tariff_purchase_price(
-        tariff,
-        payload.period_days,
-        device_limit=device_limit,
-        user=user,
-    db=db)
+        tariff, payload.period_days, device_limit=device_limit, user=user, db=db
+    )
     price_kopeks = result.final_total
     consume_promo_offer = result.promo_offer_discount > 0
     bd = result.breakdown

@@ -148,12 +148,12 @@ def _sanitize_html_content(html: str) -> str:
     if not html:
         return html
 
-    # 1. Remove dangerous tags and their content
-    result = _DANGEROUS_TAGS_RE.sub('', html)
-
-    # Also strip <script>...</script> content (tag + body)
-    result = re.sub(r'<script\b[^>]*>[\s\S]*?</script>', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'<style\b[^>]*>[\s\S]*?</style>', '', result, flags=re.IGNORECASE)
+    # Remove script/style bodies before stripping their tags. HTML end tags may
+    # contain whitespace or attributes before ">", so a literal </script> misses
+    # browser-recognized forms such as </script >.
+    result = re.sub(r'<script\b[^>]*>[\s\S]*?</script\b[^>]*>', '', html, flags=re.IGNORECASE)
+    result = re.sub(r'<style\b[^>]*>[\s\S]*?</style\b[^>]*>', '', result, flags=re.IGNORECASE)
+    result = _DANGEROUS_TAGS_RE.sub('', result)
 
     # 2. Remove event handler attributes
     result = _EVENT_HANDLER_RE.sub('', result)

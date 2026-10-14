@@ -227,7 +227,9 @@ async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypat
     monkeypatch.setattr(referral_service, 'get_effective_referral_commission_percent', lambda u: 25)
 
     notify_bonus_mock = AsyncMock(return_value=True)
-    monkeypatch.setattr(referral_service.notification_delivery_service, 'notify_referral_welcome', AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        referral_service.notification_delivery_service, 'notify_referral_welcome', AsyncMock(return_value=True)
+    )
     notify_registered_mock = AsyncMock(return_value=True)
     monkeypatch.setattr(
         referral_service.notification_delivery_service,
@@ -252,6 +254,8 @@ async def test_registration_email_notifications_do_not_send_zero_bonus(monkeypat
     notify_registered_mock.assert_awaited_once()
     assert notify_registered_mock.await_args.kwargs['user'] is referrer
     assert notify_registered_mock.await_args.kwargs['referral_name'] == new_user.full_name
+
+
 async def test_first_payment_commission_percent_overrides_flat_percent(monkeypatch):
     referrer = SimpleNamespace(
         id=2,

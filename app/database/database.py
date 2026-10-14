@@ -148,6 +148,9 @@ def with_db_retry(
         backoff: Множитель задержки для каждой следующей попытки
     """
 
+    if attempts < 1:
+        raise ValueError(f'attempts must be >= 1, got {attempts}')
+
     def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -172,7 +175,8 @@ def with_db_retry(
                     else:
                         logger.error('Ошибка БД: все попыток исчерпаны. Последняя ошибка', attempts=attempts, e=str(e))
 
-            raise last_exception  # type: ignore[misc]
+            assert last_exception is not None
+            raise last_exception
 
         return wrapper  # type: ignore[return-value]
 
@@ -201,7 +205,8 @@ async def execute_with_retry(
                 await asyncio.sleep(delay)
                 delay *= 2
 
-    raise last_exception  # type: ignore[misc]
+    assert last_exception is not None
+    raise last_exception
 
 
 # ============================================================================

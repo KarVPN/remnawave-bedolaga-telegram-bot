@@ -45,6 +45,8 @@ async def _get_tariff_included_countries(db: AsyncSession, subscription) -> list
         tariff = await get_tariff_by_id(db, subscription.tariff_id)
 
     return list(getattr(tariff, 'allowed_squads', None) or [])
+
+
 async def _resolve_subscription(callback, db_user, db, state=None):
     """Resolve subscription — delegates to shared resolve_subscription_from_context."""
     from .common import resolve_subscription_from_context

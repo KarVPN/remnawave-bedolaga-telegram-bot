@@ -6,6 +6,7 @@
 import asyncio
 import time
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import structlog
@@ -64,8 +65,11 @@ class BlacklistService:
 
             try:
                 # Заменяем github.com на raw.githubusercontent.com для получения raw содержимого
-                if 'github.com' in github_url:
-                    raw_url = github_url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                parsed = urlsplit(github_url)
+                if parsed.hostname == 'github.com':
+                    raw_url = urlunsplit(
+                        parsed._replace(netloc='raw.githubusercontent.com', path=parsed.path.replace('/blob/', '/', 1))
+                    )
                 else:
                     raw_url = github_url
 

@@ -143,8 +143,10 @@ APP_LOGIN_CODE_MESSAGES: dict[AppLoginResult, tuple[str, str]] = {
     AppLoginResult.OK: APP_LOGIN_MESSAGES[AppLoginResult.OK],
     AppLoginResult.EXPIRED: (
         'APP_LOGIN_CODE_EXPIRED',
-        '❌ Код не найден или истёк. Проверьте цифры и отправьте код ещё раз; '
-        'если он показывался давно — начните вход в приложении заново.',
+        (
+            '❌ Код не найден или истёк. Проверьте цифры и отправьте код ещё раз; '
+            'если он показывался давно — начните вход в приложении заново.'
+        ),
     ),
     AppLoginResult.UNAVAILABLE: APP_LOGIN_MESSAGES[AppLoginResult.UNAVAILABLE],
     AppLoginResult.DISABLED: APP_LOGIN_MESSAGES[AppLoginResult.DISABLED],
@@ -319,6 +321,8 @@ async def handle_app_login_code(message: types.Message, db_user=None):
         telegram_id=message.from_user.id,
         result=app_login_result.value,
     )
+
+
 _registration_invite_service = RegistrationInviteService()
 _registration_access_service = RegistrationAccessService(invite_validator=_registration_invite_service)
 

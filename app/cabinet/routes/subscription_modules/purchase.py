@@ -47,9 +47,9 @@ from app.services.subscription_purchase_service import (
     PurchaseValidationError,
 )
 from app.services.subscription_service import SubscriptionService
+from app.services.tariff_extra_squads import build_connected_squads_for_tariff_renewal
 from app.services.traffic_reset_policy import should_reset_traffic_on_tariff_purchase
 from app.services.user_cart_service import user_cart_service
-from app.services.tariff_extra_squads import build_connected_squads_for_tariff_renewal
 from app.utils.pricing_utils import calculate_price_per_month, format_period_description
 from app.utils.timezone import format_local_datetime
 
@@ -813,7 +813,11 @@ async def purchase_tariff(
             if (existing_subscription.device_limit or 0) > (tariff.device_limit or 0):
                 effective_device_limit = existing_subscription.device_limit
 
-        selected_extra_squads = (request.selected_extra_squads if existing_subscription and existing_subscription.tariff_id == tariff.id else None)
+        selected_extra_squads = (
+            request.selected_extra_squads
+            if existing_subscription and existing_subscription.tariff_id == tariff.id
+            else None
+        )
 
         # Calculate price via PricingEngine (single source of truth)
         result = await pricing_engine.calculate_tariff_purchase_price(

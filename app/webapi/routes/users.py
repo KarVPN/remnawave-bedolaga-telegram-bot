@@ -42,6 +42,7 @@ from ..schemas.users import (
     BalanceDepositRequest,
     BalanceDepositResponse,
     BalanceUpdateRequest,
+    MachineUserIdentityResponse,
     PromoGroupSummary,
     SubscriptionSummary,
     UserCreateRequest,
@@ -186,6 +187,25 @@ async def list_users(
         total=int(total),
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get('/by-id/{user_id}', response_model=MachineUserIdentityResponse)
+async def get_user_by_id_endpoint(
+    user_id: int,
+    _: Any = Security(require_api_token),
+    db: AsyncSession = Depends(get_db_session),
+) -> MachineUserIdentityResponse:
+    """Get the account with this exact cabinet ``users.id``."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'User not found')
+
+    return MachineUserIdentityResponse(
+        id=user.id,
+        telegram_id=user.telegram_id,
+        status=user.status,
+        remnawave_uuid=user.remnawave_uuid,
     )
 
 

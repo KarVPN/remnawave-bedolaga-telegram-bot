@@ -84,6 +84,15 @@ class UserNotifyResponse(BaseModel):
     email: UserNotifyChannelResult
 
 
+class MachineUserIdentityResponse(BaseModel):
+    """Minimal identity link used by trusted machine clients."""
+
+    id: int
+    telegram_id: int | None = None
+    status: str
+    remnawave_uuid: str | None = None
+
+
 class UserListResponse(BaseModel):
     items: list[UserResponse]
     total: int
