@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -66,6 +66,7 @@ from app.services.panel_sync import (
 from app.services.panel_sync.fields import narrow_push_fields
 from app.services.permission_service import PermissionService
 from app.services.user_activity_service import UnknownActivityTypes, UserActivityResponse, collect_user_activity
+from app.services.user_bulk_filters import day_bounds
 from app.utils.subscription_time import local_days_until
 from app.utils.subscription_utils import coerce_panel_device_limit
 from app.utils.timezone import local_day_start, panel_datetime_to_utc
@@ -494,6 +495,7 @@ async def list_users(
     traffic_used_percent_min: int | None = Query(None, ge=1, le=100),
     online: bool | None = Query(None),
     in_grace: bool | None = Query(None),
+    subscription_on_date: date | None = None,
     sort_by: SortByEnum = Query(SortByEnum.CREATED_AT),
     sort_order: SortOrderEnum | None = Query(None),
     admin: User = Depends(require_permission('users:read')),
@@ -575,6 +577,7 @@ async def list_users(
         traffic_used_percent_min=traffic_used_percent_min,
         connected=online_filter,
         in_grace=in_grace,
+        subscription_on_date=subscription_on_date,
         order_by_balance=order_by_balance,
         order_by_traffic=order_by_traffic,
         order_by_last_activity=order_by_last_activity,
@@ -603,6 +606,7 @@ async def list_users(
         traffic_used_percent_min=traffic_used_percent_min,
         connected=online_filter,
         in_grace=in_grace,
+        subscription_on_date=subscription_on_date,
     )
 
     # Get spending stats for all users
@@ -619,9 +623,19 @@ async def list_users(
     else:
         highlight = None
 
+    date_bounds = day_bounds(subscription_on_date) if subscription_on_date else None
     items = [
         _build_user_list_item(u, spending_stats, highlight=highlight).model_copy(
             update={
+                'estimated_date_subscription_ids': [
+                    sub.id
+                    for sub in u.subscriptions
+                    if date_bounds
+                    and sub.start_date
+                    and sub.end_date
+                    and sub.start_date < date_bounds[1]
+                    and sub.end_date > date_bounds[0]
+                ],
                 'is_online': connected.has_user(u) if connected is not None else None,
                 'online_at': snapshot.online_at_for(u) if snapshot is not None else None,
             }
