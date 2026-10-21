@@ -11,7 +11,7 @@ from sqlalchemy import case, select
 from app.cabinet.dependencies import get_cabinet_db, require_permission
 from app.cabinet.schemas.user_bulk_operations import UserBulkPreview
 from app.database.database import AsyncSessionLocal, engine
-from app.database.models import UserBulkOperation, UserBulkTarget
+from app.database.models import UserBulkNotification, UserBulkOperation, UserBulkTarget
 from app.services import user_bulk_operations as service
 
 
@@ -22,8 +22,13 @@ router.dependencies = [Depends(require_permission('users:read'))]
 
 @router.post('/preview')
 async def preview(
-    request: UserBulkPreview, admin=Depends(require_permission('bulk_actions:execute')), db=Depends(get_cabinet_db)
+    request: UserBulkPreview,
+    http_request: Request,
+    admin=Depends(require_permission('bulk_actions:execute')),
+    db=Depends(get_cabinet_db),
 ):
+    if request.notify_users:
+        await require_permission('users:send_message')(request=http_request, user=admin, db=db)
     operation_id = await service.preview(db, admin.id, request)
     return await service.summary(db, operation_id)
 
@@ -58,7 +63,16 @@ async def get_operation(
 
 
 @router.post('/{operation_id}/run')
-async def run(operation_id: UUID, admin=Depends(require_permission('bulk_actions:execute'))):
+async def run(
+    operation_id: UUID,
+    request: Request,
+    admin=Depends(require_permission('bulk_actions:execute')),
+    permission_db=Depends(get_cabinet_db),
+):
+    operation = await service.get_operation(permission_db, str(operation_id))
+    if operation.params.get('notify_users'):
+        await require_permission('users:send_message')(request=request, user=admin, db=permission_db)
+    await permission_db.rollback()
     # Independent sessions: permission resolution never holds a DB transaction
     # throughout panel I/O. An advisory lock survives business-handler commits.
     async with service.execution_lock(engine) as acquired:
@@ -101,6 +115,39 @@ async def errors(
         .all()
     )
     return [dict(row) for row in rows]
+
+
+@router.get('/{operation_id}/notification-errors')
+async def notification_errors(
+    operation_id: UUID,
+    offset: int = Query(0, ge=0),
+    admin=Depends(require_permission('bulk_actions:execute')),
+    db=Depends(get_cabinet_db),
+):
+    operation = await service.get_operation(db, str(operation_id))
+    if not operation.params.get('notify_users'):
+        return []
+    rows = (
+        (
+            await db.execute(
+                select(
+                    UserBulkNotification.user_id,
+                    UserBulkNotification.state,
+                    UserBulkNotification.message,
+                )
+                .where(
+                    UserBulkNotification.operation_id == str(operation_id),
+                    UserBulkNotification.state.in_(['failed', 'limited', 'uncertain', 'skipped']),
+                )
+                .order_by(UserBulkNotification.id)
+                .offset(offset)
+                .limit(50)
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [dict(row, subscription_id=None) for row in rows]
 
 
 @router.get('/{operation_id}/events')

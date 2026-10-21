@@ -27,6 +27,8 @@ class UserBulkPreview(BaseModel):
     filters: UserBulkFilters | None = None
     selection_id: UUID | None = None
     target_filters: UserBulkFilters | None = None
+    notify_users: bool = False
+    notification_message: str | None = Field(None, max_length=2000)
 
     @model_validator(mode='after')
     def validate_target_and_params(self):
@@ -37,4 +39,9 @@ class UserBulkPreview(BaseModel):
                 raise ValueError('Traffic package required; days not allowed')
         elif self.days is None or self.traffic_gb is not None:
             raise ValueError('Positive days required; traffic package not allowed')
+        self.notification_message = (self.notification_message or '').strip() or None
+        if self.notification_message and len(self.notification_message.encode('utf-16-le')) // 2 > 2000:
+            raise ValueError('Notification message is too long')
+        if self.notification_message and not self.notify_users:
+            raise ValueError('Enable notifications before providing a message')
         return self
