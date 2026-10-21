@@ -11,6 +11,7 @@ class BulkActionType(StrEnum):
     ACTIVATE_SUBSCRIPTION = 'activate_subscription'
     CHANGE_TARIFF = 'change_tariff'
     ADD_DAYS = 'add_days'
+    DEDUCT_DAYS = 'deduct_days'
     ADD_TRAFFIC = 'add_traffic'
     ADD_BALANCE = 'add_balance'
     ASSIGN_PROMO_GROUP = 'assign_promo_group'

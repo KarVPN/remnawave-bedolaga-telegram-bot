@@ -209,6 +209,9 @@ class Settings(BaseSettings):
     SQLITE_PATH: str = './data/bot.db'
     LOCALES_PATH: str = './locales'
 
+    USERS_BULK_BATCH_SIZE: int = Field(default=25, ge=1, le=100)
+    USERS_BULK_ITEM_DELAY: float = Field(default=0.5, ge=0.1, le=10)
+
     TIMEZONE: str = Field(default_factory=lambda: os.getenv('TZ', 'UTC'))
 
     # strftime pattern used to render datetime values that flow into

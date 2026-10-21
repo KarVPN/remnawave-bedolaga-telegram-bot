@@ -5439,3 +5439,38 @@ class UserReminderState(Base):
     # Последний успех — по нему общий лимит «одно напоминание в сутки».
     last_success_at = Column(AwareDateTime(), nullable=True)
     dismissed_at = Column(AwareDateTime(), nullable=True)
+
+
+class UserBulkOperation(Base):
+    """Immutable parameters and server-side snapshot for Users bulk actions."""
+
+    __tablename__ = 'user_bulk_operations'
+
+    id = Column(String(36), primary_key=True)
+    author_id = Column(Integer, nullable=False, index=True)
+    request_key = Column(String(36), nullable=False)
+    action = Column(String(40), nullable=False)
+    params = Column(JSON, nullable=False)
+    state = Column(String(24), nullable=False, default='preview')
+    cancel_requested = Column(Boolean, nullable=False, default=False)
+    created_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    confirmed_at = Column(AwareDateTime(), nullable=True)
+    __table_args__ = (UniqueConstraint('author_id', 'request_key'),)
+
+
+class UserBulkTarget(Base):
+    __tablename__ = 'user_bulk_targets'
+
+    id = Column(Integer, primary_key=True)
+    operation_id = Column(String(36), ForeignKey('user_bulk_operations.id', ondelete='CASCADE'), nullable=False)
+    # Keep historical IDs even when a subscription or user is deleted afterwards.
+    user_id = Column(Integer, nullable=False)
+    subscription_id = Column(Integer, nullable=True)
+    state = Column(String(24), nullable=False, default='pending')
+    message = Column(Text, nullable=True)
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    __table_args__ = (
+        Index('ix_user_bulk_target_pending', 'operation_id', 'state', 'id'),
+        Index('ix_user_bulk_target_user', 'operation_id', 'user_id'),
+    )

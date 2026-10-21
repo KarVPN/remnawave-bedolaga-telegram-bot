@@ -150,6 +150,8 @@ class UserListItem(BaseModel):
     # Временный доступ (грейс) у показанной подписки — до какого числа он открыт.
     grace_until: datetime | None = None
 
+    estimated_date_subscription_ids: list[int] = Field(default_factory=list)
+
     # All subscriptions (multi-tariff)
     subscriptions: list[SubscriptionListItem] = []
 

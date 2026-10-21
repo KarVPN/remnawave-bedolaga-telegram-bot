@@ -82,6 +82,7 @@ from .ticket_notifications import (
 )
 from .tickets import router as tickets_router
 from .unsubscribe import router as unsubscribe_router
+from .user_bulk_operations import router as user_bulk_operations_router
 from .websocket import router as websocket_router
 from .wheel import router as wheel_router
 from .withdrawal import router as withdrawal_router
@@ -160,6 +161,7 @@ router.include_router(admin_partners_router)
 router.include_router(admin_withdrawals_router)
 router.include_router(admin_users_router)
 router.include_router(admin_bulk_actions_router)
+router.include_router(user_bulk_operations_router)
 router.include_router(admin_payment_methods_router)
 router.include_router(admin_landings_router)
 router.include_router(admin_payments_router)

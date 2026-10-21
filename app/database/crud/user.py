@@ -1,7 +1,7 @@
 import hmac
 import secrets
 import string
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import structlog
@@ -1000,6 +1000,7 @@ def _users_list_conditions(
     traffic_used_percent_min: int | None = None,
     connected: 'ConnectedAccounts | None' = None,
     in_grace: bool | None = None,
+    subscription_on_date: date | None = None,
 ) -> list:
     """Условия WHERE списка пользователей админки — одни для списка и для счётчика.
 
@@ -1008,6 +1009,17 @@ def _users_list_conditions(
     """
     conditions: list = []
     now = datetime.now(UTC)
+
+    if subscription_on_date is not None:
+        from app.services.user_bulk_filters import subscription_day_condition
+
+        conditions.append(
+            exists(
+                select(Subscription.id)
+                .where(Subscription.user_id == User.id, subscription_day_condition(subscription_on_date))
+                .correlate(User)
+            )
+        )
 
     if status:
         conditions.append(User.status == status.value)
@@ -1198,6 +1210,7 @@ async def get_users_list(
     traffic_used_percent_min: int | None = None,
     connected: 'ConnectedAccounts | None' = None,
     in_grace: bool | None = None,
+    subscription_on_date: date | None = None,
     order_by_balance: bool = False,
     order_by_traffic: bool = False,
     order_by_last_activity: bool = False,
@@ -1238,6 +1251,7 @@ async def get_users_list(
             traffic_used_percent_min=traffic_used_percent_min,
             connected=connected,
             in_grace=in_grace,
+            subscription_on_date=subscription_on_date,
         )
     )
 
@@ -1376,6 +1390,7 @@ async def get_users_count(
     traffic_used_percent_min: int | None = None,
     connected: 'ConnectedAccounts | None' = None,
     in_grace: bool | None = None,
+    subscription_on_date: date | None = None,
 ) -> int:
     query = select(func.count(User.id)).where(
         *_users_list_conditions(
@@ -1395,6 +1410,7 @@ async def get_users_count(
             traffic_used_percent_min=traffic_used_percent_min,
             connected=connected,
             in_grace=in_grace,
+            subscription_on_date=subscription_on_date,
         )
     )
 

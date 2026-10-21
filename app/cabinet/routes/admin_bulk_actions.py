@@ -35,6 +35,7 @@ from app.database.models import (
     User,
     UserPromoGroup,
 )
+from app.services.bulk_execution_context import durable_execution
 from app.utils.subscription_time import local_days_until
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -46,7 +47,16 @@ from ..schemas.bulk_actions import (
     BulkSubscriptionInfo,
     BulkUserResult,
 )
-from .admin_users import _sync_subscription_to_panel
+from .admin_users import _sync_subscription_to_panel as _legacy_sync_subscription_to_panel
+
+
+async def _sync_subscription_to_panel(db, user, sub, **kwargs):
+    if durable_execution.get():
+        kwargs['pinned_subscription_identity'] = True
+    result = await _legacy_sync_subscription_to_panel(db, user, sub, **kwargs)
+    if durable_execution.get() and (result.get('error') or result.get('skipped')):
+        raise RuntimeError('Panel synchronization requires verification')
+    return result
 
 
 logger = structlog.get_logger(__name__)
@@ -178,6 +188,20 @@ async def _do_extend_subscription(
         message=f'Subscription extended by {days} days',
         username=user.username,
     )
+
+
+async def _do_deduct_days(db, user, params, dry_run, sub_override=None) -> BulkUserResult:
+    sub = _resolve_subscription(user, sub_override)
+    if not sub or not sub.end_date:
+        return BulkUserResult(user_id=user.id, success=False, message='No subscription end date')
+    if not dry_run:
+        # Negative extension already has a dedicated branch in the existing CRUD.
+        await extend_subscription(db, sub, -params.days)
+        if sub.end_date <= datetime.now(UTC):
+            sub.status = SubscriptionStatus.EXPIRED.value
+            await db.commit()
+        await _sync_subscription_to_panel(db, user, sub)
+    return BulkUserResult(user_id=user.id, success=True, message=f'Deduct {params.days} days')
 
 
 async def _do_cancel_subscription(
@@ -399,16 +423,22 @@ async def _do_add_traffic(
 
     # Explicitly enable user on panel (PATCH may not clear LIMITED status)
     _enable_panel_user_id = (
-        sub.remnawave_id if settings.is_multi_tariff_enabled() else getattr(user, 'remnawave_id', None)
+        sub.remnawave_id
+        if durable_execution.get() or settings.is_multi_tariff_enabled()
+        else getattr(user, 'remnawave_id', None)
     )
     if _enable_panel_user_id and sub.status == 'active':
         try:
             from app.services.subscription_service import SubscriptionService
 
             subscription_service = SubscriptionService()
-            await subscription_service.enable_remnawave_user(_enable_panel_user_id)
+            enabled = await subscription_service.enable_remnawave_user(_enable_panel_user_id)
+            if durable_execution.get() and not enabled:
+                raise RuntimeError('Panel enable result requires verification')
         except Exception:
-            pass  # "User already enabled" is expected for active subscriptions
+            if durable_execution.get():
+                raise
+            # "User already enabled" is expected for active subscriptions
 
     return BulkUserResult(
         user_id=user.id,
@@ -816,6 +846,7 @@ def _build_subscription_info(subs: list[Subscription]) -> list[BulkSubscriptionI
 _ACTION_HANDLERS = {
     BulkActionType.EXTEND_SUBSCRIPTION: _do_extend_subscription,
     BulkActionType.ADD_DAYS: _do_extend_subscription,
+    BulkActionType.DEDUCT_DAYS: _do_deduct_days,
     BulkActionType.CANCEL_SUBSCRIPTION: _do_cancel_subscription,
     BulkActionType.ACTIVATE_SUBSCRIPTION: _do_activate_subscription,
     BulkActionType.ADD_TRAFFIC: _do_add_traffic,
@@ -838,7 +869,7 @@ async def _validate_and_prepare(
     params: BulkActionParams,
 ) -> Tariff | None:
     """Validate required params and pre-load tariff.  Returns the tariff or None."""
-    if action in (BulkActionType.EXTEND_SUBSCRIPTION, BulkActionType.ADD_DAYS):
+    if action in (BulkActionType.EXTEND_SUBSCRIPTION, BulkActionType.ADD_DAYS, BulkActionType.DEDUCT_DAYS):
         _require_days(params)
     elif action == BulkActionType.CHANGE_TARIFF:
         _require_tariff_id(params)
