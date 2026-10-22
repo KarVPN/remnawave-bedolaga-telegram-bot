@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: security-audit-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 jobs:
   pip-audit:
     name: pip-audit (зависимости)

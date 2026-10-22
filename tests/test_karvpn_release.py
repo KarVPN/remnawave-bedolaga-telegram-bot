@@ -91,6 +91,46 @@ class KarvpnReleaseTests(unittest.TestCase):
         self.assertEqual(values['tag'], 'v5.0.0-karvpn.1')
         self.assertEqual(values['image'], 'ghcr.io/karvpn/remnawave-bedolaga-telegram-bot')
 
+    def test_release_body_contains_only_curated_notes_and_the_tested_digest(self):
+        output = self.root / 'release.md'
+        image = 'ghcr.io/karvpn/remnawave-bedolaga-telegram-bot@sha256:' + 'b' * 64
+        with patch(
+            'sys.argv',
+            [
+                'karvpn_release.py',
+                'notes',
+                '--root',
+                str(self.root),
+                '--image',
+                image,
+                '--output',
+                str(output),
+            ],
+        ):
+            main()
+        body = output.read_text()
+        self.assertIn('Only our fork change.', body)
+        self.assertIn(image, body)
+        self.assertNotIn('UPSTREAM HISTORY', body)
+
+    def test_release_body_rejects_a_mutable_or_foreign_image(self):
+        for image in ('ghcr.io/karvpn/remnawave-bedolaga-telegram-bot:main', 'ghcr.io/other/bot@sha256:' + 'b' * 64):
+            with (
+                patch(
+                    'sys.argv',
+                    [
+                        'karvpn_release.py',
+                        'notes',
+                        '--root',
+                        str(self.root),
+                        '--image',
+                        image,
+                    ],
+                ),
+                self.assertRaises(ValueError),
+            ):
+                main()
+
     def publication_commands(self, *, tag_commit=None, release_status=404, ancestor=True):
         def run(_root, *arguments):
             if arguments[:2] == ('git', 'merge-base'):

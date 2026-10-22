@@ -70,12 +70,9 @@
 ### .github/workflows
 
 - `.github/workflows/codeql.yml` — файл
-- `.github/workflows/docker-hub.yml` — файл
 - `.github/workflows/docker-registry.yml` — файл
 - `.github/workflows/lint.yml` — файл
 - `.github/workflows/pg-upgrade.yml` — файл
-- `.github/workflows/release-please.yml` — файл
-- `.github/workflows/release-pr-guard.yml` — файл
 - `.github/workflows/release.yml` — файл
 - `.github/workflows/security-audit.yml` — файл
 - `.github/workflows/tests.yml` — файл
@@ -3154,7 +3151,6 @@
 - `scripts/backfill_remnawave_ids.py` — Python-модуль
   Классы: нет
   Функции: `main`
-- `scripts/check_release_pr_override.mjs` — файл
 - `scripts/generate_structure_reference.py` — Python-модуль
   Классы: нет
   Функции: `tracked_paths` — Файлы проекта: отслеживаемые плюс новые, которые git не игнорирует., `describe_module` — Строки «Классы:» и «Функции:» для модуля., `render_entries`, `render`, `build`, `main`
@@ -3230,7 +3226,7 @@
   Классы: `ImageProfileTests` (4 методов)
   Функции: нет
 - `tests/test_karvpn_release.py` — Python-модуль
-  Классы: `KarvpnReleaseTests` (12 методов)
+  Классы: `KarvpnReleaseTests` (14 методов)
   Функции: нет
 - `tests/test_lazy_package_exports.py` — Python-модуль
   Классы: нет

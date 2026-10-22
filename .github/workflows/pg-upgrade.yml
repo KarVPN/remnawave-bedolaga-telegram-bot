@@ -34,6 +34,10 @@ env:
   PG_USER: remnawave_user
   PG_DB: remnawave_bot
 
+concurrency:
+  group: postgres-upgrade-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 jobs:
   upgrade:
     name: перенос 15 → 18
