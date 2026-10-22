@@ -3,16 +3,25 @@ name: Build and Publish Docker Image
 on:
   push:
     branches: [main, dev]
-    tags: ['v*-karvpn.*']
   pull_request:
     branches: [main, dev]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Validated KarVPN release tag; empty for ordinary image builds.
+        type: string
+        default: ''
+    outputs:
+      image:
+        description: Immutable reference of the tested and published image.
+        value: ${{ jobs.build-and-push.outputs.image }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: bedolaga-image-${{ github.ref }}-${{ github.event_name }}
+  group: bedolaga-image-${{ github.ref }}-${{ github.event_name }}-${{ inputs.release_tag || 'branch' }}
   cancel-in-progress: true
 
 env:
@@ -23,6 +32,8 @@ jobs:
   build-and-push:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    outputs:
+      image: ${{ steps.published.outputs.image }}
     permissions:
       contents: read
       packages: write
@@ -35,31 +46,14 @@ jobs:
 
       - name: Resolve upstream and KarVPN image version
         id: version
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import datetime, json, os, re, tomllib
-          from pathlib import Path
-          release = json.loads(Path('karvpn-image-release.json').read_text())
-          upstream = tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
-          if release['upstream_version'] != upstream or not re.fullmatch(r'\d+\.\d+\.\d+', upstream):
-              raise SystemExit('Update the upstream version in karvpn-image-release.json after syncing upstream')
-          revision = release['fork_revision']
-          if type(revision) is not int or revision < 1:
-              raise SystemExit('fork_revision must be a positive integer')
-          version = f'{upstream}-karvpn.{revision}'
-          if os.environ['GITHUB_REF_TYPE'] == 'tag' and os.environ['GITHUB_REF_NAME'] != f'v{version}':
-              raise SystemExit('The release tag must match the KarVPN image version')
-          if not 1 <= int(os.environ['TELEGRAM_AUTH_MAX_AGE_DAYS']) <= 36500:
-              raise SystemExit('Invalid TELEGRAM_AUTH_MAX_AGE_DAYS')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'version={version}\n')
-              output.write(f'build_date={datetime.datetime.now(datetime.UTC).isoformat()}\n')
-              output.write(f"image=ghcr.io/{os.environ['GITHUB_REPOSITORY'].lower()}\n")
-          PY
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python3 scripts/karvpn_release.py metadata --tag "$RELEASE_TAG"
 
       - name: Verify KarVPN profile against current upstream source
-        run: python3 -m unittest discover -s tests -p test_karvpn_image_profile.py -v
+        run: |
+          python3 -m unittest discover -s tests -p test_karvpn_image_profile.py -v
+          python3 -m unittest discover -s tests -p test_karvpn_release.py -v
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -70,9 +64,8 @@ jobs:
         with:
           images: ${{ steps.version.outputs.image }}
           tags: |
-            type=ref,event=tag
             type=ref,event=pr
-            type=semver,pattern={{version}}
+            type=raw,value=${{ inputs.release_tag || 'release-not-requested' }},enable=${{ inputs.release_tag != '' }}
             type=sha,format=long
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}

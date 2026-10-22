@@ -2,12 +2,16 @@ name: Tests
 
 on:
   push:
-    branches: ['**']
+    branches: [main, dev]
   pull_request:
-    branches: ['**']
+    branches: [main, dev]
 
 permissions:
   contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   pytest:

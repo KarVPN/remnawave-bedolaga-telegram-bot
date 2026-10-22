@@ -1,165 +1,92 @@
-name: Release
+name: KarVPN Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*-karvpn.*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the configured release from main (false previews notes only).
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: karvpn-release
+  cancel-in-progress: false
 
 jobs:
-  lint:
-    uses: ./.github/workflows/lint.yml
-
-  release:
-    needs: lint
-    runs-on: ubuntu-latest
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      publish: ${{ steps.release.outputs.publish }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Get previous tag
-        id: prev_tag
+      - name: Validate the explicit KarVPN version and preview notes
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        shell: bash
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 ${{ github.ref_name }}^ 2>/dev/null || echo "")
-          echo "tag=$PREV_TAG" >> $GITHUB_OUTPUT
-
-      - name: Generate changelog
-        id: changelog
-        run: |
-          TAG="${{ github.ref_name }}"
-          PREV_TAG="${{ steps.prev_tag.outputs.tag }}"
-
-          if [ -z "$PREV_TAG" ]; then
-            RANGE="$TAG"
-          else
-            RANGE="${PREV_TAG}..${TAG}"
+          python3 scripts/karvpn_release.py metadata
+          args=(notes --output "$RUNNER_TEMP/karvpn-release-notes.md")
+          if [[ "$PUBLISH" == true ]]; then
+            args+=(--publish)
           fi
-
-          # Collect commits by category
-          FEATURES=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -iE "^feat" || true)
-          FIXES=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -iE "^fix" || true)
-          PERF=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -iE "^perf|^refactor" || true)
-          DOCS=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -iE "^docs|^style" || true)
-          CHORE=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -iE "^chore|^ci|^build|^test" || true)
-          OTHER=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -ivE "^(feat|fix|perf|refactor|docs|style|chore|ci|build|test)" || true)
-
-          # Collect unique contributors
-          CONTRIBUTORS=$(git log $RANGE --pretty=format:"%an" --no-merges | sort -u)
-
-          # Stats
-          TOTAL_COMMITS=$(git log $RANGE --oneline --no-merges | wc -l | tr -d ' ')
-          FILES_CHANGED=$(git diff --stat $RANGE 2>/dev/null | tail -1 || echo "N/A")
-
-          # Format function
-          format_section() {
-            local commits="$1"
-            if [ -n "$commits" ]; then
-              echo "$commits" | while IFS='|' read -r msg author hash; do
-                # Clean conventional commit prefix
-                clean_msg=$(echo "$msg" | sed -E 's/^(feat|fix|perf|refactor|docs|style|chore|ci|build|test)(\([^)]*\))?:\s*//')
-                echo "- ${clean_msg} (\`${hash}\`) — @${author}"
-              done
-            fi
-          }
-
-          # Build changelog
+          python3 scripts/karvpn_release.py "${args[@]}"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
           {
-            echo "changelog<<CHANGELOG_EOF"
+            echo '## KarVPN release preview'
+            echo
+            cat "$RUNNER_TEMP/karvpn-release-notes.md"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-            if [ -n "$FEATURES" ]; then
-              echo "### New Features"
-              echo ""
-              format_section "$FEATURES"
-              echo ""
-            fi
+  lint:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    uses: ./.github/workflows/lint.yml
 
-            if [ -n "$FIXES" ]; then
-              echo "### Bug Fixes"
-              echo ""
-              format_section "$FIXES"
-              echo ""
-            fi
+  image:
+    needs: [prepare, lint]
+    if: needs.prepare.outputs.publish == 'true'
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    uses: ./.github/workflows/docker-registry.yml
+    with:
+      release_tag: ${{ needs.prepare.outputs.tag }}
 
-            if [ -n "$PERF" ]; then
-              echo "### Performance & Refactoring"
-              echo ""
-              format_section "$PERF"
-              echo ""
-            fi
-
-            if [ -n "$DOCS" ]; then
-              echo "### Documentation & Style"
-              echo ""
-              format_section "$DOCS"
-              echo ""
-            fi
-
-            if [ -n "$CHORE" ]; then
-              echo "### Maintenance"
-              echo ""
-              format_section "$CHORE"
-              echo ""
-            fi
-
-            if [ -n "$OTHER" ]; then
-              echo "### Other Changes"
-              echo ""
-              format_section "$OTHER"
-              echo ""
-            fi
-
-            echo "---"
-            echo ""
-            echo "### Contributors"
-            echo ""
-            if [ -n "$CONTRIBUTORS" ]; then
-              echo "$CONTRIBUTORS" | while read -r name; do
-                echo "- @${name}"
-              done
-            fi
-            echo ""
-            echo "### Stats"
-            echo ""
-            echo "- **Commits:** ${TOTAL_COMMITS}"
-            echo "- **Changes:** ${FILES_CHANGED}"
-            if [ -n "$PREV_TAG" ]; then
-              echo "- **Full diff:** [\`${PREV_TAG}...${TAG}\`](https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG})"
-            fi
-
-            echo "CHANGELOG_EOF"
-          } >> $GITHUB_OUTPUT
-
-      - name: Resolve GHCR image repository
-        id: image
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+  release:
+    needs: [prepare, image]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
         with:
-          name: ${{ github.ref_name }}
-          body: |
-            ## What's Changed
+          fetch-depth: 0
+          persist-credentials: false
 
-            ${{ steps.changelog.outputs.changelog }}
-
-            ---
-
-            ### Docker
-
-            ```bash
-            docker pull ${{ steps.image.outputs.image }}:${{ github.ref_name }}
-            ```
-
-            ### Update
-
-            Wait for **Build and Publish Docker Image** to finish successfully.
-            Deploy with `deploy_bedolaga_bot.yml` from `vpn-infrastructure`;
-            Ansible pulls the image and pins its digest without building on the VPS.
-            See [KarVPN image instructions](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/karvpn-images.md).
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'dev') }}
-          generate_release_notes: false
+      - name: Publish the release after the image has passed its checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_IMAGE: ${{ needs.image.outputs.image }}
+        shell: bash
+        run: |
+          python3 scripts/karvpn_release.py notes --publish --tag "$RELEASE_TAG" \
+            --image "$RELEASE_IMAGE" --output "$RUNNER_TEMP/karvpn-release-notes.md"
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/karvpn-release-notes.md" \
+            --latest

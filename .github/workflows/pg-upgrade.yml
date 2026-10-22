@@ -7,7 +7,7 @@ name: PostgreSQL upgrade
 
 on:
   push:
-    branches: ['**']
+    branches: [main, dev]
     paths:
       - docker-compose.yml
       - docker-compose.local.yml
@@ -15,7 +15,7 @@ on:
       - docker/postgres/**
       - .github/workflows/pg-upgrade.yml
   pull_request:
-    branches: ['**']
+    branches: [main, dev]
     paths:
       - docker-compose.yml
       - docker-compose.local.yml
@@ -33,6 +33,10 @@ env:
   OLD_COMPOSE_REF: e31831f5e24892ba97dfe341b00eb748e4dce59d
   PG_USER: remnawave_user
   PG_DB: remnawave_bot
+
+concurrency:
+  group: postgres-upgrade-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   upgrade:
