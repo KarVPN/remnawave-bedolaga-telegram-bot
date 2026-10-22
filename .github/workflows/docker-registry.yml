@@ -2,30 +2,27 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches:
-      - main
-      - dev 
-    tags:
-      - 'v*'
+    branches: [main, dev]
+    tags: ['v*-karvpn.*']
   pull_request:
-    branches:
-      - main
-      - dev 
-  # Публикация образа вручную — из ветки или из main, без релизного тега.
-  # Нужно потому, что в форке KarVPN push в main не всегда запускает сборку,
-  # а тестовому контуру образ нужен раньше релиза.
+    branches: [main, dev]
   workflow_dispatch:
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 permissions:
   contents: read
 
+concurrency:
+  group: bedolaga-image-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # Public deployment profile, matching the former Ansible source patches.
+  TELEGRAM_AUTH_MAX_AGE_DAYS: ${{ vars.TELEGRAM_AUTH_MAX_AGE_DAYS || '3650' }}
+
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -34,148 +31,132 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0  
+          persist-credentials: false
+
+      - name: Resolve upstream and KarVPN image version
+        id: version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, re, tomllib
+          from pathlib import Path
+          release = json.loads(Path('karvpn-image-release.json').read_text())
+          upstream = tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
+          if release['upstream_version'] != upstream or not re.fullmatch(r'\d+\.\d+\.\d+', upstream):
+              raise SystemExit('Update the upstream version in karvpn-image-release.json after syncing upstream')
+          revision = release['fork_revision']
+          if type(revision) is not int or revision < 1:
+              raise SystemExit('fork_revision must be a positive integer')
+          version = f'{upstream}-karvpn.{revision}'
+          if os.environ['GITHUB_REF_TYPE'] == 'tag' and os.environ['GITHUB_REF_NAME'] != f'v{version}':
+              raise SystemExit('The release tag must match the KarVPN image version')
+          if not 1 <= int(os.environ['TELEGRAM_AUTH_MAX_AGE_DAYS']) <= 36500:
+              raise SystemExit('Invalid TELEGRAM_AUTH_MAX_AGE_DAYS')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+              output.write(f'build_date={datetime.datetime.now(datetime.UTC).isoformat()}\n')
+              output.write(f"image=ghcr.io/{os.environ['GITHUB_REPOSITORY'].lower()}\n")
+          PY
+
+      - name: Verify KarVPN profile against current upstream source
+        run: python3 -m unittest discover -s tests -p test_karvpn_image_profile.py -v
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get version info
-        id: version
-        run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-
-          # Read base version from release-please manifest (single source of truth)
-          BASE_VERSION=$(jq -r '."."' .release-please-manifest.json)
-
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/}
-            echo "🏷️ Building release version: $VERSION"
-          elif [[ $GITHUB_REF == refs/heads/main ]]; then
-            VERSION="v${BASE_VERSION}-${SHORT_SHA}"
-            echo "🚀 Building main version: $VERSION"
-          elif [[ $GITHUB_REF == refs/heads/dev ]]; then
-            VERSION="v${BASE_VERSION}-dev-${SHORT_SHA}"
-            echo "🧪 Building dev version: $VERSION"
-          else
-            VERSION="v${BASE_VERSION}-pr-${SHORT_SHA}"
-            echo "🔀 Building PR version: $VERSION"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "should_push=false" >> $GITHUB_OUTPUT
-            echo "⚠️ PR - only build without push"
-          else
-            echo "should_push=true" >> $GITHUB_OUTPUT
-            echo "✅ Push/Tag - will push"
-          fi
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.version.outputs.image }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=tag
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
-            type=raw,value=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            io.karvpn.bedolaga.deploy-contract=1
+            io.karvpn.bedolaga.telegram-auth-max-age-days=${{ env.TELEGRAM_AUTH_MAX_AGE_DAYS }}
 
-      - name: Build and push Docker image
+      - name: Build on the GitHub runner
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ steps.version.outputs.should_push }}
+          platforms: linux/amd64
+          load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             BUILD_DATE=${{ steps.version.outputs.build_date }}
-            VCS_REF=${{ steps.version.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            VCS_REF=${{ github.sha }}
+            TELEGRAM_AUTH_MAX_AGE_DAYS=${{ env.TELEGRAM_AUTH_MAX_AGE_DAYS }}
+          cache-from: type=gha,scope=bot-amd64
+          cache-to: type=gha,scope=bot-amd64,mode=max
 
-      # OCI-референсы требуют lowercase, а github.repository сохраняет регистр
-      # (BEDOLAGA-DEV/…) — Trivy падал бы на 'repository name must be lowercase'.
-      # metadata-action лоуэркейсит теги сам, но digest-референс собираем вручную.
-      - name: Lowercase image name for Trivy
-        if: steps.version.outputs.should_push == 'true'
-        id: image
-        run: echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+      - name: Smoke test without Telegram polling or production connections
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: |
+          docker run --rm --network none --entrypoint python \
+            -e BOT_TOKEN=123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+            -e ADMIN_IDS=1 -e WEB_API_ENABLED=true -e CABINET_ENABLED=true \
+            "$IMAGE_ID" scripts/smoke_karvpn_image.py
 
-      # Trivy сканирует запушенный образ по digest и выгружает SARIF в
-      # Security → Code scanning (персистентные находки, в т.ч. на push в main,
-      # где Docker Scout не запускается). Пока non-blocking (exit-code: 0).
-      - name: Scan image with Trivy
-        if: steps.version.outputs.should_push == 'true'
+      # Registry credentials are only introduced after the image is built/tested.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the tested image
+        if: github.event_name != 'pull_request'
+        id: published
+        env:
+          IMAGE_NAME: ${{ steps.version.outputs.image }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
+          image=$(docker image inspect "$IMAGE_NAME:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Bedolaga image ready'
+            echo
+            echo "Version: $IMAGE_VERSION. Platform: linux/amd64. Commit: $GITHUB_SHA."
+            echo
+            echo 'Immutable reference for a test or rollback:'
+            echo '```yaml'
+            echo "remnawave_bedolaga_telegram_bot_image: $image"
+            echo '```'
+            echo
+            echo 'Normal deployments can keep the main tag; Ansible resolves and pins the downloaded digest.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scan published image with Trivy
+        if: github.event_name != 'pull_request'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ steps.published.outputs.image }}
           format: sarif
           output: trivy-results.sarif
           severity: HIGH,CRITICAL
-          exit-code: "0"
+          exit-code: '0'
 
       - name: Upload Trivy results to Security tab
-        if: steps.version.outputs.should_push == 'true'
+        if: github.event_name != 'pull_request'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy
-
-      - name: Generate security report
-        uses: docker/scout-action@v1
-        if: github.event_name == 'pull_request'
-        with:
-          command: quickview,compare
-          image: ${{ steps.meta.outputs.tags }}
-          to: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          ignore-unchanged: true
-          only-severities: critical,high
-          write-comment: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Build Summary
-        if: steps.version.outputs.should_push == 'true'
-        run: |
-          echo "## 🚀 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Version** | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit** | \`${{ steps.version.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Build Date** | \`${{ steps.version.outputs.build_date }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Registry** | \`${{ env.REGISTRY }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image** | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | ✅ Published |" >> $GITHUB_STEP_SUMMARY
-
-      - name: Build Summary (No Push)
-        if: steps.version.outputs.should_push == 'false'
-        run: |
-          echo "## 🔨 Docker Build Summary (Test Only)" >> $GITHUB_STEP_SUMMARY
-          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Version** | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit** | \`${{ steps.version.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Build Date** | \`${{ steps.version.outputs.build_date }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | ✅ Built successfully (without publishing) |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ **Note:** Image built but not published as this is a pull request." >> $GITHUB_STEP_SUMMARY

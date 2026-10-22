@@ -22,9 +22,24 @@ tests/
 .ruff_cache/
 
 # Environment files
-.env
-.env.local
-.env.*.local
+**/.env
+**/.env.*
+**/.npmrc
+**/.ssh
+**/.aws
+**/*.key
+**/*.pem
+**/id_rsa
+**/id_ed25519
+data/
+uploads/
+locales/
+*.sql
+*.dump
+*.sqlite*
+.claude/
+.codex/
+.agents/
 
 # Logs
 *.log

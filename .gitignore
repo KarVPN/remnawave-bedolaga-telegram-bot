@@ -16,6 +16,7 @@
 !uv.lock
 !requirements.txt
 !alembic.ini
+!karvpn-image-release.json
 !release-please-config.json
 !.release-please-manifest.json
 
