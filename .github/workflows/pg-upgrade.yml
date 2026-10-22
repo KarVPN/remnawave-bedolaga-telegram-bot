@@ -7,7 +7,7 @@ name: PostgreSQL upgrade
 
 on:
   push:
-    branches: ['**']
+    branches: [main, dev]
     paths:
       - docker-compose.yml
       - docker-compose.local.yml
@@ -15,7 +15,7 @@ on:
       - docker/postgres/**
       - .github/workflows/pg-upgrade.yml
   pull_request:
-    branches: ['**']
+    branches: [main, dev]
     paths:
       - docker-compose.yml
       - docker-compose.local.yml

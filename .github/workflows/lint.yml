@@ -2,9 +2,9 @@ name: Lint
 
 on:
   push:
-    branches: ['**']
+    branches: [main, dev]
   pull_request:
-    branches: ['**']
+    branches: [main, dev]
   # Перезапуск линта без нового коммита (в том числе по ветке).
   # 03.10.2026 CI в форке молчал, потому что GitHub отключает workflow-файлы
   # у форков — разбор и проверки в docs/ci.md.
