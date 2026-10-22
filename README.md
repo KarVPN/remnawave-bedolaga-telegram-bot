@@ -402,3 +402,6 @@ gh workflow run lint.yml --ref <ветка>                                  # �
 **[MIT License](LICENSE)** — используйте свободно для личных и коммерческих проектов.
 
 </div>
+
+
+Сборка и развёртывание образов KarVPN: [инструкция](docs/karvpn-images.md).

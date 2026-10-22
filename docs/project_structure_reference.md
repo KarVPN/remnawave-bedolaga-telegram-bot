@@ -29,6 +29,7 @@
 - `docker-compose.local.yml` — файл
 - `docker-compose.yml` — файл
 - `docs/`
+- `karvpn-image-release.json` — файл
 - `main.py` — Python-модуль
   Классы: `GracefulExit` (2 методов)
   Функции: `main`
@@ -3146,6 +3147,12 @@
   Классы: нет
   Функции: `tracked_paths` — Файлы проекта: отслеживаемые плюс новые, которые git не игнорирует., `describe_module` — Строки «Классы:» и «Функции:» для модуля., `render_entries`, `render`, `build`, `main`
 - `scripts/pg-upgrade.sh` — файл
+- `scripts/prepare_karvpn_image.py` — Python-модуль
+  Классы: нет
+  Функции: `prepare`
+- `scripts/smoke_karvpn_image.py` — Python-модуль
+  Классы: нет
+  Функции: нет
 
 ## tests
 
@@ -3204,6 +3211,9 @@
 - `tests/test_grace_env_example_stays_commented.py` — Python-модуль
   Классы: нет
   Функции: `test_no_grace_key_is_active_in_the_example`, `test_commented_values_match_the_code_defaults`
+- `tests/test_karvpn_image_profile.py` — Python-модуль
+  Классы: `ImageProfileTests` (4 методов)
+  Функции: нет
 - `tests/test_lazy_package_exports.py` — Python-модуль
   Классы: нет
   Функции: `test_package_declares_exports`, `test_every_exported_name_resolves`, `test_unknown_name_still_raises` — __getattr__ не должен выдавать что попало вместо AttributeError.
