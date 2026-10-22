@@ -13,6 +13,8 @@ on:
 
 jobs:
   build:
+    # KarVPN publishes tested images to GHCR; the upstream Docker Hub account is not used.
+    if: github.repository == 'BEDOLAGA-DEV/remnawave-bedolaga-telegram-bot'
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code

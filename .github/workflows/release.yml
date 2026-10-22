@@ -133,6 +133,10 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> $GITHUB_OUTPUT
 
+      - name: Resolve GHCR image repository
+        id: image
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -147,22 +151,15 @@ jobs:
             ### Docker
 
             ```bash
-            # Docker Hub
-            docker pull fr1ngg/remnawave-bedolaga-telegram-bot:${{ github.ref_name }}
-
-            # GitHub Container Registry
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            docker pull ${{ steps.image.outputs.image }}:${{ github.ref_name }}
             ```
 
             ### Update
 
-            ```bash
-            # Docker Compose
-            docker compose pull && docker compose up -d
-
-            # Or with Make
-            make reload
-            ```
+            Wait for **Build and Publish Docker Image** to finish successfully.
+            Deploy with `deploy_bedolaga_bot.yml` from `vpn-infrastructure`;
+            Ansible pulls the image and pins its digest without building on the VPS.
+            See [KarVPN image instructions](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/karvpn-images.md).
           draft: false
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'dev') }}
           generate_release_notes: false

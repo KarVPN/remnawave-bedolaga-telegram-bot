@@ -2,7 +2,8 @@
 
 GitHub Actions (`Build and Publish Docker Image`) собирает `linux/amd64` на
 `ubuntu-24.04` и публикует `ghcr.io/karvpn/remnawave-bedolaga-telegram-bot`.
-VPS и локальный Mac в сборке не участвуют. Push в `main` обновляет `:main` и
+VPS и локальный Mac в сборке не участвуют. Унаследованный Docker Hub workflow
+в форке KarVPN пропускается: аккаунт и credentials upstream для публикации не нужны. Push в `main` обновляет `:main` и
 `:sha-<полный SHA>`; pull request только собирает и проверяет образ.
 Для ручной пересборки используйте Actions → Build and Publish Docker Image →
 Run workflow → main. Сборка ветки вручную публикует SHA-тег, но не меняет `:main`.
