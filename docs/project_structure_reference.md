@@ -2704,6 +2704,7 @@
 - `docs/contests-api.md` — файл
 - `docs/grace-access.md` — файл
 - `docs/handoffs/`
+- `docs/karvpn-images.md` — файл
 - `docs/menu_stats_api_usage.md` — файл
 - `docs/miniapp-setup.md` — файл
 - `docs/mobile-support-websocket-v1.md` — файл
