@@ -5474,3 +5474,22 @@ class UserBulkTarget(Base):
         Index('ix_user_bulk_target_pending', 'operation_id', 'state', 'id'),
         Index('ix_user_bulk_target_user', 'operation_id', 'user_id'),
     )
+
+
+class UserBulkNotification(Base):
+    """One immutable Telegram receipt per user and durable bulk operation."""
+
+    __tablename__ = 'user_bulk_notifications'
+
+    id = Column(Integer, primary_key=True)
+    operation_id = Column(String(36), ForeignKey('user_bulk_operations.id', ondelete='CASCADE'), nullable=False)
+    user_id = Column(Integer, nullable=False)
+    state = Column(String(24), nullable=False, default='pending')
+    text = Column(Text, nullable=True)
+    message = Column(Text, nullable=True)
+    telegram_message_id = Column(BigInteger, nullable=True)
+    updated_at = Column(AwareDateTime(), nullable=False, default=func.now())
+    __table_args__ = (
+        UniqueConstraint('operation_id', 'user_id', name='uq_user_bulk_notification_recipient'),
+        Index('ix_user_bulk_notification_pending', 'operation_id', 'state', 'id'),
+    )

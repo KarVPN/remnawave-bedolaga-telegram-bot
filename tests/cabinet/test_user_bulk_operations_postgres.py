@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.cabinet.schemas.user_bulk_operations import UserBulkFilters, UserBulkPreview
 from app.config import settings
-from app.database.models import Subscription, User, UserBulkOperation, UserBulkTarget
+from app.database.models import Subscription, User, UserBulkNotification, UserBulkOperation, UserBulkTarget
 from app.services import user_bulk_operations as service
 from tests.fixtures.postgres_db import postgres_engine
 
@@ -194,14 +194,20 @@ async def test_migration_round_trip_matches_runtime_models(postgres_database):
     from sqlalchemy import inspect
 
     migration = importlib.import_module('migrations.alembic.versions.0132_users_bulk_operations')
+    receipts = importlib.import_module('migrations.alembic.versions.0133_user_bulk_notifications')
     async with postgres_engine(postgres_database, TABLES) as engine:
         async with engine.begin() as conn:
 
             def migrate(sync):
                 with Operations.context(MigrationContext.configure(sync)):
+                    receipts.downgrade()
                     migration.downgrade()
                     migration.upgrade()
+                    receipts.upgrade()
                 inspector = inspect(sync)
+                assert {c['name'] for c in inspector.get_columns('user_bulk_notifications')} == set(
+                    UserBulkNotification.__table__.columns.keys()
+                )
                 assert {c['name'] for c in inspector.get_columns('user_bulk_targets')} == set(
                     UserBulkTarget.__table__.columns.keys()
                 )

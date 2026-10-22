@@ -17,6 +17,7 @@ from app.config import settings
 from app.database.crud.subscription_segments import segment_condition
 from app.database.crud.user import _users_list_conditions
 from app.database.models import Subscription, User, UserBulkOperation, UserBulkTarget, UserStatus
+from app.services import user_bulk_notifications as notifications
 from app.services.bulk_execution_context import durable_execution
 from app.services.user_bulk_filters import subscription_day_condition
 
@@ -88,7 +89,12 @@ async def preview(db, admin_id, request):
     existing = await db.scalar(
         select(UserBulkOperation).where(UserBulkOperation.author_id == admin_id, UserBulkOperation.request_key == key)
     )
-    params = {'days': request.days, 'traffic_gb': request.traffic_gb}
+    params = {
+        'days': request.days,
+        'traffic_gb': request.traffic_gb,
+        'notify_users': request.notify_users,
+        'notification_message': request.notification_message,
+    }
     # Store the selection too: a reused idempotency key cannot silently alter intent.
     intent = request.model_dump(mode='json', exclude={'request_key'})
     if existing:
@@ -128,6 +134,8 @@ async def preview(db, admin_id, request):
     )
     # Classify skips using SQL, without loading user cards or target lists.
     await classify_skips(db, operation_id, request.action)
+    if request.notify_users:
+        await notifications.create_receipts(db, operation_id)
     await db.commit()
     return operation_id
 
@@ -177,7 +185,10 @@ async def recover(db, operation):
         .where(UserBulkTarget.operation_id == operation.id, UserBulkTarget.state == 'processing')
         .values(state='uncertain', message='Результат требует проверки после прерывания', updated_at=datetime.now(UTC))
     )
+    if operation.params.get('notify_users'):
+        await notifications.recover(db, operation.id)
     if operation.state == 'running':
+        delivery = await notifications.counts(db, operation.id) if operation.params.get('notify_users') else {}
         pending = await db.scalar(
             select(func.count())
             .select_from(UserBulkTarget)
@@ -192,9 +203,9 @@ async def recover(db, operation):
             'cancelled'
             if operation.cancel_requested
             else 'paused'
-            if pending
+            if pending or delivery.get('pending')
             else 'needs_review'
-            if uncertain
+            if uncertain or delivery.get('uncertain') or delivery.get('failed') or delivery.get('limited')
             else 'completed'
         )
         operation.updated_at = datetime.now(UTC)
@@ -299,7 +310,8 @@ async def summary(db, operation_id):
         'id': operation.id,
         'author_id': operation.author_id,
         'action': operation.action,
-        'params': {k: operation.params[k] for k in ('days', 'traffic_gb')},
+        'params': {k: operation.params.get(k) for k in ('days', 'traffic_gb', 'notify_users', 'notification_message')},
+        'notifications': await notifications.counts(db, operation_id) if operation.params.get('notify_users') else {},
         'state': operation.state,
         'updated_at': operation.updated_at,
         'cancel_requested': operation.cancel_requested,
@@ -333,6 +345,14 @@ async def cancel(db, operation_id):
         .where(UserBulkTarget.operation_id == operation_id, UserBulkTarget.state == 'pending')
         .values(state='cancelled', message='Отменена оставшаяся обработка', updated_at=datetime.now(UTC))
     )
+    if operation.params.get('notify_users'):
+        from app.database.models import UserBulkNotification
+
+        await db.execute(
+            update(UserBulkNotification)
+            .where(UserBulkNotification.operation_id == operation_id, UserBulkNotification.state == 'pending')
+            .values(state='skipped', message='Уведомление отменено администратором', updated_at=datetime.now(UTC))
+        )
     if operation.state != 'running':
         operation.state = 'cancelled'
     await db.commit()
@@ -414,6 +434,11 @@ async def run_batch(db, operation_id):
             break
         await asyncio.sleep(settings.USERS_BULK_ITEM_DELAY)
     operation = await get_operation(db, operation_id)
+    delivery = {}
+    if operation.params.get('notify_users'):
+        await notifications.deliver_batch(db, operation_id)
+        delivery = await notifications.counts(db, operation_id)
+        operation = await get_operation(db, operation_id)
     pending = await db.scalar(
         select(func.count())
         .select_from(UserBulkTarget)
@@ -428,9 +453,9 @@ async def run_batch(db, operation_id):
         'cancelled'
         if operation.cancel_requested
         else 'paused'
-        if pending
+        if pending or delivery.get('pending')
         else 'needs_review'
-        if uncertain
+        if uncertain or delivery.get('uncertain') or delivery.get('failed') or delivery.get('limited')
         else 'completed'
     )
     operation.updated_at = datetime.now(UTC)
