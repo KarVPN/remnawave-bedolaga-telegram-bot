@@ -320,11 +320,13 @@ docker compose up -d
 
 ## 🔧 Проверки в форке KarVPN
 
-CI в форке работает: `push` и `pull_request` запускают `Lint`, `docker-registry`,
-`docker-hub` и `release-please`. С момента форка (24.03.2026) и до начала октября 2026
-GitHub держал workflow-файлы форка выключенными, поэтому проверки шли только локально.
-Если прогоны снова пропали — смотреть вкладку Actions и **[docs/ci.md](docs/ci.md)**;
-там же ручной запуск линта и разбор локальных падений.
+В форке работают `Lint`, `Tests`, `Build and Publish Docker Image`, `CodeQL`
+и `Security Audit`. Проверка миграции PostgreSQL запускается только при изменении
+файлов миграции/Compose или вручную. `KarVPN Release` выпускает явно выбранную
+версию `5.0.0-karvpn.N`; по умолчанию ручной запуск только показывает release notes.
+Унаследованные Docker Hub, release-please и Release PR Guard отключены и удалены.
+Порядок выпуска и короткие заметки — в **[docs/karvpn-images.md](docs/karvpn-images.md)**.
+Если прогоны пропали — смотреть вкладку Actions и **[docs/ci.md](docs/ci.md)**.
 
 ```bash
 gh workflow run lint.yml --ref <ветка>                                  # линт вручную

@@ -1,21 +1,52 @@
 # Образы Bedolaga для KarVPN
 
 GitHub Actions (`Build and Publish Docker Image`) собирает `linux/amd64` на
-`ubuntu-24.04` и публикует `ghcr.io/karvpn/remnawave-bedolaga-telegram-bot`.
-VPS и локальный Mac в сборке не участвуют. Унаследованный Docker Hub workflow
-в форке KarVPN пропускается: аккаунт и credentials upstream для публикации не нужны. Push в `main` обновляет `:main` и
+`ubuntu-24.04` и публикует приватный `ghcr.io/karvpn/remnawave-bedolaga-telegram-bot`.
+VPS и локальный Mac в сборке не участвуют. Push в `main` обновляет `:main` и
 `:sha-<полный SHA>`; pull request только собирает и проверяет образ.
-Для ручной пересборки используйте Actions → Build and Publish Docker Image →
-Run workflow → main. Сборка ветки вручную публикует SHA-тег, но не меняет `:main`.
+Для обычной пересборки: Actions → Build and Publish Docker Image → Run workflow → main.
+Сборка ветки вручную публикует SHA-тег, но не меняет `:main`.
 
-Версия образа хранится в `karvpn-image-release.json`: upstream `5.0.0` и
-`fork_revision: 1` дают `5.0.0-karvpn.1`. Для следующей нашей сборки увеличивается
-`fork_revision`; при обновлении upstream меняется `upstream_version` и ревизия
-начинается с 1. Workflow сверяет upstream с `pyproject.toml` и отказывается
-публиковать релизный тег, не совпадающий с `v<версия>`. После слияния изменений
-тег `v5.0.0-karvpn.1` запускает публикацию одноимённого Docker-тега. Python-версия
-проекта и встроенная проверка upstream-обновлений сохраняют `5.0.0`;
-`VERSION` и OCI label образа содержат полную версию KarVPN.
+## Версии и выпуск KarVPN
+
+Единственный источник версии нашего образа — `karvpn-image-release.json`:
+`upstream_version: 5.0.0` и `fork_revision: 1` дают `5.0.0-karvpn.1`.
+Python-версия приложения в `pyproject.toml` остаётся upstream `5.0.0`.
+За нашими изменениями следуют `5.0.0-karvpn.2`, `.3` и т. д.; обычный `fix`,
+`feat` или breaking change не повышает базовую версию. При реальном обновлении
+upstream измените `upstream_version` вслед за `pyproject.toml` и начните ревизию с 1.
+`VERSION` и OCI labels Docker-образа содержат полную версию KarVPN.
+
+Унаследованные release-please, Release PR Guard и Docker Hub удалены из workflows
+и отключены в настройках Actions. Их старые конфигурационные JSON остаются
+для синхронизации с upstream, но выпуском KarVPN не управляют.
+
+Для выпуска:
+
+1. В PR измените `fork_revision` (или upstream + ревизию при обновлении основы).
+   Добавьте `docs/releases/<полная версия>.md`: первая строка `# <полная версия>`,
+   затем короткие пункты **только изменений KarVPN с предыдущего нашего релиза**.
+   Для первого выпуска подготовлен [5.0.0-karvpn.1](releases/5.0.0-karvpn.1.md).
+   Старый upstream CHANGELOG сохраняется как история и в release notes не читается.
+2. Слейте PR в `main`. Обычная сборка обновит main/SHA, но сама новый релиз не создаёт.
+3. Откройте Actions → **KarVPN Release** → Run workflow → main.
+   С `publish=false` (по умолчанию) получите только preview коротких notes в Summary;
+   Docker-образ, Git-тег и GitHub Release при этом не создаются.
+4. Для выпуска запустите тот же workflow с `publish=true`. Сначала проверяются
+   версия, notes, принадлежность коммита main и отсутствие опубликованного релиза.
+   Затем выполняются lint и общая сборка/проверка образа. После успешной публикации
+   образа создаются Git-тег `v<версия>` и GitHub Release с короткими notes и digest.
+
+Также поддерживается обычный push Git-тега `v5.0.0-karvpn.1` с коммита main:
+он запускает **KarVPN Release** с той же последовательностью проверок и сборки.
+Ссылаться на другую версию, выпускать из произвольной ветки, переназначать
+существующий тег или перезаписывать опубликованный релиз workflow не разрешает.
+Увеличьте ревизию для нового выпуска. Повторная обычная сборка main разрешена.
+
+Релиз вызывает общий workflow сборки непосредственно через `workflow_call`.
+Он не рассчитывает на запуск отдельного workflow от тега, созданного `GITHUB_TOKEN`,
+и не запускает две одинаковые сборки по событию release tag. Дополнительный PAT
+для публикации не нужен; используется встроенный `GITHUB_TOKEN` с правами текущих jobs.
 
 Dockerfile копирует явный список исходников и публичных ресурсов. `.env`, данные,
 дампы и ключи исключены через `.dockerignore`. Серверные секреты, Ansible Vault,

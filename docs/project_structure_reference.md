@@ -406,7 +406,7 @@
   Функции: `unsubscribe_page` — Ничего не меняет — только отдаёт самоотправляющуюся форму., `unsubscribe_one_click` — Единственное место, где отписка применяется.
 - `app/cabinet/routes/user_bulk_operations.py` — Python-модуль
   Классы: нет
-  Функции: `preview`, `list_operations`, `get_operation`, `run`, `cancel`, `errors`, `events`
+  Функции: `preview`, `list_operations`, `get_operation`, `run`, `cancel`, `errors`, `notification_errors`, `events`
 - `app/cabinet/routes/websocket.py` — Python-модуль
   Классы: нет
   Функции: `verify_cabinet_ws_token` — Проверить JWT токен для WebSocket., `cabinet_websocket_endpoint` — WebSocket endpoint для real-time уведомлений кабинета., `notify_user_ticket_reply` — Уведомить пользователя об ответе в тикете., `notify_admins_new_ticket` — Уведомить админов о новом тикете., `notify_admins_ticket_reply` — Уведомить админов об ответе пользователя., `notify_user_balance_topup` — Уведомить пользователя о пополнении баланса., `notify_user_balance_change` — Уведомить пользователя об изменении баланса., `notify_user_subscription_activated` — Уведомить пользователя об активации подписки., `notify_user_subscription_expiring` — Уведомить пользователя о скором истечении подписки., `notify_user_subscription_expired` — Уведомить пользователя об истечении подписки., `notify_user_subscription_renewed` — Уведомить пользователя о продлении подписки., `notify_user_devices_purchased` — Уведомить пользователя о покупке устройств., `notify_user_traffic_purchased` — Уведомить пользователя о покупке трафика., `notify_user_autopay_success` — Уведомить пользователя об успешном автопродлении., `notify_user_autopay_failed` — Уведомить пользователя о неудачном автопродлении., `notify_user_autopay_insufficient_funds` — Уведомить о недостатке средств для автопродления., `notify_user_ban` — Уведомить пользователя о блокировке., `notify_user_unban` — Уведомить пользователя о разблокировке., `notify_user_warning` — Уведомить пользователя о предупреждении., `notify_user_referral_bonus` — Уведомить пользователя о реферальном бонусе., `notify_user_referral_registered` — Уведомить пользователя о регистрации нового реферала., `notify_user_daily_debit` — Уведомить о ежедневном списании., `notify_user_traffic_reset` — Уведомить о сбросе трафика., `notify_user_payment_received` — Уведомить о полученном платеже.
@@ -652,7 +652,7 @@
   Классы: нет
   Функции: `run_alembic_upgrade` — Run ``alembic upgrade head``, handling fresh and legacy databases., `stamp_alembic_head` — Stamp the DB as being at head without running migrations (for existing DBs).
 - `app/database/models.py` — Python-модуль
-  Классы: `AwareDateTime` (2 методов), `UserStatus`, `SubscriptionStatus`, `TransactionType`, `PromoCodeType`, `PaymentMethod`, `MainMenuButtonActionType`, `MainMenuButtonVisibility`, `WheelPrizeType`, `WheelSpinPaymentType`, `YooKassaPayment` (6 методов), `SavedPaymentMethod` (1 методов), `CryptoBotPayment` (5 методов), `AppleTransaction` (2 методов), `AppleIAPAccount` (1 методов), `AppleNotification` (1 методов), `AppleIAPAbuseEvent` (1 методов), `HeleketPayment` (5 методов), `MulenPayPayment` (2 методов), `Pal24Payment` (3 методов), `WataPayment` (2 методов), `PlategaPayment` (2 методов), `PlategaSubscription` (1 методов), `LavaSubscription` (1 методов), `CasheraSubscription` (1 методов), `CloudPaymentsPayment` (5 методов), `FreekassaPayment` (5 методов), `KassaAiPayment` (5 методов), `RioPayPayment` (5 методов), `SeverPayPayment` (5 методов), `PayPearPayment` (5 методов), `RollyPayPayment` (5 методов), `OverpayPayment` (5 методов), `AuraPayPayment` (5 методов), `EtoplatezhiPayment` (5 методов), `AntilopayPayment` (5 методов), `JupiterPayment` (5 методов), `DonutPayment` (5 методов), `LavaPayment` (5 методов), `CisPayPayment` (5 методов), `CasheraPayment` (5 методов), `TabPayPayment` (5 методов), `ParityPayPayment` (5 методов), `PromoGroup` (3 методов), `UserPromoGroup` (1 методов), `Tariff` (21 методов), `PartnerStatus`, `User` (12 методов), `Subscription` (15 методов), `GraceAccessSessionModel`, `TrafficPurchase` (1 методов), `Transaction` (1 методов), `SubscriptionConversion` (2 методов), `PromoCode` (2 методов), `PromoCodeUse`, `CouponStatus`, `CouponBatch` (2 методов), `Coupon` (1 методов), `ReferralRewardType`, `ReferralRewardTrigger`, `ReferralRewardMode`, `ReferralRewardLevel` (1 методов), `ReferralEarning` (1 методов), `WithdrawalRequestStatus`, `WithdrawalRequest` (1 методов), `PartnerApplication`, `ReferralContest` (1 методов), `ReferralContestEvent` (1 методов), `ReferralContestVirtualParticipant` (1 методов), `ContestTemplate`, `ContestRound`, `ContestAttempt`, `Squad` (1 методов), `ServiceRule`, `PrivacyPolicy`, `PublicOffer`, `LegalConsent`, `RecurrentPayments`, `FaqSetting`, `FaqPage`, `SystemSetting`, `EmailTemplate`, `MonitoringLog`, `SentNotification`, `SubscriptionEvent`, `DiscountOffer`, `PromoOfferTemplate`, `SubscriptionTemporaryAccess`, `PromoOfferLog`, `BroadcastHistory`, `Poll`, `PollQuestion`, `PollOption`, `PollResponse`, `PollAnswer`, `ServerSquad` (3 методов), `SubscriptionServer`, `SupportAuditLog`, `UserMessage` (1 методов), `WelcomeText`, `PinnedMessage`, `AdvertisingCampaign` (4 методов), `AdvertisingCampaignRegistration` (1 методов), `TicketStatus`, `Ticket` (8 методов), `TicketMessage` (3 методов), `WebApiToken` (1 методов), `MainMenuButton` (3 методов), `MenuLayoutHistory` (1 методов), `ButtonClickLog` (1 методов), `Webhook` (1 методов), `WebhookDelivery` (1 методов), `CabinetRefreshToken` (4 методов), `WheelConfig` (1 методов), `WheelPrize` (1 методов), `WheelSpin` (3 методов), `TicketNotification` (1 методов), `PaymentMethodConfig` (1 методов), `RequiredChannel` (1 методов), `UserChannelSubscription` (1 методов), `AdminRole` (1 методов), `UserRole` (1 методов), `AccessPolicy` (1 методов), `AdminAuditLog` (1 методов), `LandingPage` (1 методов), `GuestPurchaseStatus`, `GuestPurchase` (1 методов), `NewsArticle` (1 методов), `NewsCategory` (1 методов), `NewsTag` (1 методов), `YandexClientIdMap`, `InfoPage`, `UserDeviceAlias`, `SystemErrorEvent`, `EmailQueueItem`, `ReachabilityBatch`, `ReachabilityJob`, `ReachabilityLeg`, `ReachabilityTargetPref`, `DpiCheckerAction`, `UserReminder` (1 методов), `UserReminderState`, `UserBulkOperation`, `UserBulkTarget`
+  Классы: `AwareDateTime` (2 методов), `UserStatus`, `SubscriptionStatus`, `TransactionType`, `PromoCodeType`, `PaymentMethod`, `MainMenuButtonActionType`, `MainMenuButtonVisibility`, `WheelPrizeType`, `WheelSpinPaymentType`, `YooKassaPayment` (6 методов), `SavedPaymentMethod` (1 методов), `CryptoBotPayment` (5 методов), `AppleTransaction` (2 методов), `AppleIAPAccount` (1 методов), `AppleNotification` (1 методов), `AppleIAPAbuseEvent` (1 методов), `HeleketPayment` (5 методов), `MulenPayPayment` (2 методов), `Pal24Payment` (3 методов), `WataPayment` (2 методов), `PlategaPayment` (2 методов), `PlategaSubscription` (1 методов), `LavaSubscription` (1 методов), `CasheraSubscription` (1 методов), `CloudPaymentsPayment` (5 методов), `FreekassaPayment` (5 методов), `KassaAiPayment` (5 методов), `RioPayPayment` (5 методов), `SeverPayPayment` (5 методов), `PayPearPayment` (5 методов), `RollyPayPayment` (5 методов), `OverpayPayment` (5 методов), `AuraPayPayment` (5 методов), `EtoplatezhiPayment` (5 методов), `AntilopayPayment` (5 методов), `JupiterPayment` (5 методов), `DonutPayment` (5 методов), `LavaPayment` (5 методов), `CisPayPayment` (5 методов), `CasheraPayment` (5 методов), `TabPayPayment` (5 методов), `ParityPayPayment` (5 методов), `PromoGroup` (3 методов), `UserPromoGroup` (1 методов), `Tariff` (21 методов), `PartnerStatus`, `User` (12 методов), `Subscription` (15 методов), `GraceAccessSessionModel`, `TrafficPurchase` (1 методов), `Transaction` (1 методов), `SubscriptionConversion` (2 методов), `PromoCode` (2 методов), `PromoCodeUse`, `CouponStatus`, `CouponBatch` (2 методов), `Coupon` (1 методов), `ReferralRewardType`, `ReferralRewardTrigger`, `ReferralRewardMode`, `ReferralRewardLevel` (1 методов), `ReferralEarning` (1 методов), `WithdrawalRequestStatus`, `WithdrawalRequest` (1 методов), `PartnerApplication`, `ReferralContest` (1 методов), `ReferralContestEvent` (1 методов), `ReferralContestVirtualParticipant` (1 методов), `ContestTemplate`, `ContestRound`, `ContestAttempt`, `Squad` (1 методов), `ServiceRule`, `PrivacyPolicy`, `PublicOffer`, `LegalConsent`, `RecurrentPayments`, `FaqSetting`, `FaqPage`, `SystemSetting`, `EmailTemplate`, `MonitoringLog`, `SentNotification`, `SubscriptionEvent`, `DiscountOffer`, `PromoOfferTemplate`, `SubscriptionTemporaryAccess`, `PromoOfferLog`, `BroadcastHistory`, `Poll`, `PollQuestion`, `PollOption`, `PollResponse`, `PollAnswer`, `ServerSquad` (3 методов), `SubscriptionServer`, `SupportAuditLog`, `UserMessage` (1 методов), `WelcomeText`, `PinnedMessage`, `AdvertisingCampaign` (4 методов), `AdvertisingCampaignRegistration` (1 методов), `TicketStatus`, `Ticket` (8 методов), `TicketMessage` (3 методов), `WebApiToken` (1 методов), `MainMenuButton` (3 методов), `MenuLayoutHistory` (1 методов), `ButtonClickLog` (1 методов), `Webhook` (1 методов), `WebhookDelivery` (1 методов), `CabinetRefreshToken` (4 методов), `WheelConfig` (1 методов), `WheelPrize` (1 методов), `WheelSpin` (3 методов), `TicketNotification` (1 методов), `PaymentMethodConfig` (1 методов), `RequiredChannel` (1 методов), `UserChannelSubscription` (1 методов), `AdminRole` (1 методов), `UserRole` (1 методов), `AccessPolicy` (1 методов), `AdminAuditLog` (1 методов), `LandingPage` (1 методов), `GuestPurchaseStatus`, `GuestPurchase` (1 методов), `NewsArticle` (1 методов), `NewsCategory` (1 методов), `NewsTag` (1 методов), `YandexClientIdMap`, `InfoPage`, `UserDeviceAlias`, `SystemErrorEvent`, `EmailQueueItem`, `ReachabilityBatch`, `ReachabilityJob`, `ReachabilityLeg`, `ReachabilityTargetPref`, `DpiCheckerAction`, `UserReminder` (1 методов), `UserReminderState`, `UserBulkOperation`, `UserBulkTarget`, `UserBulkNotification`
   Функции: нет
 
 #### app/database/crud
@@ -1892,6 +1892,9 @@
 - `app/services/user_bulk_filters.py` — Python-модуль
   Классы: нет
   Функции: `day_bounds`, `subscription_day_condition`
+- `app/services/user_bulk_notifications.py` — Python-модуль
+  Классы: нет
+  Функции: `action_text`, `receipt_text`, `create_receipts`, `recover`, `counts`, `deliver_batch` — Called only under the operation executor's global advisory lock.
 - `app/services/user_bulk_operations.py` — Python-модуль
   Классы: нет
   Функции: `execution_lock`, `selection_query`, `preview`, `classify_skips`, `get_operation`, `recover` — Only called with the global advisory lock held; no worker can still own it., `summary`, `cancel`, `run_batch`
@@ -2714,6 +2717,7 @@
 - `docs/pr11-codeql-review.md` — файл
 - `docs/project_structure_reference.md` — файл
 - `docs/referral_program_setting.md` — файл
+- `docs/releases/`
 - `docs/users-bulk-actions.md` — файл
 - `docs/web-admin-integration-guide.md` — файл
 - `docs/web-admin-integration.md` — файл
@@ -2723,6 +2727,10 @@
 
 - `docs/handoffs/handoff-2026-08-31-1659.md` — файл
 - `docs/handoffs/handoff-2026-08-31-1944.md` — файл
+
+### docs/releases
+
+- `docs/releases/5.0.0-karvpn.1.md` — файл
 
 ## migrations
 
@@ -3134,6 +3142,9 @@
 - `migrations/alembic/versions/0132_users_bulk_operations.py` — Python-модуль
   Классы: нет
   Функции: `upgrade`, `downgrade`
+- `migrations/alembic/versions/0133_user_bulk_notifications.py` — Python-модуль
+  Классы: нет
+  Функции: `upgrade`, `downgrade`
 
 ## scripts
 
@@ -3147,6 +3158,9 @@
 - `scripts/generate_structure_reference.py` — Python-модуль
   Классы: нет
   Функции: `tracked_paths` — Файлы проекта: отслеживаемые плюс новые, которые git не игнорирует., `describe_module` — Строки «Классы:» и «Функции:» для модуля., `render_entries`, `render`, `build`, `main`
+- `scripts/karvpn_release.py` — Python-модуль
+  Классы: нет
+  Функции: `release_data`, `release_notes`, `image_repository`, `run_command`, `check_publication`, `main`
 - `scripts/pg-upgrade.sh` — файл
 - `scripts/prepare_karvpn_image.py` — Python-модуль
   Классы: нет
@@ -3214,6 +3228,9 @@
   Функции: `test_no_grace_key_is_active_in_the_example`, `test_commented_values_match_the_code_defaults`
 - `tests/test_karvpn_image_profile.py` — Python-модуль
   Классы: `ImageProfileTests` (4 методов)
+  Функции: нет
+- `tests/test_karvpn_release.py` — Python-модуль
+  Классы: `KarvpnReleaseTests` (12 методов)
   Функции: нет
 - `tests/test_lazy_package_exports.py` — Python-модуль
   Классы: нет
@@ -3704,6 +3721,12 @@
 - `tests/cabinet/test_unlink_forgets_provider_email.py` — Python-модуль
   Классы: нет
   Функции: `test_unlink_forgets_the_email_that_only_this_provider_attested`, `test_unlink_keeps_the_email_once_a_password_made_it_a_login`, `test_unlink_keeps_an_email_verified_elsewhere`, `test_unlinking_another_provider_leaves_the_email_alone`
+- `tests/cabinet/test_user_bulk_notifications.py` — Python-модуль
+  Классы: нет
+  Функции: `request`, `bot`, `test_one_receipt_after_all_subscriptions_and_no_replay`, `test_disabled_receipts_keep_existing_behavior`, `test_send_failure_never_repeats_changes_or_delivery`, `test_uncertain_subscription_does_not_claim_success`, `test_no_success_no_telegram_and_blocked_are_skipped`, `test_recovery_never_replays_interrupted_telegram_send`, `test_notification_only_backlog_can_resume_without_mutations`, `test_cancel_discards_queued_notifications`, `test_action_description`, `test_reject_custom_text_without_opt_in_and_telegram_oversize`, `test_notification_permission_checked_before_work`, `test_blocked_bot_recipient_does_not_stop_other_receipts`
+- `tests/cabinet/test_user_bulk_notifications_postgres.py` — Python-модуль
+  Классы: нет
+  Функции: `test_receipt_claim_visible_before_send_and_cancel_skips_rest`, `test_new_session_recovers_sending_without_duplicate`, `test_notification_migration_upgrades_existing_journal_and_downgrades`
 - `tests/cabinet/test_user_bulk_operations.py` — Python-модуль
   Классы: нет
   Функции: `seed`, `request`, `test_snapshot_unique_users_skips_and_idempotency`, `test_date_sql_boundaries_count_snapshot_and_multisub`, `test_dst_calendar_day`, `test_copy_selection_reclassifies_without_expanding_membership`, `test_restart_never_repeats_success_or_uncertain`, `test_cancel_preserves_current_item_and_success`, `test_failure_stops_batch_and_is_never_retried`, `test_reject_ambiguous_confirmation`, `test_traffic_packages_reuse_existing_handler`, `test_deduction_expires_and_syncs_explicit_subscription`, `test_strict_panel_error_cannot_be_reported_as_success`, `test_manual_selection_respects_date_targets`, `test_permission_dependencies_cover_every_route`, `test_list_date_filter_returns_matching_subscription_ids`, `test_expiration_snapshot_targets_only_matching_subscriptions_without_tariff`
