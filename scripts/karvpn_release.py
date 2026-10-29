@@ -13,7 +13,10 @@ from pathlib import Path
 
 def release_data(root: Path, requested_tag: str = '') -> tuple[str, str]:
     release = json.loads((root / 'karvpn-image-release.json').read_text())
-    upstream = tomllib.loads((root / 'pyproject.toml').read_text())['project']['version']
+    if (root / 'pyproject.toml').is_file():
+        upstream = tomllib.loads((root / 'pyproject.toml').read_text())['project']['version']
+    else:
+        upstream = json.loads((root / 'karvpn-version.json').read_text())['upstream']
     if release['upstream_version'] != upstream or not re.fullmatch(r'\d+\.\d+\.\d+', upstream):
         raise ValueError('Sync upstream_version with pyproject.toml before building')
     revision = release['fork_revision']
@@ -21,6 +24,8 @@ def release_data(root: Path, requested_tag: str = '') -> tuple[str, str]:
         raise ValueError('fork_revision must be a positive integer')
     version = f'{upstream}-karvpn.{revision}'
     tag = f'v{version}'
+    if (root / 'package.json').is_file() and json.loads((root / 'package.json').read_text())['version'] != version:
+        raise ValueError('Sync package.json with the reviewed KarVPN version')
     if requested_tag and requested_tag != tag:
         raise ValueError('The requested tag does not match karvpn-image-release.json')
     return version, tag
@@ -61,7 +66,7 @@ def check_publication(root: Path, tag: str) -> None:
     ref = os.environ['GITHUB_REF']
     if ref not in ('refs/heads/main', f'refs/tags/{tag}'):
         raise ValueError('Publish from main or the matching release tag; use preview for branches')
-    commit = os.environ['GITHUB_SHA']
+    commit = os.environ.get('KARVPN_RELEASE_SHA', os.environ['GITHUB_SHA'])
     if not re.fullmatch(r'[a-f0-9]{40}', commit) or not re.fullmatch(r'v\d+\.\d+\.\d+-karvpn\.[1-9]\d*', tag):
         raise ValueError('Invalid release commit or tag')
     ancestry = run_command(root, 'git', 'merge-base', '--is-ancestor', commit, 'origin/main')

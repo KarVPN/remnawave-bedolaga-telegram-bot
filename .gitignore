@@ -104,3 +104,6 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Shared automatic release descriptor
+!karvpn-release-config.json

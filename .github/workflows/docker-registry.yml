@@ -12,6 +12,10 @@ on:
         description: Validated KarVPN release tag; empty for ordinary image builds.
         type: string
         default: ''
+      source_ref:
+        description: Reviewed release commit to build.
+        type: string
+        default: ''
     outputs:
       image:
         description: Immutable reference of the tested and published image.
@@ -43,6 +47,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Resolve upstream and KarVPN image version
         id: version
@@ -66,10 +71,11 @@ jobs:
           tags: |
             type=ref,event=pr
             type=raw,value=${{ inputs.release_tag || 'release-not-requested' }},enable=${{ inputs.release_tag != '' }}
-            type=sha,format=long
-            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=sha-${{ inputs.source_ref || github.sha }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' && inputs.release_tag == '' }}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
           labels: |
+            org.opencontainers.image.revision=${{ inputs.source_ref || github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             io.karvpn.bedolaga.deploy-contract=1
             io.karvpn.bedolaga.telegram-auth-max-age-days=${{ env.TELEGRAM_AUTH_MAX_AGE_DAYS }}
@@ -87,7 +93,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             BUILD_DATE=${{ steps.version.outputs.build_date }}
-            VCS_REF=${{ github.sha }}
+            VCS_REF=${{ inputs.source_ref || github.sha }}
             TELEGRAM_AUTH_MAX_AGE_DAYS=${{ env.TELEGRAM_AUTH_MAX_AGE_DAYS }}
           cache-from: type=gha,scope=bot-amd64
           cache-to: type=gha,scope=bot-amd64,mode=max
@@ -116,18 +122,19 @@ jobs:
         env:
           IMAGE_NAME: ${{ steps.version.outputs.image }}
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_COMMIT: ${{ inputs.source_ref || github.sha }}
           IMAGE_VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           while IFS= read -r tag; do
             docker push "$tag"
           done <<< "$IMAGE_TAGS"
-          image=$(docker image inspect "$IMAGE_NAME:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
+          image=$(docker image inspect "$IMAGE_NAME:sha-$IMAGE_COMMIT" --format '{{index .RepoDigests 0}}')
           echo "image=$image" >> "$GITHUB_OUTPUT"
           {
             echo '## Bedolaga image ready'
             echo
-            echo "Version: $IMAGE_VERSION. Platform: linux/amd64. Commit: $GITHUB_SHA."
+            echo "Version: $IMAGE_VERSION. Platform: linux/amd64. Commit: $IMAGE_COMMIT."
             echo
             echo 'Immutable reference for a test or rollback:'
             echo '```yaml'
