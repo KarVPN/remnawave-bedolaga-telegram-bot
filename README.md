@@ -322,8 +322,8 @@ docker compose up -d
 
 В форке работают `Lint`, `Tests`, `Build and Publish Docker Image`, `CodeQL`
 и `Security Audit`. Проверка миграции PostgreSQL запускается только при изменении
-файлов миграции/Compose или вручную. `KarVPN Release` выпускает явно выбранную
-версию `5.0.0-karvpn.N`; по умолчанию ручной запуск только показывает release notes.
+файлов миграции/Compose или вручную. `KarVPN Release` автоматически готовит
+релизный PR `5.0.0-karvpn.N`; его слияние публикует проверенный образ и релиз.
 Унаследованные Docker Hub, release-please и Release PR Guard отключены и удалены.
 Порядок выпуска и короткие заметки — в **[docs/karvpn-images.md](docs/karvpn-images.md)**.
 Если прогоны пропали — смотреть вкладку Actions и **[docs/ci.md](docs/ci.md)**.

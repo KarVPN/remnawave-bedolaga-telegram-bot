@@ -1,0 +1,21 @@
+name: KarVPN release checks
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  release-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify versions, release PR updates and publication guards without GitHub writes
+        run: python3 -m unittest discover -s tests -p 'test_karvpn_release*.py' -v

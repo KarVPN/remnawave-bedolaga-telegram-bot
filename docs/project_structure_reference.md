@@ -30,6 +30,7 @@
 - `docker-compose.yml` — файл
 - `docs/`
 - `karvpn-image-release.json` — файл
+- `karvpn-release-config.json` — файл
 - `main.py` — Python-модуль
   Классы: `GracefulExit` (2 методов)
   Функции: `main`
@@ -73,6 +74,7 @@
 - `.github/workflows/docker-registry.yml` — файл
 - `.github/workflows/lint.yml` — файл
 - `.github/workflows/pg-upgrade.yml` — файл
+- `.github/workflows/release-contract.yml` — файл
 - `.github/workflows/release.yml` — файл
 - `.github/workflows/security-audit.yml` — файл
 - `.github/workflows/tests.yml` — файл
@@ -3157,6 +3159,9 @@
 - `scripts/karvpn_release.py` — Python-модуль
   Классы: нет
   Функции: `release_data`, `release_notes`, `image_repository`, `run_command`, `check_publication`, `main`
+- `scripts/karvpn_release_pr.py` — Python-модуль
+  Классы: нет
+  Функции: `command`, `api`, `pages`, `repository`, `configuration`, `branch`, `released`, `next_version`, `local_changes` — Only main's first-parent changes: never expand an imported upstream history., `release_files`, `proposal`, `update_proposal`, `pending_release`, `main`
 - `scripts/pg-upgrade.sh` — файл
 - `scripts/prepare_karvpn_image.py` — Python-модуль
   Классы: нет
@@ -3226,7 +3231,10 @@
   Классы: `ImageProfileTests` (4 методов)
   Функции: нет
 - `tests/test_karvpn_release.py` — Python-модуль
-  Классы: `KarvpnReleaseTests` (14 методов)
+  Классы: `KarvpnReleaseTests` (16 методов)
+  Функции: нет
+- `tests/test_karvpn_release_pr.py` — Python-модуль
+  Классы: `ReleasePrTests` (21 методов)
   Функции: нет
 - `tests/test_lazy_package_exports.py` — Python-модуль
   Классы: нет

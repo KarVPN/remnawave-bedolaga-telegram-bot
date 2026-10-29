@@ -131,6 +131,20 @@ class KarvpnReleaseTests(unittest.TestCase):
             ):
                 main()
 
+    def test_cabinet_metadata_must_match_the_ui_version(self):
+        (self.root / 'pyproject.toml').unlink()
+        (self.root / 'karvpn-version.json').write_text(json.dumps({'upstream': '5.0.0'}))
+        package = self.root / 'package.json'
+        package.write_text(json.dumps({'version': '5.0.0-karvpn.1'}))
+        self.assertEqual(release_data(self.root)[0], '5.0.0-karvpn.1')
+        package.write_text(json.dumps({'version': '5.0.0-karvpn.2'}))
+        with self.assertRaises(ValueError):
+            release_data(self.root)
+
+    def test_retry_uses_the_reviewed_commit_even_after_main_has_advanced(self):
+        with patch.dict(os.environ, {'KARVPN_RELEASE_SHA': 'b' * 40}), self.publication_commands(tag_commit='b' * 40):
+            check_publication(self.root, 'v5.0.0-karvpn.1')
+
     def publication_commands(self, *, tag_commit=None, release_status=404, ancestor=True):
         def run(_root, *arguments):
             if arguments[:2] == ('git', 'merge-base'):

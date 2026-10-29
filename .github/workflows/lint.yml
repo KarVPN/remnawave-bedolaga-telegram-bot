@@ -11,9 +11,14 @@ on:
   workflow_dispatch:
   # KarVPN Release использует тот же lint перед публикацией.
   workflow_call:
+    inputs:
+      source_ref:
+        description: Reviewed commit to validate.
+        type: string
+        default: ''
 
 concurrency:
-  group: lint-${{ github.ref }}-${{ github.event_name }}
+  group: lint-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -21,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - uses: astral-sh/setup-uv@v10.0.1
 

@@ -2,13 +2,8 @@ name: KarVPN Release
 
 on:
   push:
-    tags: ['v*-karvpn.*']
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish the configured release from main (false previews notes only).
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -20,40 +15,31 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
+      publish: ${{ steps.release.outputs.publish }}
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
-      publish: ${{ steps.release.outputs.publish }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Validate the explicit KarVPN version and preview notes
+      - name: Find a reviewed and merged release PR awaiting publication
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
-        shell: bash
-        run: |
-          python3 scripts/karvpn_release.py metadata
-          args=(notes --output "$RUNNER_TEMP/karvpn-release-notes.md")
-          if [[ "$PUBLISH" == true ]]; then
-            args+=(--publish)
-          fi
-          python3 scripts/karvpn_release.py "${args[@]}"
-          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
-          {
-            echo '## KarVPN release preview'
-            echo
-            cat "$RUNNER_TEMP/karvpn-release-notes.md"
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/karvpn_release_pr.py pending
 
   lint:
     needs: prepare
     if: needs.prepare.outputs.publish == 'true'
     uses: ./.github/workflows/lint.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.commit }}
 
   image:
     needs: [prepare, lint]
@@ -65,6 +51,7 @@ jobs:
     uses: ./.github/workflows/docker-registry.yml
     with:
       release_tag: ${{ needs.prepare.outputs.tag }}
+      source_ref: ${{ needs.prepare.outputs.commit }}
 
   release:
     needs: [prepare, image]
@@ -73,20 +60,37 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Publish the release after the image has passed its checks
+      - name: Publish the reviewed release after the image has passed its checks
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          KARVPN_RELEASE_SHA: ${{ needs.prepare.outputs.commit }}
           RELEASE_IMAGE: ${{ needs.image.outputs.image }}
-        shell: bash
         run: |
           python3 scripts/karvpn_release.py notes --publish --tag "$RELEASE_TAG" \
             --image "$RELEASE_IMAGE" --output "$RUNNER_TEMP/karvpn-release-notes.md"
-          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
-            --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/karvpn-release-notes.md" \
-            --latest
+          gh release create "$RELEASE_TAG" --target "$KARVPN_RELEASE_SHA" \
+            --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/karvpn-release-notes.md" --latest
+
+  release-pr:
+    needs: [prepare, release]
+    if: always() && needs.prepare.result == 'success' && (needs.prepare.outputs.publish == 'false' || needs.release.result == 'success')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create or update the next KarVPN release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/karvpn_release_pr.py propose
