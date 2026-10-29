@@ -38,6 +38,8 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.publish == 'true'
     uses: ./.github/workflows/lint.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.commit }}
 
   image:
     needs: [prepare, lint]
