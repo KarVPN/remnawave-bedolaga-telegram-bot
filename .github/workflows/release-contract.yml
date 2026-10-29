@@ -13,9 +13,9 @@ jobs:
   release-contract:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.13'
+          python-version: '3.14'
       - name: Verify versions, release PR updates and publication guards without GitHub writes
         run: python3 -m unittest discover -s tests -p 'test_karvpn_release*.py' -v
