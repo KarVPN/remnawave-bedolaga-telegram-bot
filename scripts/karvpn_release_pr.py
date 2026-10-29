@@ -158,7 +158,7 @@ def proposal(root, repo, config, releases):
     version = next_version(upstream, releases)
     files = release_files(root, version, changes, initial=latest is None)
     notes = files[f'docs/releases/{version}.md']
-    body = f'{notes}\n<!-- karvpn-release:{version} -->\n\nАвтоматический релизный PR. Проверьте версию и заметки, разрешите проверки GitHub при запросе и слейте PR. После слияния KarVPN Release проверит и опубликует Docker-образ, затем создаст релиз с digest. VPS обновляется отдельно через Ansible.\n'
+    body = f'{notes}\n<!-- karvpn-release:{version} -->\n\nАвтоматический релизный PR. Правки заметок для публикации вносите в файл docs/releases этой ветки. Проверьте версию и заметки, разрешите проверки GitHub при запросе и слейте PR. После слияния KarVPN Release проверит и опубликует Docker-образ, затем создаст релиз с digest. VPS обновляется отдельно через Ansible.\n'
     return {
         'head': head,
         'version': version,
