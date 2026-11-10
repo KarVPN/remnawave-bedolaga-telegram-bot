@@ -75,7 +75,7 @@ def fake_client(monkeypatch):
 
 
 def _configure(monkeypatch):
-    monkeypatch.setattr(settings, 'KARVPN_BFF_URL', 'https://api.test.yolgins.ru/api/v1', raising=False)
+    monkeypatch.setattr(settings, 'KARVPN_BFF_URL', 'https://app.deskorb.com/api/v1', raising=False)
     monkeypatch.setattr(settings, 'KARVPN_BOT_SECRET', 'bot-secret-value-long-enough', raising=False)
 
 

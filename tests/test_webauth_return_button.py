@@ -41,7 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCALES_DIR = PROJECT_ROOT / 'app' / 'localization' / 'locales'
 HANDLER = PROJECT_ROOT / 'app' / 'handlers' / 'start.py'
 LANGUAGES = ('ru', 'en')
-RETURN_URL = 'https://api.test.yolgins.ru/app/open'
+RETURN_URL = 'https://app.deskorb.com/app/open'
 TOKEN = 'K-Dph9mc4v8gGrn0abcd'
 TELEGRAM_ID = 895225
 USER_ID = 42
@@ -106,7 +106,7 @@ def test_the_way_back_is_built_once_for_both_ways_in(return_url):
 
 @pytest.mark.parametrize(
     'scheme_url',
-    ['karvpn://login', 'tg://resolve?domain=karvpn', 'ftp://api.test.yolgins.ru/app/open'],
+    ['karvpn://login', 'tg://resolve?domain=karvpn', 'ftp://app.deskorb.com/app/open'],
 )
 def test_a_scheme_telegram_refuses_never_becomes_a_button(scheme_url, monkeypatch):
     """Схему приложения в переменной прописали — кнопки всё равно не будет."""
